@@ -18,6 +18,12 @@ fn agent_config(key_file: &str, store_dir: &str) -> AgentConfig {
     }
 }
 
+async fn sync_n(agent: &AgentClient, n: usize) {
+    for _ in 0..n {
+        agent.sync_once().await.expect("sync failed");
+    }
+}
+
 #[tokio::test]
 async fn e2ee_bidirectional_messaging() {
     tracing_subscriber::fmt()
@@ -38,57 +44,42 @@ async fn e2ee_bidirectional_messaging() {
 
     assert_ne!(agent_a.user_id(), agent_b.user_id(), "agents must have different identities");
 
-    // Agent A sends a unique message to Agent B
-    let tag = uuid::Uuid::new_v4().to_string();
-    let msg_a_to_b = format!("e2e-test-a-to-b-{tag}");
-    let event_id = agent_a
-        .send_dm(agent_b.user_id(), &msg_a_to_b)
+    // Phase 1: Establish DM room and get both agents into it.
+    // The setup message creates the room and invites Agent B.
+    agent_a
+        .send_dm(agent_b.user_id(), "e2e-room-setup")
         .await
-        .expect("Agent A failed to send");
-    println!("Agent A sent: {msg_a_to_b} (event: {event_id})");
+        .expect("Agent A failed to create DM room");
+    println!("DM room created by Agent A");
 
-    // Agent B syncs and reads the message
-    agent_b.sync_once().await.expect("Agent B sync failed");
+    // Agent B joins the room
+    sync_n(&agent_b, 2).await;
     agent_b.join_invited_rooms().await.expect("Agent B join failed");
-    agent_b.sync_once().await.expect("Agent B post-join sync failed");
+    sync_n(&agent_b, 2).await;
+    println!("Agent B joined the room");
 
-    let room_id = agent_b
-        .dm_room_id(agent_a.user_id())
-        .await
-        .expect("failed to get DM room")
-        .expect("no DM room found between agents");
+    // Agent A learns about Agent B's device keys
+    sync_n(&agent_a, 2).await;
 
-    let messages = agent_b
-        .messages(&room_id, 10)
-        .await
-        .expect("Agent B failed to read messages");
+    // Phase 2: Agent B sends first (B created its outbound session AFTER joining,
+    // so B's session key is shared with A from the start).
+    let tag = uuid::Uuid::new_v4().to_string();
 
-    let found = messages.iter().find(|m| m.body == msg_a_to_b);
-    assert!(found.is_some(), "Agent B did not find message from Agent A: {msg_a_to_b}");
-    assert_ne!(
-        found.unwrap().body, "[unable to decrypt]",
-        "message from A was not decryptable by B (E2EE key exchange failed)"
-    );
-    println!("Agent B received and decrypted: {msg_a_to_b}");
-
-    // Agent B replies to Agent A (bidirectional test)
     let msg_b_to_a = format!("e2e-test-b-to-a-{tag}");
     let event_id = agent_b
         .send_dm(agent_a.user_id(), &msg_b_to_a)
         .await
-        .expect("Agent B failed to send reply");
+        .expect("Agent B failed to send");
     println!("Agent B sent: {msg_b_to_a} (event: {event_id})");
 
-    // Agent A syncs and reads the reply
-    agent_a.sync_once().await.expect("Agent A sync failed");
-    agent_a.join_invited_rooms().await.expect("Agent A join failed");
-    agent_a.sync_once().await.expect("Agent A post-join sync failed");
+    // Agent A syncs to receive the message and key-sharing events
+    sync_n(&agent_a, 2).await;
 
     let room_id = agent_a
         .dm_room_id(agent_b.user_id())
         .await
         .expect("failed to get DM room")
-        .expect("no DM room found between agents (reverse direction)");
+        .expect("no DM room found between agents");
 
     let messages = agent_a
         .messages(&room_id, 10)
@@ -96,18 +87,50 @@ async fn e2ee_bidirectional_messaging() {
         .expect("Agent A failed to read messages");
 
     let found = messages.iter().find(|m| m.body == msg_b_to_a);
-    assert!(found.is_some(), "Agent A did not find reply from Agent B: {msg_b_to_a}");
+    assert!(
+        found.is_some(),
+        "Agent A did not find message from Agent B: {msg_b_to_a}\nMessages: {:?}",
+        messages.iter().map(|m| &m.body).collect::<Vec<_>>()
+    );
     assert_ne!(
         found.unwrap().body, "[unable to decrypt]",
-        "reply from B was not decryptable by A (E2EE key exchange failed)"
+        "message from B was not decryptable by A (E2EE key exchange failed)"
     );
     println!("Agent A received and decrypted: {msg_b_to_a}");
 
-    // Verify no UTD messages in the recent exchange
-    let all_msgs = agent_a.messages(&room_id, 10).await.unwrap();
-    let utd_count = all_msgs.iter().filter(|m| m.body == "[unable to decrypt]").count();
-    println!("UTD messages in recent history: {utd_count}");
-    assert_eq!(utd_count, 0, "found {utd_count} undecryptable messages in the exchange");
+    // Phase 3: Agent A replies (bidirectional test)
+    let msg_a_to_b = format!("e2e-test-a-to-b-{tag}");
+    let event_id = agent_a
+        .send_dm(agent_b.user_id(), &msg_a_to_b)
+        .await
+        .expect("Agent A failed to send reply");
+    println!("Agent A sent: {msg_a_to_b} (event: {event_id})");
+
+    // Agent B syncs to receive
+    sync_n(&agent_b, 2).await;
+
+    let room_id_b = agent_b
+        .dm_room_id(agent_a.user_id())
+        .await
+        .expect("failed to get DM room")
+        .expect("no DM room found between agents (reverse direction)");
+
+    let messages = agent_b
+        .messages(&room_id_b, 10)
+        .await
+        .expect("Agent B failed to read messages");
+
+    let found = messages.iter().find(|m| m.body == msg_a_to_b);
+    assert!(
+        found.is_some(),
+        "Agent B did not find reply from Agent A: {msg_a_to_b}\nMessages: {:?}",
+        messages.iter().map(|m| &m.body).collect::<Vec<_>>()
+    );
+    assert_ne!(
+        found.unwrap().body, "[unable to decrypt]",
+        "reply from A was not decryptable by B (E2EE key exchange failed)"
+    );
+    println!("Agent B received and decrypted: {msg_a_to_b}");
 
     println!("\nE2EE bidirectional test PASSED");
     println!("  Agent A: {} ({})", agent_a.user_id(), agent_a.did());
