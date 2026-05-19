@@ -24,12 +24,22 @@ async fn sync_n(agent: &AgentClient, n: usize) {
     }
 }
 
+fn clean_store(path: &str) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[tokio::test]
 async fn e2ee_bidirectional_messaging() {
     tracing_subscriber::fmt()
         .with_env_filter("warn,aqua_matrix_agent=info")
         .try_init()
         .ok();
+
+    // Wipe stores to avoid stale crypto keys from prior runs or CLI usage.
+    // The device_id is deterministic per DID, so any other crypto store that
+    // used the same key file will have uploaded conflicting identity keys.
+    clean_store("/tmp/aqua-e2e-agent-a");
+    clean_store("/tmp/aqua-e2e-agent-b");
 
     // Connect both agents via CAIP-122 auth
     let agent_a = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-agent-a"))
