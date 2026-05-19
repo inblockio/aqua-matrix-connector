@@ -5,4 +5,5 @@ target/
 *.db-shm
 .env
 .env.*
-.claude/
+.claude/*
+!.claude/skills/
