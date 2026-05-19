@@ -59,17 +59,20 @@ aqua-matrix-agent (binary)
   +-- matrix-sdk     -- Matrix client with E2E encryption (Megolm/Vodozemac)
 ```
 
-**Authentication flow:** Ed25519 key -> DID -> CAIP-122 signed message -> siwx-oidc issues OIDC tokens -> Matrix session restored.
+**Authentication flow:** Ed25519 key -> derive DID -> CAIP-122 challenge-response against siwx-oidc -> siwx-oidc verifies signature, provisions user in Synapse via MSC3861 endpoints, issues opaque `mat_*`/`mcr_*` tokens -> Synapse validates tokens via `/oauth2/introspect` (RFC 7662) -> Matrix session restored.
 
-**Encryption:** All DMs are E2E encrypted. The agent bootstraps cross-signing on first connect so its device appears as "verified" in Element. Crypto state persists in SQLite at the store directory.
+**siwx-oidc is NOT a fork of MAS.** It is a fully independent Rust OIDC provider (Axum + Redis) that implements MSC3861 compatibility so Synapse can delegate authentication to it. The CAIP-122 signature verification happens server-side in siwx-core. A shared `MAS_SHARED_SECRET` secures the introspection channel between Synapse and siwx-oidc.
+
+**Encryption:** All DMs are E2E encrypted (Megolm via Vodozemac). The agent bootstraps cross-signing on first connect so its device appears as "verified" in Element. Crypto state persists in SQLite at the store directory.
 
 **OIDC auto-registration:** If no `--client-id` is provided, the agent registers a new client via the siwx-oidc `/register` endpoint and caches credentials in `{store_dir}/config.toml`.
 
 ## Building and testing
 
 ```bash
-cargo build --release          # build binary
-cargo test                     # run unit tests (config roundtrip, partial loading)
+cargo build --release                        # build binary
+cargo test                                   # run unit tests (config roundtrip, partial loading)
+cargo test --test e2e --features e2e         # run E2E test (requires live matrix.inblock.io)
 ```
 
 The binary lands at `target/release/aqua-matrix-agent`.
@@ -95,6 +98,7 @@ The binary lands at `target/release/aqua-matrix-agent`.
 | Skill | Purpose |
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
+| `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
 
 ## Companion repos
 
