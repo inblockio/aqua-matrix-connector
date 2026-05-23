@@ -117,19 +117,9 @@ So practical operation — restarts within a single day, or even after a long we
 
 **Upstream dependency:** this design relies on `siwx-oidc-auth` shipping `AuthTokens.refresh_token` and `siwx_oidc_auth::refresh(...)`. Since commit `ab3ad3f` of the siwx-oidc repo these are available; we depend via `path = "../siwx-oidc/siwx-oidc-auth"` (sibling checkout) rather than a pinned git rev, because the newer commit's workspace also requires the `aqua-auth` crate at `../../aqua-auth` which cargo cannot fetch through a single git dep. To set up a fresh dev host: `git clone https://github.com/inblockio/siwx-oidc.git && git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
 
-## Auto-respawn (always alive)
+## Auto-respawn
 
-All three systemd units use `Restart=always` (Matrix daemons) or a supervisor loop (claude-bridge) so that any kill, crash, or clean exit triggers an automatic respawn:
-
-| Unit | Mechanism | Crash → up in |
-|---|---|---|
-| `aqua-matrix-heartbeat` | `Restart=always`, `RestartSec=5s` + `StartLimitBurst=10 / IntervalSec=300` | ~5s |
-| `aqua-matrix-claude-channel` | same | ~5s |
-| `claude-bridge` | `Type=simple` bash supervisor that polls `tmux has-session` every 10s and re-runs `tmux new-session` if missing; plus `Restart=always` on the supervisor itself | ~10s (inner claude respawn) or ~5s (supervisor respawn) |
-
-Acid-tested on this host: `kill -9 $(pid_of_heartbeat)` → systemd respawned in <5s, NRestarts=1, cached session reused (no auth storm). `tmux kill-session -t claude-bridge` → supervisor respawned the session on its next 10s tick.
-
-Crash-loop guard: `StartLimitBurst=10` over `StartLimitIntervalSec=300` means systemd will give up after 10 restarts in 5 minutes — covers the case where the daemon is fundamentally broken (e.g. siwx-oidc unreachable) without burning through retries forever. After the limit, `systemctl --user reset-failed <unit>` re-enables restarts once the root cause is fixed.
+All three units are designed to be "always alive" via `Restart=always` (Matrix daemons) or a bash supervisor loop (claude-bridge). Per-unit mechanism, recovery times, manual procedures, and the diagnostic decision tree all live in [`RECOVERY.md`](RECOVERY.md) — start there when something is broken.
 
 ## Auto-start chain (WSL boot → daemons up)
 
@@ -170,40 +160,9 @@ WSL itself does **not** start on Windows boot unless triggered (open a WSL termi
 
 All `.pem` files are gitignored (`*.pem` in `.gitignore`) — they ARE the identities, must not be checked in.
 
-## Troubleshooting decision tree
+## Troubleshooting
 
-**The ops channel went silent / no heartbeat in 10+ min**
-
-1. `systemctl --user is-active aqua-matrix-heartbeat` — expect `active`. If `failed`, check `journalctl --user -u aqua-matrix-heartbeat -n 50`.
-2. If `activating` indefinitely: cached session has expired AND the store-wipe-retry path is failing for some other reason. Manual remediation: `rm ~/.aqua-matrix-heartbeat/matrix-sdk-*.sqlite3* && rm ~/.aqua-matrix-heartbeat/config.toml && systemctl --user restart aqua-matrix-heartbeat`. (Removing `config.toml` forces a fully fresh start including OIDC re-registration.)
-3. If `active` but no heartbeat: matrix sync may be stuck. `journalctl ... -f` will show sync errors. Send `#shell ping` from Tim's account — if no reply, the daemon is wedged. `systemctl --user restart aqua-matrix-heartbeat` forces a fresh stream sync.
-
-**The Claude channel does not respond**
-
-1. `systemctl --user is-active aqua-matrix-claude-channel` — same triage as heartbeat.
-2. Test `claude -p hi` locally: if claude itself is broken, daemon cannot reply either.
-3. If daemon is active but messages do not get answers: check `journalctl --user -u aqua-matrix-claude-channel -n 30`. Look for `claude -p` spawn failures or sync errors.
-4. From Tim's account, send `#shell respawn` to the **heartbeat** identity. The `respawn` verb restarts `claude-bridge.service` (the local tmux), NOT the claude-channel daemon. To restart the Matrix-side claude channel: `systemctl --user restart aqua-matrix-claude-channel` locally, or extend the `#shell` dispatcher with a new verb.
-
-**`device_id` keeps rotating, store keeps wiping**
-
-This should NOT happen routinely — the refresh-token grant covers up to 24h of downtime while preserving `device_id`. If it is happening on every restart:
-
-1. Check the session cache has a refresh_token: `grep refresh_token <store_dir>/config.toml`. If missing, the daemon was authenticated against an older siwx-oidc that didn't issue them — restart will fix on the next fresh auth.
-2. Check `did` is also persisted (`grep '^did ' <store_dir>/config.toml`). Both `refresh_token` AND `did` are needed for the refresh-grant call.
-3. Check the journal for `refresh grant failed`. If the refresh token expired (>24h since issue), fresh auth is the only path and will mint a new device.
-
-For genuine multi-day downtime, expect a single fresh-auth + cross-signing rebootstrap. That is the design boundary, not a bug.
-
-**`#shell` commands do nothing**
-
-1. Verify the sender matches `--target` of the heartbeat unit (defaults to Tim). The dispatcher only honors commands from the configured target — DMs from other accounts are silently ignored by design.
-2. Verify the prefix is exactly `#shell` (case-insensitive on the prefix). `/help`, `!help`, etc. are NOT recognized — that was the whole point of the rename.
-3. `#shell logs 30` from Tim's account dumps the journal — useful for diagnosing the daemon from inside Matrix without local shell access.
-
-**Local interactive `claude-bridge` died but Matrix daemons fine**
-
-`systemctl --user restart claude-bridge` or `#shell respawn` from Tim. The interactive tmux session is decoupled from the Matrix daemons; their lifecycles do not affect each other.
+Moved to [`RECOVERY.md`](RECOVERY.md) — its "Diagnostic decision tree" section covers the canonical symptoms (silent ops channel, claude channel not responding, device_id rotating, `#shell` commands ignored, bridge tmux missing). RECOVERY.md is the runbook; this document is the design rationale.
 
 ## Adding a fourth surface
 

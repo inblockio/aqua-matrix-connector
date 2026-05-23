@@ -3,7 +3,9 @@
 Rust library and CLI for Matrix agent communication with E2E encryption.
 Agents authenticate via [siwx-oidc](https://github.com/inblockio/siwx-oidc) using decentralized identifiers (DIDs), not passwords.
 
-**Architecture & troubleshooting:** see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the host's full agent layout (heartbeat ops channel, claude-channel LLM channel, local claude-bridge tmux), identity/device-id persistence model, stream-sync design, and the troubleshooting decision tree. Read it first when something is broken.
+**Architecture:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design rationale for the host's three agent components (heartbeat ops channel, claude-channel LLM channel, local claude-bridge tmux), identity/device-id persistence model, stream-sync design, file/identity inventory.
+
+**Recovery / when things break:** [`docs/RECOVERY.md`](docs/RECOVERY.md) — what auto-recovers vs needs human intervention, per-unit restart policies, crash-loop guard explained, manual recovery procedures, and a diagnostic decision tree keyed by symptom. Start here when something is broken.
 
 ## If you are an AI agent: how to send and receive messages
 
