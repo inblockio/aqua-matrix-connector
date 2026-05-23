@@ -1,5 +1,5 @@
 use anyhow::Result;
-use aqua_matrix_agent::{did_from_key_file, heartbeat, AgentClient, AgentConfig};
+use aqua_matrix_agent::{did_from_key_file, claude_channel, heartbeat, AgentClient, AgentConfig};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -66,6 +66,12 @@ struct Args {
         help = "Heartbeat interval in seconds (default 600 = 10 minutes)"
     )]
     heartbeat_interval: u64,
+
+    #[arg(
+        long,
+        help = "Run as the claude-channel daemon: forward inbound DMs from --target through `claude -p` and reply with stdout. Mutually exclusive with --heartbeat."
+    )]
+    claude_channel: bool,
 }
 
 fn default_store_dir() -> PathBuf {
@@ -105,9 +111,18 @@ async fn main() -> Result<()> {
         agent.sync_once().await?;
     }
 
+    if args.heartbeat && args.claude_channel {
+        anyhow::bail!("--heartbeat and --claude-channel are mutually exclusive");
+    }
+
     if args.heartbeat {
         let interval = Duration::from_secs(args.heartbeat_interval);
         heartbeat::run(&agent, &args.target, interval).await;
+        return Ok(());
+    }
+
+    if args.claude_channel {
+        claude_channel::run(&agent, &args.target).await;
         return Ok(());
     }
 

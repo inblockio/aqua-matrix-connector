@@ -1,6 +1,12 @@
+// matrix-sdk 0.17's deeply-nested async types overflow rustc's default
+// Send-bound recursion budget when we spawn `client.sync(...)` in a tokio task.
+#![recursion_limit = "256"]
+
 pub mod heartbeat;
+pub mod claude_channel;
 
 use anyhow::{anyhow, Context, Result};
+use std::time::{SystemTime, UNIX_EPOCH};
 use matrix_sdk::{
     config::SyncSettings,
     room::MessagesOptions,
@@ -28,12 +34,26 @@ const DEFAULT_CLIENT_NAME: &str = "aqua-matrix-agent";
 pub struct ConfigFile {
     #[serde(default)]
     pub oidc: OidcConfig,
+    /// Cached Matrix session. Lets restarts within the token's lifetime reuse
+    /// the same `device_id` so the SQLite crypto store stays valid.
+    /// See docs/ARCHITECTURE.md "Identity and device-id persistence".
+    #[serde(default)]
+    pub session: Option<SessionCache>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct OidcConfig {
     pub client_id: Option<String>,
     pub redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCache {
+    pub access_token: String,
+    pub user_id: String,
+    pub device_id: String,
+    /// Unix seconds when the access token expires. We refresh ~30s early.
+    pub expires_at_unix: u64,
 }
 
 impl ConfigFile {
@@ -123,10 +143,20 @@ pub struct Message {
     pub event_id: String,
 }
 
+#[derive(Clone)]
 pub struct AgentClient {
     client: Client,
     did: String,
     user_id: OwnedUserId,
+}
+
+impl AgentClient {
+    /// Expose the underlying matrix-sdk Client (cheaply cloneable, internally Arc'd)
+    /// so the heartbeat and claude-channel modes can register event handlers and
+    /// drive `client.sync(...)` directly.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
 }
 
 pub fn did_from_key_file(path: &Path) -> Result<String> {
@@ -144,6 +174,69 @@ pub fn did_from_key_file(path: &Path) -> Result<String> {
 struct WhoAmI {
     user_id: String,
     device_id: String,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_store_mismatch(err: &anyhow::Error) -> bool {
+    // matrix-sdk wraps this from the crypto store. The string is the load-bearing
+    // signal — there is no typed error variant exposed at this layer.
+    let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
+    chain.contains("account in the store doesn't match")
+        || chain.contains("crypto store the account in the store")
+}
+
+fn wipe_crypto_store(store_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(store_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("matrix-sdk-") && name.contains(".sqlite3") {
+            let path = entry.path();
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!("failed to remove {}: {e}", path.display());
+            } else {
+                tracing::info!("wiped {}", path.display());
+            }
+        }
+    }
+}
+
+async fn build_and_restore(
+    matrix_url: &str,
+    store_dir: &Path,
+    user_id: &OwnedUserId,
+    device_id: &OwnedDeviceId,
+    access_token: &str,
+) -> Result<Client> {
+    let client = Client::builder()
+        .homeserver_url(matrix_url)
+        .sqlite_store(store_dir, None)
+        .build()
+        .await
+        .context("failed to build Matrix client")?;
+
+    let session = matrix_sdk::authentication::matrix::MatrixSession {
+        meta: SessionMeta {
+            user_id: user_id.clone(),
+            device_id: device_id.clone(),
+        },
+        tokens: SessionTokens {
+            access_token: access_token.to_string(),
+            refresh_token: None,
+        },
+    };
+    client
+        .matrix_auth()
+        .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
+        .await
+        .context("failed to restore session")?;
+    Ok(client)
 }
 
 async fn resolve_identity(matrix_url: &str, access_token: &str) -> Result<WhoAmI> {
@@ -235,57 +328,116 @@ impl AgentClient {
             }
         };
 
-        tracing::info!("authenticating against {}", config.siwx_url);
-        let tokens = siwx_oidc_auth::authenticate(
-            &config.siwx_url,
-            &client_id,
-            &redirect_uri,
-            &key,
-        )
-        .await
-        .context("siwx-oidc authentication failed")?;
-        tracing::info!(
-            "access token acquired (expires in {}s)",
-            tokens.expires_in.unwrap_or(0)
-        );
+        // Resolve a usable Matrix session: cached if valid, otherwise fresh auth.
+        // Caching here means restarts within the access token's lifetime (~5 min
+        // for siwx-oidc) reuse the same device_id, so the SQLite crypto store
+        // does NOT need to be wiped. Beyond the token lifetime we re-auth (which
+        // mints a new device_id) and the store-mismatch retry below handles the
+        // wipe automatically.
+        let now_unix = unix_now();
+        let cached_session = config_file.session.clone().filter(|s| {
+            // 30s of slack so we don't try to use a token that expires mid-call
+            s.expires_at_unix > now_unix + 30
+        });
 
-        tracing::info!("resolving Matrix identity");
-        let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
-        tracing::info!(
-            "matrix user: {}, device: {}",
-            identity.user_id,
-            identity.device_id
-        );
+        let session_data = if let Some(sess) = cached_session {
+            tracing::info!(
+                "trying cached session (expires in {}s, device_id: {})",
+                sess.expires_at_unix.saturating_sub(now_unix),
+                sess.device_id
+            );
+            match resolve_identity(&config.matrix_url, &sess.access_token).await {
+                Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
+                    tracing::info!("cached session valid; reusing access token and device_id");
+                    Some((sess.access_token, sess.user_id, sess.device_id))
+                }
+                Ok(_) => {
+                    tracing::warn!("cached session whoami returned different identity; re-authenticating");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("cached session whoami failed: {e:#}; re-authenticating");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        let user_id: OwnedUserId = identity
-            .user_id
+        let (access_token, user_id_str, device_id_str) = match session_data {
+            Some(triple) => triple,
+            None => {
+                tracing::info!("authenticating against {}", config.siwx_url);
+                let tokens = siwx_oidc_auth::authenticate(
+                    &config.siwx_url,
+                    &client_id,
+                    &redirect_uri,
+                    &key,
+                )
+                .await
+                .context("siwx-oidc authentication failed")?;
+                let expires_in = tokens.expires_in.unwrap_or(300);
+                tracing::info!("access token acquired (expires in {}s)", expires_in);
+
+                let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
+                tracing::info!(
+                    "matrix user: {}, device: {}",
+                    identity.user_id,
+                    identity.device_id
+                );
+
+                config_file.session = Some(SessionCache {
+                    access_token: tokens.access_token.clone(),
+                    user_id: identity.user_id.clone(),
+                    device_id: identity.device_id.clone(),
+                    expires_at_unix: unix_now().saturating_add(expires_in),
+                });
+                if let Err(e) = config_file.save(&config_path) {
+                    tracing::warn!("failed to persist session cache: {e:#} (continuing anyway)");
+                }
+                (tokens.access_token, identity.user_id, identity.device_id)
+            }
+        };
+
+        let user_id: OwnedUserId = user_id_str
             .try_into()
             .map_err(|e| anyhow!("invalid user_id: {e}"))?;
-        let device_id: OwnedDeviceId = identity.device_id.into();
+        let device_id: OwnedDeviceId = device_id_str.into();
 
         std::fs::create_dir_all(&config.store_dir)?;
-        let client = Client::builder()
-            .homeserver_url(&config.matrix_url)
-            .sqlite_store(&config.store_dir, None)
-            .build()
-            .await
-            .context("failed to build Matrix client")?;
 
-        let session = matrix_sdk::authentication::matrix::MatrixSession {
-            meta: SessionMeta {
-                user_id: user_id.clone(),
-                device_id,
-            },
-            tokens: SessionTokens {
-                access_token: tokens.access_token,
-                refresh_token: None,
-            },
+        // Build client + restore session, with one wipe-and-retry on store mismatch.
+        // siwx-oidc mints a new device_id on every fresh auth; the SQLite crypto
+        // store binds to the device_id it was created with. When they diverge we
+        // wipe matrix-sdk-*.sqlite3* (NOT config.toml) and let cross-signing
+        // re-bootstrap on the new device.
+        let client = match build_and_restore(
+            &config.matrix_url,
+            &config.store_dir,
+            &user_id,
+            &device_id,
+            &access_token,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) if is_store_mismatch(&e) => {
+                tracing::warn!(
+                    "crypto store device_id mismatch; wiping store and retrying once: {e:#}"
+                );
+                wipe_crypto_store(&config.store_dir);
+                build_and_restore(
+                    &config.matrix_url,
+                    &config.store_dir,
+                    &user_id,
+                    &device_id,
+                    &access_token,
+                )
+                .await
+                .context("restore_session failed even after store wipe")?
+            }
+            Err(e) => return Err(e),
         };
-        client
-            .matrix_auth()
-            .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
-            .await
-            .context("failed to restore session")?;
 
         tracing::info!("running initial sync");
         client

@@ -3,6 +3,8 @@
 Rust library and CLI for Matrix agent communication with E2E encryption.
 Agents authenticate via [siwx-oidc](https://github.com/inblockio/siwx-oidc) using decentralized identifiers (DIDs), not passwords.
 
+**Architecture & troubleshooting:** see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the host's full agent layout (heartbeat ops channel, claude-channel LLM channel, local claude-bridge tmux), identity/device-id persistence model, stream-sync design, and the troubleshooting decision tree. Read it first when something is broken.
+
 ## If you are an AI agent: how to send and receive messages
 
 This repo is your messaging tool. Use `/matrix-message` for the full skill, or follow the quick start below.
@@ -118,6 +120,7 @@ The hook reads the latest `usage.input_tokens` from the active transcript, so to
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
 | `/heartbeat` | Run aqua-matrix-agent as a daemon DMing status every 10min AND honoring `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell logs` commands sent from `--target` |
 | `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawnable via `#shell respawn` |
+| `/claude-channel` | Matrix LLM channel daemon — separate identity, forwards DMs from `--target` to `claude -p` and replies with stdout; respawnable via `#shell respawn-channel` |
 
 **Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:
 

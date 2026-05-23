@@ -1,0 +1,23 @@
+[Unit]
+Description=Aqua Matrix claude-channel (LLM bridge — DM in, `claude -p` reply out)
+Documentation=https://github.com/inblockio/aqua-matrix-hello
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aqua-matrix-hello
+# Forward CONTEXT_WINDOW for consistency with the heartbeat (status payloads
+# only matter on the heartbeat side, but keep envs aligned).
+Environment=CONTEXT_WINDOW=1000000
+# claude is at ~/.local/bin/claude; the daemon also resolves this dynamically
+# but setting PATH lets a future PATH-based claude lookup work too.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --claude-channel --key-file claude-channel.pem --store-dir %h/.aqua-matrix-claude-channel
+Restart=on-failure
+RestartSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

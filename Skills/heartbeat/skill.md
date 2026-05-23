@@ -21,7 +21,8 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 | `#shell ping` | `pong @ <UTC timestamp>` |
 | `#shell uptime` | Agent loop uptime + host uptime |
 | `#shell restart` | Acks, then spawns `systemctl --user restart aqua-matrix-heartbeat`. systemd kills the running daemon and starts a fresh one. |
-| `#shell respawn` | Restart the LLM bridge: spawns `systemctl --user restart claude-bridge`, which kills the tmux session running `claude --dangerously-skip-permissions` and recreates it. |
+| `#shell respawn` | Restart the LOCAL interactive Claude in tmux: `systemctl --user restart claude-bridge`. For local `tmux attach`, not Matrix replies. |
+| `#shell respawn-channel` | Restart the Matrix LLM channel daemon: `systemctl --user restart aqua-matrix-claude-channel`. |
 | `#shell logs [N]` | Last N lines from `journalctl --user -u aqua-matrix-heartbeat` (default 10, max 50) |
 
 **Security**: only messages whose sender matches `--target` are honored. Anyone else who DMs the heartbeat identity is ignored. Anything not matching a known subcommand yields `unknown command: ...` plus the help text.
@@ -30,7 +31,9 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 
 **`#shell restart` safety**: because the watermark is initialized after startup, the freshly-started daemon will NOT see the original `#shell restart` message and will not loop.
 
-**Restart reliability**: the heartbeat systemd unit runs `ExecStartPre=rm -f %h/.aqua-matrix-heartbeat/matrix-sdk-*.sqlite3*` before each start. This wipes the matrix-sdk crypto SQLite store (but keeps `config.toml` with the OIDC creds). Reason: siwx-oidc mints a new `device_id` on every re-auth and the crypto store binds to the previous one, causing `account in the store doesn't match` failures otherwise.
+**Restart reliability**: handled in code, not via systemd. `AgentClient::connect` caches the access token + device_id in `~/.aqua-matrix-heartbeat/config.toml` and reuses them on restart if still valid (~5 min window). If the cached token has expired, fresh auth mints a new device_id; if that triggers `account in the store doesn't match`, the connect code wipes `matrix-sdk-*.sqlite3*` and retries `restore_session` once. No more `ExecStartPre` wipe. See `docs/ARCHITECTURE.md` "Identity and device-id persistence".
+
+**Sync model**: stream sync, not polling. `client.sync(...)` runs forever in a background tokio task; a registered event handler dispatches incoming `#shell` commands within ~1 second of receipt (not a 30s tick).
 
 ## Quick start (foreground)
 
