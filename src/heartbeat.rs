@@ -6,13 +6,17 @@
 //!   * host        — hostname, host uptime, load, free RAM, disk on /
 //!   * Claude Code — most-recent active transcript's context usage, model, last tool/user
 //!
-//! Commands (only honored when sender == --target):
-//!   /help      list commands
-//!   /status    immediate status payload
-//!   /ping      pong + timestamp
-//!   /uptime    agent + host uptime
-//!   /restart   spawn `systemctl --user restart aqua-matrix-heartbeat`
-//!   /logs [N]  last N journal lines (default 10, capped at 50)
+//! Commands (only honored when sender == --target, prefix `#shell`):
+//!   #shell help          list commands
+//!   #shell status        immediate status payload
+//!   #shell ping          pong + timestamp
+//!   #shell uptime        agent + host uptime
+//!   #shell restart       spawn `systemctl --user restart aqua-matrix-heartbeat`
+//!   #shell respawn       spawn `systemctl --user restart claude-bridge` (the LLM bridge)
+//!   #shell logs [N]      last N journal lines (default 10, capped at 50)
+//!
+//! The `#shell` prefix is required to avoid colliding with other messengers'
+//! own `/command` slash menus. Matching is case-insensitive on the prefix.
 //!
 //! Inner loop ticks every COMMAND_POLL_INTERVAL (30s) to remain responsive to
 //! commands; the heartbeat payload is sent on the user-supplied interval
@@ -129,7 +133,8 @@ async fn process_commands(
             continue;
         }
         let body = msg.body.trim();
-        if !body.starts_with('/') {
+        let lower = body.to_lowercase();
+        if !(lower.starts_with("#shell ") || lower == "#shell") {
             watermark_ms = msg.timestamp_ms;
             continue;
         }
@@ -148,30 +153,41 @@ async fn process_commands(
 }
 
 fn handle_command(input: &str, stats: &HeartbeatStats) -> String {
+    // input is the full message body, starts with "#shell" (case-insensitive).
+    // parts[0] == "#shell", parts[1] == subcommand, parts[2..] == args.
     let parts: Vec<&str> = input.split_whitespace().collect();
-    let cmd = parts.first().copied().unwrap_or("").to_lowercase();
+    let cmd = parts.get(1).copied().unwrap_or("").to_lowercase();
 
     match cmd.as_str() {
-        "/help" => help_text(),
-        "/ping" => format!("pong @ {}", now_string()),
-        "/status" => build_status(stats),
-        "/uptime" => format!(
+        "" | "help" => help_text(),
+        "ping" => format!("pong @ {}", now_string()),
+        "status" => build_status(stats),
+        "uptime" => format!(
             "agent up {} | host up {}",
             format_duration(stats.start.elapsed()),
             host_uptime().unwrap_or_else(|| "?".into()),
         ),
-        "/restart" => {
+        "restart" => {
             match std::process::Command::new("systemctl")
                 .args(["--user", "restart", "aqua-matrix-heartbeat"])
                 .spawn()
             {
                 Ok(_) => "restarting heartbeat unit (systemctl --user restart aqua-matrix-heartbeat)".to_string(),
-                Err(e) => format!("/restart failed to spawn systemctl: {e}"),
+                Err(e) => format!("#shell restart failed to spawn systemctl: {e}"),
             }
         }
-        "/logs" => {
+        "respawn" => {
+            match std::process::Command::new("systemctl")
+                .args(["--user", "restart", "claude-bridge"])
+                .spawn()
+            {
+                Ok(_) => "respawning LLM bridge (systemctl --user restart claude-bridge)".to_string(),
+                Err(e) => format!("#shell respawn failed to spawn systemctl: {e}"),
+            }
+        }
+        "logs" => {
             let n = parts
-                .get(1)
+                .get(2)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(10)
                 .clamp(1, 50);
@@ -183,13 +199,14 @@ fn handle_command(input: &str, stats: &HeartbeatStats) -> String {
 
 fn help_text() -> String {
     [
-        "aqua-matrix-agent heartbeat — supported commands:",
-        "  /help        this message",
-        "  /status      send a status payload now (same content as periodic heartbeat)",
-        "  /ping        reply pong + timestamp",
-        "  /uptime      agent + host uptime",
-        "  /restart     restart the heartbeat systemd unit",
-        "  /logs [N]    last N journal lines (default 10, max 50)",
+        "aqua-matrix-agent heartbeat — supported commands (prefix `#shell`):",
+        "  #shell help        this message",
+        "  #shell status      send a status payload now (same content as periodic heartbeat)",
+        "  #shell ping        reply pong + timestamp",
+        "  #shell uptime      agent + host uptime",
+        "  #shell restart     restart the heartbeat systemd unit",
+        "  #shell respawn     restart the LLM bridge (claude-bridge tmux session)",
+        "  #shell logs [N]    last N journal lines (default 10, max 50)",
         "",
         "Commands are honored only when sender matches the configured --target.",
     ]

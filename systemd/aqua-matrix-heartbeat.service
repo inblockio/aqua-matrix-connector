@@ -6,6 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# siwx-oidc mints a fresh device_id on every re-auth, but the matrix-sdk
+# SQLite crypto store binds to the previous one — so any restart fails
+# with `account in the store doesn't match`. Wiping the crypto SQLite files
+# (NOT config.toml) before each start sidesteps this so /restart works.
+ExecStartPre=/bin/sh -c 'rm -f %h/.aqua-matrix-heartbeat/matrix-sdk-*.sqlite3*'
 ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
 Restart=on-failure
 RestartSec=30s

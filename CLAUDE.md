@@ -116,7 +116,8 @@ The hook reads the latest `usage.input_tokens` from the active transcript, so to
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
-| `/heartbeat` | Run aqua-matrix-agent as a daemon DMing status every 10min AND honoring `/help`, `/status`, `/ping`, `/uptime`, `/restart`, `/logs` commands sent from `--target` |
+| `/heartbeat` | Run aqua-matrix-agent as a daemon DMing status every 10min AND honoring `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell logs` commands sent from `--target` |
+| `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawnable via `#shell respawn` |
 
 **Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:
 

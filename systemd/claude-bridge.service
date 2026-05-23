@@ -1,0 +1,20 @@
+[Unit]
+Description=Persistent claude-ws session in tmux (LLM-Claude-Agent-Bridge)
+Documentation=https://github.com/inblockio/aqua-matrix-hello
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# `tmux new-session -d` returns once the session is detached, so we use
+# oneshot+RemainAfterExit: systemd considers the unit active for as long as
+# the tmux session exists. `systemctl --user restart` runs ExecStop (kill
+# the session) then ExecStart (recreate it) — that is what `#shell respawn`
+# in the heartbeat triggers.
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/aqua-matrix-hello
+ExecStart=/usr/bin/tmux new-session -d -s claude-bridge -- %h/.local/bin/claude --dangerously-skip-permissions
+ExecStop=/usr/bin/tmux kill-session -t claude-bridge
+
+[Install]
+WantedBy=default.target
