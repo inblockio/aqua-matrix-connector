@@ -50,6 +50,17 @@ pub async fn run(agent: &AgentClient, target: &str, interval: Duration) {
         target
     );
 
+    // 0. One-shot hello so the operator sees the daemon come online in Element.
+    let hello = format!(
+        "[hello] aqua-matrix-heartbeat online @ {} (identity: {}). I send a status payload every {}s. Reply with `#shell help` for the command list.",
+        now_string(),
+        agent.user_id(),
+        interval.as_secs(),
+    );
+    if let Err(e) = agent.send_dm(&target, &hello).await {
+        tracing::warn!("hello send failed: {e:#}");
+    }
+
     // 1. Register the message event handler BEFORE sync starts so we don't miss
     //    events on the initial sync pass.
     register_command_handler(agent.clone(), target.clone(), stats.clone(), watermark.clone());

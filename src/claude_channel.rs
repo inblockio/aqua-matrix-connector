@@ -33,6 +33,16 @@ pub async fn run(agent: &AgentClient, target: &str) {
         target
     );
 
+    // One-shot hello so the operator sees the daemon come online in Element.
+    let hello = format!(
+        "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. {}s timeout per invocation, stateless per message.",
+        agent.user_id(),
+        CLAUDE_TIMEOUT.as_secs(),
+    );
+    if let Err(e) = agent.send_dm(&target, &hello).await {
+        tracing::warn!("hello send failed: {e:#}");
+    }
+
     // Register the message handler before sync starts.
     register_handler(agent.clone(), target.clone(), watermark.clone());
 
