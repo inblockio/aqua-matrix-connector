@@ -12,8 +12,8 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 | Claude inside `claude-bridge` tmux exits (`/quit`, crash, OOM) | Supervisor's 10s tick re-runs `tmux new-session` | ≤10s |
 | `claude-bridge` supervisor itself dies | systemd respawns the supervisor, which respawns tmux | ~5s |
 | Matrix sync stream errors (homeserver reachable but transient) | matrix-sdk-internal retry | seconds |
-| Matrix sync stream errors (homeserver/network down for a while) | our loop catches it, sleeps 5s, calls `client.sync()` again | 5s after server is back |
-| Access token expires while daemon is running | matrix-sdk uses the token until rejected; on restart, refresh-grant exchanges for new token | next restart, ~1 call to `/token` |
+| Matrix sync stream errors (homeserver/network down for a while) | inner cycle's sync future returns Err → outer loop reconnects (tier-2 refresh) | seconds after server is back |
+| Access token nears expiry while daemon is running | daemon proactively rotates the matrix-sdk Client `REFRESH_GUARD_SECS` (30s) before `expires_at_unix`. Tier-2 refresh-grant in `AgentClient::connect` mints a new access token, `device_id` preserved, crypto store untouched. No 401 reaches the server | TTL − 30s, no operator-visible disruption |
 | WSL reboots | wsl.conf `systemd=true` + linger + units `enabled` brings all three up | seconds after WSL itself starts |
 
 ## At a glance — what requires human intervention
@@ -30,17 +30,21 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 
 ### `aqua-matrix-heartbeat.service`
 
-- `Restart=always`, `RestartSec=5s`, crash-loop guard `StartLimitBurst=10 / IntervalSec=300`
-- On restart: `connect()` runs the three-tier session resolution
-  1. cached access token still valid → reuse (one `/whoami` call, ~50ms)
+- `Restart=always`, `RestartSec=5s`, crash-loop guard `StartLimitBurst=10 / IntervalSec=300` (in `[Unit]`, not `[Service]`)
+- **Outer loop owns AgentClient lifecycle.** Each iteration:
+  1. `AgentClient::connect()` runs the three-tier session resolution (see below)
+  2. Inner cycle (`run_cycle`) registers the message handler, spawns `client.sync()`, runs heartbeat ticks. Returns when **either** the refresh deadline (`expires_at_unix − REFRESH_GUARD_SECS`) is reached **or** the sync future ends (network blip, fatal error)
+  3. Outer loop drops the AgentClient and reconnects. matrix-sdk has no public API to swap an access token in place, so we rotate the whole Client instead — `device_id` is preserved through the rebuild via tier-2.
+- Three-tier session resolution inside `connect()`:
+  1. cached access token still valid → reuse (one `/whoami` call, ~50 ms)
   2. cached refresh_token + did → `siwx_oidc_auth::refresh()` → new access token, **same `device_id`**, crypto store untouched (one `/token` call)
   3. neither → fresh OAuth code flow → **new `device_id`**, store-mismatch handler wipes `matrix-sdk-*.sqlite3*` and retries `restore_session` once, cross-signing re-bootstraps
-- Stream sync (`client.sync()` in background tokio task): on `Err(e)`, the loop catches, sleeps 5s, retries. No restart of the systemd unit needed for transient sync errors.
-- Watermark: initialized to `now()` on every start so commands sent before the daemon was online are NOT re-processed (in particular: `#shell restart` does not loop)
+- Steady state on a 300 s siwx-oidc token TTL: tier-2 refresh-grant fires roughly every 270 s, no `M_UNKNOWN_TOKEN` ever reaches the server.
+- Heartbeat stats (`sent`, `commands_handled`, `start`) survive rotations — they live outside `run_cycle`. Watermark is reset per cycle because event handlers are re-registered on the new Client; the matrix-sdk initial sync after each reconnect fetches anything missed.
 
 ### `aqua-matrix-claude-channel.service`
 
-Identical recovery profile to heartbeat — same `Restart=always`, same three-tier auth, same stream-sync recovery, same watermark behavior.
+Identical recovery profile to heartbeat — same outer-loop rotation, same three-tier auth, same `Restart=always`. No periodic tick of its own; the inner cycle parks on `select!` until refresh deadline or sync exit.
 
 Differences in failure modes specific to claude-channel:
 - Per-message `claude -p` invocation has a 180s timeout; on timeout the daemon replies with `[claude-channel error] claude -p timed out after 180s` and stays running.

@@ -1,10 +1,17 @@
 //! Heartbeat daemon: 10-min status DM + `#shell` command channel, driven by
 //! matrix-sdk's continuous sync stream (near-realtime, not polling).
 //!
-//! Three concurrent tasks:
+//! Three concurrent tasks per client lifecycle:
 //!   1. background sync (`client.sync()` looping forever) — pulls events
 //!   2. message event handler (registered before sync starts) — dispatches commands
 //!   3. heartbeat timer (this function's main loop) — sends status every `interval`
+//!
+//! Resilience: an outer loop owns AgentClient lifecycle. ~30 s before the
+//! siwx-oidc access token expires, the inner cycle returns, the AgentClient
+//! is dropped, and a fresh one is built via `AgentClient::connect` — which
+//! hits the tier-2 refresh-grant path, preserves device_id, and leaves the
+//! crypto store untouched. This avoids the M_UNKNOWN_TOKEN sync-loop wedge
+//! that matrix-sdk has no public hook to recover from on its own.
 //!
 //! See docs/ARCHITECTURE.md for the full design and rationale.
 use std::path::{Path, PathBuf};
@@ -19,7 +26,16 @@ use matrix_sdk::{
 };
 use tokio::sync::Mutex;
 
-use crate::AgentClient;
+use crate::{AgentClient, AgentConfig};
+
+/// Refresh `REFRESH_GUARD_SECS` before the access token expires server-side.
+/// 30 s gives the tier-2 refresh-grant round trip + new initial sync ample
+/// headroom inside the (typically 300 s) token TTL.
+const REFRESH_GUARD_SECS: u64 = 30;
+/// Minimum sleep between rotations. Bounds the worst case where the token
+/// already arrived close to expiry — better to rotate immediately than to
+/// hammer siwx-oidc, but still give one heartbeat tick a chance to fire.
+const MIN_CYCLE_SECS: u64 = 15;
 
 pub struct HeartbeatStats {
     start: Instant,
@@ -39,54 +55,116 @@ impl HeartbeatStats {
     }
 }
 
-pub async fn run(agent: &AgentClient, target: &str, interval: Duration) {
+pub async fn run(config: AgentConfig, target: &str, interval: Duration) {
+    // Stats survive client rotations — restart-on-token-rotation should look
+    // like uninterrupted uptime to the operator, not a fresh boot.
     let stats = Arc::new(Mutex::new(HeartbeatStats::new()));
-    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
     let target = Arc::new(target.to_string());
 
     tracing::info!(
-        "heartbeat daemon starting (heartbeat interval: {}s, target: {}, sync: stream)",
+        "heartbeat daemon starting (heartbeat interval: {}s, target: {}, sync: stream, refresh-guard: {}s)",
         interval.as_secs(),
-        target
+        target,
+        REFRESH_GUARD_SECS,
     );
 
-    // 0. One-shot hello so the operator sees the daemon come online in Element.
-    let hello = format!(
-        "[hello] aqua-matrix-heartbeat online @ {} (identity: {}). I send a status payload every {}s. Reply with `#shell help` for the command list.",
-        now_string(),
-        agent.user_id(),
-        interval.as_secs(),
-    );
-    if let Err(e) = agent.send_dm(&target, &hello).await {
-        tracing::warn!("hello send failed: {e:#}");
-    }
-
-    // 1. Register the message event handler BEFORE sync starts so we don't miss
-    //    events on the initial sync pass.
-    register_command_handler(agent.clone(), target.clone(), stats.clone(), watermark.clone());
-
-    // 2. Background sync — runs forever. On error, log and reconnect.
-    let sync_client = agent.client().clone();
-    tokio::spawn(async move {
-        loop {
-            tracing::info!("starting matrix sync stream");
-            match sync_client.sync(SyncSettings::default()).await {
-                Ok(_) => {
-                    tracing::warn!("matrix sync returned Ok (unexpected); reconnecting in 5s");
-                }
-                Err(e) => {
-                    tracing::warn!("matrix sync error: {e:#}; reconnecting in 5s");
-                }
+    let mut first_cycle = true;
+    loop {
+        let agent = match AgentClient::connect(config.clone()).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("heartbeat: AgentClient::connect failed: {e:#}; retrying in 10s");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+        };
+
+        if let Err(e) = agent.join_invited_rooms().await {
+            tracing::warn!("heartbeat: join_invited_rooms failed: {e:#}");
         }
+
+        let now = unix_now_secs();
+        let ttl = agent
+            .expires_at_unix()
+            .saturating_sub(now)
+            .saturating_sub(REFRESH_GUARD_SECS)
+            .max(MIN_CYCLE_SECS);
+        let refresh_deadline = tokio::time::Instant::now() + Duration::from_secs(ttl);
+        tracing::info!(
+            "heartbeat: client cycle starting (token ttl {}s, rotating in {}s)",
+            agent.expires_at_unix().saturating_sub(now),
+            ttl,
+        );
+
+        if first_cycle {
+            let hello = format!(
+                "[hello] aqua-matrix-heartbeat online @ {} (identity: {}). I send a status payload every {}s. Reply with `#shell help` for the command list.",
+                now_string(),
+                agent.user_id(),
+                interval.as_secs(),
+            );
+            if let Err(e) = agent.send_dm(&target, &hello).await {
+                tracing::warn!("hello send failed: {e:#}");
+            }
+            first_cycle = false;
+        }
+
+        let exit = run_cycle(&agent, &target, interval, &stats, refresh_deadline).await;
+        tracing::info!("heartbeat: cycle ended ({exit}); reconnecting");
+    }
+}
+
+async fn run_cycle(
+    agent: &AgentClient,
+    target: &Arc<String>,
+    interval: Duration,
+    stats: &Arc<Mutex<HeartbeatStats>>,
+    refresh_deadline: tokio::time::Instant,
+) -> &'static str {
+    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
+    register_command_handler(agent.clone(), target.clone(), stats.clone(), watermark);
+
+    let sync_client = agent.client().clone();
+    let mut sync_task = tokio::spawn(async move {
+        sync_client.sync(SyncSettings::default()).await
     });
 
-    // 3. Heartbeat timer.
-    loop {
-        send_heartbeat(agent, &target, &stats).await;
-        tokio::time::sleep(interval).await;
-    }
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick — the hello (or the previous cycle's last
+    // heartbeat) just went out; let the operator see the cadence.
+    tick.tick().await;
+
+    let exit = loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(refresh_deadline) => {
+                break "refresh-deadline";
+            }
+            res = &mut sync_task => {
+                match res {
+                    Ok(Ok(_)) => tracing::warn!("matrix sync returned Ok (unexpected)"),
+                    Ok(Err(e)) => tracing::warn!("matrix sync error: {e:#}"),
+                    Err(e) => tracing::warn!("matrix sync task join error: {e:#}"),
+                }
+                break "sync-ended";
+            }
+            _ = tick.tick() => {
+                send_heartbeat(agent, target, stats).await;
+            }
+        }
+    };
+
+    sync_task.abort();
+    let _ = sync_task.await;
+    exit
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn register_command_handler(

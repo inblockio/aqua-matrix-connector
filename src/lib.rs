@@ -135,6 +135,7 @@ pub async fn register_oidc_client(siwx_url: &str) -> Result<(String, String)> {
 // Agent config and resolution
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct AgentConfig {
     pub key_file: PathBuf,
     pub siwx_url: String,
@@ -156,6 +157,11 @@ pub struct AgentClient {
     client: Client,
     did: String,
     user_id: OwnedUserId,
+    /// Unix seconds when the current access token expires. Used by the daemon
+    /// outer-loop to proactively rotate the matrix-sdk Client (which has no
+    /// public API to swap tokens in place) ~30 s before the server starts
+    /// returning M_UNKNOWN_TOKEN.
+    expires_at_unix: u64,
 }
 
 impl AgentClient {
@@ -164,6 +170,10 @@ impl AgentClient {
     /// drive `client.sync(...)` directly.
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
     }
 }
 
@@ -348,7 +358,7 @@ impl AgentClient {
         let now_unix = unix_now();
         let cached_clone = config_file.session.clone();
 
-        let session_data: Option<(String, String, String)> = if let Some(sess) = cached_clone {
+        let session_data: Option<(String, String, String, u64)> = if let Some(sess) = cached_clone {
             if sess.expires_at_unix > now_unix + 30 {
                 tracing::info!(
                     "cached access token still valid ({}s left, device_id: {})",
@@ -358,7 +368,7 @@ impl AgentClient {
                 match resolve_identity(&config.matrix_url, &sess.access_token).await {
                     Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
                         tracing::info!("cached session validated; skipping auth");
-                        Some((sess.access_token, sess.user_id, sess.device_id))
+                        Some((sess.access_token, sess.user_id, sess.device_id, sess.expires_at_unix))
                     }
                     Ok(_) => {
                         tracing::warn!("cached session whoami returned different identity; falling through");
@@ -395,7 +405,7 @@ impl AgentClient {
                         if let Err(e) = config_file.save(&config_path) {
                             tracing::warn!("failed to persist refreshed session: {e:#}");
                         }
-                        Some((refreshed.access_token, refreshed.user_id, refreshed.device_id))
+                        Some((refreshed.access_token, refreshed.user_id, refreshed.device_id, refreshed.expires_at_unix))
                     }
                     Err(e) => {
                         tracing::warn!("refresh grant failed: {e:#}; falling through to fresh auth");
@@ -410,8 +420,8 @@ impl AgentClient {
             None
         };
 
-        let (access_token, user_id_str, device_id_str) = match session_data {
-            Some(triple) => triple,
+        let (access_token, user_id_str, device_id_str, expires_at_unix) = match session_data {
+            Some(quad) => quad,
             None => {
                 tracing::info!("authenticating against {}", config.siwx_url);
                 let tokens = siwx_oidc_auth::authenticate(
@@ -436,18 +446,19 @@ impl AgentClient {
                     identity.device_id
                 );
 
+                let expires_at_unix = unix_now().saturating_add(expires_in);
                 config_file.session = Some(SessionCache {
                     access_token: tokens.access_token.clone(),
                     user_id: identity.user_id.clone(),
                     device_id: identity.device_id.clone(),
-                    expires_at_unix: unix_now().saturating_add(expires_in),
+                    expires_at_unix,
                     refresh_token: tokens.refresh_token,
                     did: Some(tokens.did.clone()),
                 });
                 if let Err(e) = config_file.save(&config_path) {
                     tracing::warn!("failed to persist session cache: {e:#} (continuing anyway)");
                 }
-                (tokens.access_token, identity.user_id, identity.device_id)
+                (tokens.access_token, identity.user_id, identity.device_id, expires_at_unix)
             }
         };
 
@@ -532,6 +543,7 @@ impl AgentClient {
             client,
             did,
             user_id,
+            expires_at_unix,
         })
     }
 

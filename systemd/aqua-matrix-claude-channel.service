@@ -3,6 +3,10 @@ Description=Aqua Matrix claude-channel (LLM bridge — DM in, `claude -p` reply 
 Documentation=https://github.com/inblockio/aqua-matrix-hello
 After=network-online.target
 Wants=network-online.target
+# Crash-loop guard belongs in [Unit] in modern systemd; [Service] placement
+# is silently ignored.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -16,8 +20,6 @@ Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-agent --claude-channel --key-file claude-channel.pem --store-dir %h/.aqua-matrix-claude-channel
 Restart=always
 RestartSec=5s
-StartLimitIntervalSec=300
-StartLimitBurst=10
 StandardOutput=journal
 StandardError=journal
 

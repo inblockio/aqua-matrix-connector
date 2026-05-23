@@ -5,6 +5,9 @@
 //! stateless per message. No conversation continuity for now (could be added
 //! later via `claude -c <session-id>` keyed by room or user).
 //!
+//! Resilience: an outer loop owns AgentClient lifecycle and rotates it ~30 s
+//! before the siwx-oidc access token expires, matching `heartbeat.rs`.
+//!
 //! See docs/ARCHITECTURE.md for the full design.
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,48 +22,103 @@ use matrix_sdk::{
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::AgentClient;
+use crate::{AgentClient, AgentConfig};
 
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_REPLY_BYTES: usize = 16_000; // Matrix can take more, but be polite
+const REFRESH_GUARD_SECS: u64 = 30;
+const MIN_CYCLE_SECS: u64 = 15;
 
-pub async fn run(agent: &AgentClient, target: &str) {
-    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
+pub async fn run(config: AgentConfig, target: &str) {
     let target = Arc::new(target.to_string());
 
     tracing::info!(
-        "claude-channel daemon starting (target: {}, sync: stream)",
-        target
+        "claude-channel daemon starting (target: {}, sync: stream, refresh-guard: {}s)",
+        target,
+        REFRESH_GUARD_SECS,
     );
 
-    // One-shot hello so the operator sees the daemon come online in Element.
-    let hello = format!(
-        "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. {}s timeout per invocation, stateless per message.",
-        agent.user_id(),
-        CLAUDE_TIMEOUT.as_secs(),
-    );
-    if let Err(e) = agent.send_dm(&target, &hello).await {
-        tracing::warn!("hello send failed: {e:#}");
-    }
-
-    // Register the message handler before sync starts.
-    register_handler(agent.clone(), target.clone(), watermark.clone());
-
-    // Background sync — runs forever.
-    let sync_client = agent.client().clone();
-    tokio::spawn(async move {
-        loop {
-            tracing::info!("starting matrix sync stream");
-            match sync_client.sync(SyncSettings::default()).await {
-                Ok(_) => tracing::warn!("matrix sync returned Ok (unexpected); reconnecting in 5s"),
-                Err(e) => tracing::warn!("matrix sync error: {e:#}; reconnecting in 5s"),
+    let mut first_cycle = true;
+    loop {
+        let agent = match AgentClient::connect(config.clone()).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("claude-channel: AgentClient::connect failed: {e:#}; retrying in 10s");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+        };
+
+        if let Err(e) = agent.join_invited_rooms().await {
+            tracing::warn!("claude-channel: join_invited_rooms failed: {e:#}");
         }
+
+        let now = unix_now_secs();
+        let ttl = agent
+            .expires_at_unix()
+            .saturating_sub(now)
+            .saturating_sub(REFRESH_GUARD_SECS)
+            .max(MIN_CYCLE_SECS);
+        let refresh_deadline = tokio::time::Instant::now() + Duration::from_secs(ttl);
+        tracing::info!(
+            "claude-channel: client cycle starting (token ttl {}s, rotating in {}s)",
+            agent.expires_at_unix().saturating_sub(now),
+            ttl,
+        );
+
+        if first_cycle {
+            let hello = format!(
+                "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. {}s timeout per invocation, stateless per message.",
+                agent.user_id(),
+                CLAUDE_TIMEOUT.as_secs(),
+            );
+            if let Err(e) = agent.send_dm(&target, &hello).await {
+                tracing::warn!("hello send failed: {e:#}");
+            }
+            first_cycle = false;
+        }
+
+        let exit = run_cycle(&agent, &target, refresh_deadline).await;
+        tracing::info!("claude-channel: cycle ended ({exit}); reconnecting");
+    }
+}
+
+async fn run_cycle(
+    agent: &AgentClient,
+    target: &Arc<String>,
+    refresh_deadline: tokio::time::Instant,
+) -> &'static str {
+    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
+    register_handler(agent.clone(), target.clone(), watermark);
+
+    let sync_client = agent.client().clone();
+    let mut sync_task = tokio::spawn(async move {
+        sync_client.sync(SyncSettings::default()).await
     });
 
-    // Park forever — sync drives all work via event handler.
-    std::future::pending::<()>().await;
+    let exit = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(refresh_deadline) => "refresh-deadline",
+        res = &mut sync_task => {
+            match res {
+                Ok(Ok(_)) => tracing::warn!("matrix sync returned Ok (unexpected)"),
+                Ok(Err(e)) => tracing::warn!("matrix sync error: {e:#}"),
+                Err(e) => tracing::warn!("matrix sync task join error: {e:#}"),
+            }
+            "sync-ended"
+        }
+    };
+
+    sync_task.abort();
+    let _ = sync_task.await;
+    exit
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn register_handler(agent: AgentClient, target: Arc<String>, watermark: Arc<AtomicU64>) {

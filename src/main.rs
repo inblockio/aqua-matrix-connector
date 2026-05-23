@@ -104,26 +104,29 @@ async fn main() -> Result<()> {
         store_dir: args.store_dir.unwrap_or_else(default_store_dir),
     };
 
+    if args.heartbeat && args.claude_channel {
+        anyhow::bail!("--heartbeat and --claude-channel are mutually exclusive");
+    }
+
+    // Daemon modes own their own AgentClient lifecycle (they rotate it every
+    // few minutes ahead of token expiry — see heartbeat::run / claude_channel::run).
+    if args.heartbeat {
+        let interval = Duration::from_secs(args.heartbeat_interval);
+        heartbeat::run(config, &args.target, interval).await;
+        return Ok(());
+    }
+
+    if args.claude_channel {
+        claude_channel::run(config, &args.target).await;
+        return Ok(());
+    }
+
+    // One-shot CLI invocations connect once and exit.
     let agent = AgentClient::connect(config).await?;
 
     let joined = agent.join_invited_rooms().await?;
     if !joined.is_empty() {
         agent.sync_once().await?;
-    }
-
-    if args.heartbeat && args.claude_channel {
-        anyhow::bail!("--heartbeat and --claude-channel are mutually exclusive");
-    }
-
-    if args.heartbeat {
-        let interval = Duration::from_secs(args.heartbeat_interval);
-        heartbeat::run(&agent, &args.target, interval).await;
-        return Ok(());
-    }
-
-    if args.claude_channel {
-        claude_channel::run(&agent, &args.target).await;
-        return Ok(());
     }
 
     if let Some(ref msg) = args.message {
