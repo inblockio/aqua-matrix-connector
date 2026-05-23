@@ -5,10 +5,10 @@ description: Run aqua-matrix-agent as a heartbeat + Matrix command channel (dete
 
 # Heartbeat + Command Channel
 
-`--heartbeat` puts the agent into a dual-purpose loop:
+`--heartbeat` puts the agent into a dual-purpose daemon — see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design:
 
 1. **Heartbeat (outbound)**: every N seconds (default 600 = 10 min) it sends a status DM to `--target` containing agent, host, and Claude Code session facts.
-2. **Command channel (inbound)**: every 30 seconds it polls the same DM room. Messages from `--target` that start with `/` are parsed as commands and answered deterministically — no LLM involved.
+2. **Command channel (inbound)**: stream sync (matrix-sdk `client.sync()` in a background tokio task) plus an event handler delivers messages from `--target` within ~1s of arrival. Messages starting with `#shell` are parsed as commands and answered deterministically — no LLM involved.
 
 ## Command list
 
@@ -39,7 +39,7 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 
 ```bash
 cd ~/aqua-matrix-hello
-./target/release/aqua-matrix-agent --heartbeat
+./target/debug/aqua-matrix-agent --heartbeat
 ```
 
 Stops on Ctrl+C / SIGTERM. Send failures are logged and retried next tick — the daemon does not crash on transient errors.
@@ -48,10 +48,10 @@ Stops on Ctrl+C / SIGTERM. Send failures are logged and retried next tick — th
 
 ```bash
 # Different recipient
-./target/release/aqua-matrix-agent --heartbeat --target "@user:matrix.inblock.io"
+./target/debug/aqua-matrix-agent --heartbeat --target "@user:matrix.inblock.io"
 
 # 5-minute interval instead of 10
-./target/release/aqua-matrix-agent --heartbeat --heartbeat-interval 300
+./target/debug/aqua-matrix-agent --heartbeat --heartbeat-interval 300
 ```
 
 ## Auto-start with WSL

@@ -3,9 +3,9 @@ name: claude-bridge
 description: Persistent claude-ws (Claude Code) session in a tmux session managed by systemd, respawnable via #shell respawn
 ---
 
-# Claude Bridge (LLM-Claude-Agent-Bridge)
+# Claude Bridge (local interactive Claude in tmux)
 
-A long-lived `claude --dangerously-skip-permissions` process running inside a detached tmux session named `claude-bridge`, supervised by the `claude-bridge.service` systemd user unit. The heartbeat's `#shell respawn` command restarts it remotely.
+A long-lived `claude --dangerously-skip-permissions` process running inside a detached tmux session named `claude-bridge`, supervised by the `claude-bridge.service` systemd user unit. The heartbeat's `#shell respawn` command restarts it remotely. For Matrix-routed Claude conversations see the separate `/claude-channel` skill — this skill is about the LOCAL interactive session you can `tmux attach` to. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full layout.
 
 ## Quick check
 

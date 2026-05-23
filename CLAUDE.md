@@ -12,7 +12,7 @@ This repo is your messaging tool. Use `/matrix-message` for the full skill, or f
 ### Send a message
 
 ```bash
-~/aqua-matrix-hello/target/release/aqua-matrix-agent --message "your message here"
+~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "your message here"
 ```
 
 No flags needed beyond `--message`. The agent auto-registers OIDC credentials on first run, caches them in `~/.aqua-matrix-agent/config.toml`, and defaults to messaging Tim.
@@ -20,38 +20,43 @@ No flags needed beyond `--message`. The agent auto-registers OIDC credentials on
 ### Read messages
 
 ```bash
-~/aqua-matrix-hello/target/release/aqua-matrix-agent --read --read-limit 20
+~/aqua-matrix-hello/target/debug/aqua-matrix-agent --read --read-limit 20
 ```
 
 ### Send and read in one call
 
 ```bash
-~/aqua-matrix-hello/target/release/aqua-matrix-agent --message "ping" --read
+~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "ping" --read
 ```
 
 ### Message a specific user
 
 ```bash
-~/aqua-matrix-hello/target/release/aqua-matrix-agent --message "hello" --target "@user:matrix.inblock.io"
+~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "hello" --target "@user:matrix.inblock.io"
 ```
 
 ### Use a different agent identity
 
 ```bash
-~/aqua-matrix-hello/target/release/aqua-matrix-agent --key-file other.pem --store-dir ~/.other-agent --message "hi"
+~/aqua-matrix-hello/target/debug/aqua-matrix-agent --key-file other.pem --store-dir ~/.other-agent --message "hi"
 ```
 
 Each key file produces a unique DID and separate Matrix account. Convention on this host:
 
 - `agent.pem` — chat identity (re-created on first chat run if absent)
 - `agent-b.pem` — second test identity for `/e2e-test`
-- `heartbeat.pem` — heartbeat-only identity used by the systemd unit. Do not reuse for chat — its crypto store lives separately at `~/.aqua-matrix-heartbeat/`.
+- `heartbeat.pem` — ops identity (heartbeat + `#shell` command channel). Store at `~/.aqua-matrix-heartbeat/`. Managed by `aqua-matrix-heartbeat.service`.
+- `claude-channel.pem` — LLM channel identity (forwards prose to `claude -p`). Store at `~/.aqua-matrix-claude-channel/`. Managed by `aqua-matrix-claude-channel.service`.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the rationale (one daemon per surface, separate failure domains, no stateful mode-switching).
 
 ### Build if binary is missing
 
 ```bash
-cd ~/aqua-matrix-hello && cargo build --release
+cd ~/aqua-matrix-hello && cargo build
 ```
+
+Default to debug builds (release is much slower for iteration). The systemd units intentionally point at `target/debug/`.
 
 ## Architecture
 
@@ -82,7 +87,7 @@ cargo test                                   # run unit tests (config roundtrip,
 cargo test --test e2e --features e2e         # run E2E test (requires live matrix.inblock.io)
 ```
 
-The binary lands at `target/debug/aqua-matrix-agent` (debug) or `target/release/aqua-matrix-agent` (release). The systemd heartbeat unit points at the debug path on purpose — keeps rebuild cycles tight.
+The binary lands at `target/debug/aqua-matrix-agent` (debug) or `target/debug/aqua-matrix-agent` (release). The systemd heartbeat unit points at the debug path on purpose — keeps rebuild cycles tight.
 
 ## CLI flags
 
@@ -101,6 +106,7 @@ The binary lands at `target/debug/aqua-matrix-agent` (debug) or `target/release/
 | `--print-did` | | | Print agent DID and exit |
 | `--heartbeat` | | | Run as a status-DM daemon (see `/heartbeat` skill) |
 | `--heartbeat-interval` | | `600` | Heartbeat tick in seconds |
+| `--claude-channel` | | | Run as the LLM bridge daemon — forwards inbound DMs from `--target` through `claude -p` (see `/claude-channel` skill) |
 
 ## Wrapped-harness configuration
 
