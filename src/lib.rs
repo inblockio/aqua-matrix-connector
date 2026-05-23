@@ -54,6 +54,14 @@ pub struct SessionCache {
     pub device_id: String,
     /// Unix seconds when the access token expires. We refresh ~30s early.
     pub expires_at_unix: u64,
+    /// Refresh token from siwx-oidc (24h TTL on standalone). When the
+    /// access token has expired we exchange this for a new access token,
+    /// preserving the device_id and crypto store.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Persisted DID — needed for the refresh-grant call.
+    #[serde(default)]
+    pub did: Option<String>,
 }
 
 impl ConfigFile {
@@ -328,37 +336,75 @@ impl AgentClient {
             }
         };
 
-        // Resolve a usable Matrix session: cached if valid, otherwise fresh auth.
-        // Caching here means restarts within the access token's lifetime (~5 min
-        // for siwx-oidc) reuse the same device_id, so the SQLite crypto store
-        // does NOT need to be wiped. Beyond the token lifetime we re-auth (which
-        // mints a new device_id) and the store-mismatch retry below handles the
-        // wipe automatically.
+        // Resolve a usable Matrix session in this order of preference:
+        //   1. Cached access token still within its TTL  → use it (no network).
+        //   2. Cached refresh token            → exchange for a new access token via
+        //                                       siwx_oidc_auth::refresh() (preserves
+        //                                       device_id → crypto store stays valid).
+        //   3. Fresh authentication            → mints a new device_id; the
+        //                                       store-mismatch retry below wipes
+        //                                       and rebuilds the crypto store.
+        // See docs/ARCHITECTURE.md "Identity and device-id persistence".
         let now_unix = unix_now();
-        let cached_session = config_file.session.clone().filter(|s| {
-            // 30s of slack so we don't try to use a token that expires mid-call
-            s.expires_at_unix > now_unix + 30
-        });
+        let cached_clone = config_file.session.clone();
 
-        let session_data = if let Some(sess) = cached_session {
-            tracing::info!(
-                "trying cached session (expires in {}s, device_id: {})",
-                sess.expires_at_unix.saturating_sub(now_unix),
-                sess.device_id
-            );
-            match resolve_identity(&config.matrix_url, &sess.access_token).await {
-                Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
-                    tracing::info!("cached session valid; reusing access token and device_id");
-                    Some((sess.access_token, sess.user_id, sess.device_id))
+        let session_data: Option<(String, String, String)> = if let Some(sess) = cached_clone {
+            if sess.expires_at_unix > now_unix + 30 {
+                tracing::info!(
+                    "cached access token still valid ({}s left, device_id: {})",
+                    sess.expires_at_unix.saturating_sub(now_unix),
+                    sess.device_id
+                );
+                match resolve_identity(&config.matrix_url, &sess.access_token).await {
+                    Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
+                        tracing::info!("cached session validated; skipping auth");
+                        Some((sess.access_token, sess.user_id, sess.device_id))
+                    }
+                    Ok(_) => {
+                        tracing::warn!("cached session whoami returned different identity; falling through");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("cached session whoami failed: {e:#}; falling through");
+                        None
+                    }
                 }
-                Ok(_) => {
-                    tracing::warn!("cached session whoami returned different identity; re-authenticating");
-                    None
+            } else if let (Some(rt), Some(saved_did)) = (sess.refresh_token.as_ref(), sess.did.as_ref()) {
+                tracing::info!(
+                    "access token expired; attempting refresh grant (device_id: {})",
+                    sess.device_id
+                );
+                match siwx_oidc_auth::refresh(&config.siwx_url, &client_id, rt, saved_did).await {
+                    Ok(new_tokens) => {
+                        let expires_in = new_tokens.expires_in.unwrap_or(300);
+                        tracing::info!(
+                            "refresh grant succeeded (new access token expires in {}s, device_id preserved)",
+                            expires_in
+                        );
+                        let refreshed = SessionCache {
+                            access_token: new_tokens.access_token.clone(),
+                            user_id: sess.user_id.clone(),
+                            device_id: sess.device_id.clone(),
+                            expires_at_unix: unix_now().saturating_add(expires_in),
+                            // If the server rotated the refresh token, persist the new one;
+                            // otherwise keep the old one (siwx-oidc may or may not rotate).
+                            refresh_token: new_tokens.refresh_token.or_else(|| Some(rt.clone())),
+                            did: Some(saved_did.clone()),
+                        };
+                        config_file.session = Some(refreshed.clone());
+                        if let Err(e) = config_file.save(&config_path) {
+                            tracing::warn!("failed to persist refreshed session: {e:#}");
+                        }
+                        Some((refreshed.access_token, refreshed.user_id, refreshed.device_id))
+                    }
+                    Err(e) => {
+                        tracing::warn!("refresh grant failed: {e:#}; falling through to fresh auth");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("cached session whoami failed: {e:#}; re-authenticating");
-                    None
-                }
+            } else {
+                tracing::info!("cached access token expired and no refresh_token; re-authenticating");
+                None
             }
         } else {
             None
@@ -377,7 +423,11 @@ impl AgentClient {
                 .await
                 .context("siwx-oidc authentication failed")?;
                 let expires_in = tokens.expires_in.unwrap_or(300);
-                tracing::info!("access token acquired (expires in {}s)", expires_in);
+                tracing::info!(
+                    "access token acquired (expires in {}s, refresh_token: {})",
+                    expires_in,
+                    if tokens.refresh_token.is_some() { "yes" } else { "no" }
+                );
 
                 let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
                 tracing::info!(
@@ -391,6 +441,8 @@ impl AgentClient {
                     user_id: identity.user_id.clone(),
                     device_id: identity.device_id.clone(),
                     expires_at_unix: unix_now().saturating_add(expires_in),
+                    refresh_token: tokens.refresh_token,
+                    did: Some(tokens.did.clone()),
                 });
                 if let Err(e) = config_file.save(&config_path) {
                     tracing::warn!("failed to persist session cache: {e:#} (continuing anyway)");

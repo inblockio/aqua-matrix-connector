@@ -145,5 +145,8 @@ Edit skills in `Skills/`. Do not duplicate content into `.claude/skills/`. When 
 
 | Repo | Purpose |
 |---|---|
-| `../siwx-oidc/` | CAIP-122 OIDC provider (authentication backend) |
+| `../siwx-oidc/` | CAIP-122 OIDC provider. Path-dep source of `siwx-oidc-auth` (see Cargo.toml). |
+| `../aqua-auth/` | Workspace member of `../siwx-oidc/`. Must be checked out as a sibling for `cargo build` to resolve `siwx-oidc-auth`'s `path = "../../aqua-auth"` dep. |
 | `../siwx-oidc-matrix-server/` | Docker Compose stack (Synapse + siwx-oidc + Element Web) |
+
+Fresh dev setup needs `git clone https://github.com/inblockio/siwx-oidc.git` and `git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.

@@ -122,6 +122,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
+name = "aqua-auth"
+version = "0.2.0"
+dependencies = [
+ "bs58",
+ "ed25519-dalek",
+ "hex",
+ "k256",
+ "p256",
+ "serde",
+ "sha3",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "aqua-matrix-agent"
 version = "0.1.0"
 dependencies = [
@@ -3508,26 +3522,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
-name = "siwx-core"
-version = "0.1.0"
-source = "git+https://github.com/inblockio/siwx-oidc.git#fc1da3f0bc6dc053c4e3cae5f85a3426547aaa64"
-dependencies = [
- "bs58",
- "ed25519-dalek",
- "hex",
- "k256",
- "p256",
- "serde",
- "sha3",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "siwx-oidc-auth"
 version = "0.1.0"
-source = "git+https://github.com/inblockio/siwx-oidc.git#fc1da3f0bc6dc053c4e3cae5f85a3426547aaa64"
 dependencies = [
  "anyhow",
+ "aqua-auth",
  "base64",
  "bs58",
  "chrono",
@@ -3541,7 +3540,6 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2",
- "siwx-core",
  "tokio",
  "url",
  "urlencoding",

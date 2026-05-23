@@ -19,7 +19,7 @@ e2e = ["dep:uuid"]
 [dependencies]
 uuid = { version = "1", features = ["v4"], optional = true }
 
-siwx-oidc-auth = { git = "https://github.com/inblockio/siwx-oidc.git" }
+siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
 matrix-sdk = "0.17"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

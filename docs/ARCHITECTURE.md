@@ -85,29 +85,37 @@ Tradeoff: the daemon holds an open HTTP connection to the homeserver continuousl
 
 ## Identity and device-id persistence
 
-Matrix `device_id` is server-assigned on every fresh OAuth login. `siwx-oidc-auth` does a code-grant flow each call and does not currently return a refresh token (`AuthTokens` has `access_token` + `expires_in` only — checked, not theoretical). Each fresh auth = a new `device_id`. matrix-sdk's SQLite crypto store binds to the `device_id` it was created with, so a `device_id` change against an existing store errors with `account in the store doesn't match`.
+Matrix `device_id` is server-assigned on every fresh OAuth login. matrix-sdk's SQLite crypto store binds to the `device_id` it was created with, so a `device_id` change against an existing store errors with `account in the store doesn't match`. We preserve `device_id` (and therefore the crypto store) across restarts using siwx-oidc's refresh-token grant.
 
-**Strategy implemented in `AgentClient::connect`:**
+**Three-tier resolution in `AgentClient::connect`** (`<store_dir>/config.toml` holds the cache):
 
-1. **Cache the access token + device_id + user_id + expires_at** in `<store_dir>/config.toml` after every successful auth.
-2. On startup, if a cached session exists and `expires_at - 30s > now`, validate it with `/whoami`. If `whoami` returns the same `user_id` + `device_id`, **skip re-auth entirely** and reuse the cached token. Same `device_id` → existing crypto store opens cleanly.
-3. If the cached session is missing, expired, or `/whoami` rejects it, do a fresh `siwx_oidc_auth::authenticate(...)`. Save the new session to `config.toml`.
-4. If `restore_session` against the SQLite store still fails with "account in the store doesn't match", wipe `<store_dir>/matrix-sdk-*.sqlite3*` (NOT `config.toml`) and retry restore once. This is the last-resort path that previously lived in `ExecStartPre` on the systemd unit — now in code, so it only fires when actually needed.
+1. **Cached access token still within TTL** → validate via `/whoami`, reuse. No network beyond the cheap whoami call.
+2. **Access token expired but refresh_token present** → call `siwx_oidc_auth::refresh(server, client_id, refresh_token, did)` to mint a new access token. `device_id` is preserved across this exchange because the refresh grant is bound to the original login session. Persist the new access token (and rotated refresh token, if the server rotated) back to config.toml.
+3. **No cached session, refresh failed, or refresh_token missing** → fresh `siwx_oidc_auth::authenticate(...)`. This is the only path that mints a new `device_id`. The fresh AuthTokens come with a new refresh_token (24h TTL on siwx-oidc standalone) which is persisted for next time.
+
+If step 3 minted a new `device_id` and the existing SQLite store rejects it with "account in the store doesn't match", the connect code wipes `<store_dir>/matrix-sdk-*.sqlite3*` (NOT `config.toml`) and retries `restore_session` once. The previous `ExecStartPre=rm -f ...sqlite3*` workaround in the systemd unit is removed; the in-code path replaces it.
 
 **Resulting behavior:**
 
-| Time since last auth | `device_id` after restart? |
+| Time since last activity | `device_id` after restart? | Network calls |
+|---|---|---|
+| Within access-token TTL (~5 min) | Same | 1 `/whoami` |
+| Within refresh-token TTL (24h) | Same | 1 `/token` (refresh grant) |
+| Beyond refresh-token TTL | New (crypto store wiped + rebuilt) | Full OAuth code flow + cross-signing rebootstrap |
+
+So practical operation — restarts within a single day, or even after a long weekend if the daemon was kept alive enough to refresh — preserves identity completely. Only multi-day downtime forces a fresh device. The daemon recovers automatically from any of these cases without manual intervention.
+
+**Persisted fields in `SessionCache`** (`<store_dir>/config.toml` under `[session]`):
+
+| Field | Purpose |
 |---|---|
-| Within `expires_in` (~5 min) | Same. Cached token validates, store opens, no wipe. |
-| After `expires_in` | New. Cached token rejected by `/whoami`, fresh auth runs, store wiped + rebuilt. |
+| `access_token` | Bearer token for the Matrix homeserver. Validated via `/whoami`. |
+| `expires_at_unix` | When the access token expires. We trigger refresh 30s early. |
+| `refresh_token` | siwx-oidc refresh-grant token (opaque `mcr_*`). 24h TTL on standalone. |
+| `did` | Required by the refresh-grant call (siwx-oidc signature: `refresh(server, client_id, refresh_token, did)`). |
+| `user_id` / `device_id` | Server-assigned; checked against `/whoami` to detect drift; required for `restore_session`. |
 
-So restarts within ~5 min preserve identity completely. Restarts after that get a fresh device but the daemon recovers automatically without manual intervention. The previous `ExecStartPre=rm -f ...sqlite3*` is no longer needed.
-
-**Full device-id persistence across long downtime** requires either:
-- Refresh tokens from `siwx-oidc-auth` (upstream change), or
-- MSC3861 device scope (`urn:matrix:org.matrix.msc2967.client:device:<id>`) passed by `siwx-oidc-auth` to Synapse, also upstream.
-
-Both are out of scope here; tracked as known limitations.
+**Upstream dependency:** this design relies on `siwx-oidc-auth` shipping `AuthTokens.refresh_token` and `siwx_oidc_auth::refresh(...)`. Since commit `ab3ad3f` of the siwx-oidc repo these are available; we depend via `path = "../siwx-oidc/siwx-oidc-auth"` (sibling checkout) rather than a pinned git rev, because the newer commit's workspace also requires the `aqua-auth` crate at `../../aqua-auth` which cargo cannot fetch through a single git dep. To set up a fresh dev host: `git clone https://github.com/inblockio/siwx-oidc.git && git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
 
 ## Auto-start chain (WSL boot → daemons up)
 
@@ -165,7 +173,13 @@ All `.pem` files are gitignored (`*.pem` in `.gitignore`) — they ARE the ident
 
 **`device_id` keeps rotating, store keeps wiping**
 
-This is expected when restarts happen >5 minutes apart (cached token expired). Each long-gap restart pays a fresh-auth + store-wipe cost. The fix is upstream (refresh tokens or device-scope OIDC, see above). For now, accept the occasional cross-signing re-bootstrap.
+This should NOT happen routinely — the refresh-token grant covers up to 24h of downtime while preserving `device_id`. If it is happening on every restart:
+
+1. Check the session cache has a refresh_token: `grep refresh_token <store_dir>/config.toml`. If missing, the daemon was authenticated against an older siwx-oidc that didn't issue them — restart will fix on the next fresh auth.
+2. Check `did` is also persisted (`grep '^did ' <store_dir>/config.toml`). Both `refresh_token` AND `did` are needed for the refresh-grant call.
+3. Check the journal for `refresh grant failed`. If the refresh token expired (>24h since issue), fresh auth is the only path and will mint a new device.
+
+For genuine multi-day downtime, expect a single fresh-auth + cross-signing rebootstrap. That is the design boundary, not a bug.
 
 **`#shell` commands do nothing**
 
