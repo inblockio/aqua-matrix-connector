@@ -78,6 +78,15 @@ pub async fn run(config: AgentConfig, target: &str) {
             first_cycle = false;
         }
 
+        // Upsert the fleet-registry entry on every client cycle start. The
+        // channel has no periodic tick of its own, but the outer loop rotates
+        // the client ~every token TTL (≈270s), so `last_online` is refreshed at
+        // that cadence. Best-effort: never let a registry failure perturb the
+        // daemon.
+        if let Err(e) = agent.update_registry("claude-channel", Some("aqua-matrix-claude-channel")).await {
+            tracing::warn!("registry update failed: {e:#}");
+        }
+
         let exit = run_cycle(&agent, &target, refresh_deadline).await;
         tracing::info!("claude-channel: cycle ended ({exit}); reconnecting");
     }

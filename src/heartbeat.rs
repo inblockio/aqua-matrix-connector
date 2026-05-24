@@ -109,6 +109,13 @@ pub async fn run(config: AgentConfig, target: &str, interval: Duration) {
             first_cycle = false;
         }
 
+        // Upsert the fleet-registry entry on every client cycle start so a
+        // freshly-rotated session re-announces itself promptly. Best-effort:
+        // never let a registry failure perturb the heartbeat.
+        if let Err(e) = agent.update_registry("heartbeat", Some("aqua-matrix-heartbeat")).await {
+            tracing::warn!("registry update failed: {e:#}");
+        }
+
         let exit = run_cycle(&agent, &target, interval, &stats, refresh_deadline).await;
         tracing::info!("heartbeat: cycle ended ({exit}); reconnecting");
     }
@@ -257,6 +264,12 @@ async fn handle_event(
 }
 
 async fn send_heartbeat(agent: &AgentClient, target: &str, stats: &Arc<Mutex<HeartbeatStats>>) {
+    // Refresh the fleet-registry entry every tick so `last_online` stays
+    // current. Best-effort — a registry failure must never skip the heartbeat.
+    if let Err(e) = agent.update_registry("heartbeat", Some("aqua-matrix-heartbeat")).await {
+        tracing::warn!("registry update failed: {e:#}");
+    }
+
     let body = {
         let s = stats.lock().await;
         build_status(&s)

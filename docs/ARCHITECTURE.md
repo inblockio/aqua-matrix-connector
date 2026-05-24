@@ -117,6 +117,68 @@ So practical operation — restarts within a single day, or even after a long we
 
 **Upstream dependency:** this design relies on `siwx-oidc-auth` shipping `AuthTokens.refresh_token` and `siwx_oidc_auth::refresh(...)`. Since commit `ab3ad3f` of the siwx-oidc repo these are available; we depend via `path = "../siwx-oidc/siwx-oidc-auth"` (sibling checkout) rather than a pinned git rev, because the newer commit's workspace also requires the `aqua-auth` crate at `../../aqua-auth` which cargo cannot fetch through a single git dep. To set up a fresh dev host: `git clone https://github.com/inblockio/siwx-oidc.git && git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
 
+## DM rooms as server-side state (`m.direct`)
+
+When the agent sends a DM it also marks the room as direct in the `m.direct`
+global account data map (`{ user_id: [room_id, ...] }`). This means the DM
+relationship lives in server-side account data, not only in local crypto/sync
+state:
+
+- The DM room resolves from the homeserver on a cold start — even after a full
+  crypto-store wipe (tier-3 fresh auth, see "Identity and device-id
+  persistence") — instead of the agent creating a fresh, duplicate DM room.
+- Element shows the room under "People" / direct chats rather than as a generic
+  room.
+
+`m.direct` is written best-effort and idempotently (the existing entry is read,
+the room id added if absent, the map written back); it does not gate message
+sending.
+
+## Agent self-registry (`io.inblock.aqua.registry`)
+
+Each daemon advertises itself in its own global account data under the custom
+type `io.inblock.aqua.registry`, so the fleet can be enumerated by reading
+account data rather than scraping logs or systemd. The payload:
+
+```jsonc
+{
+  "did":          "did:...",                    // the agent's decentralized identifier
+  "user_id":      "@...:matrix.inblock.io",      // server-assigned Matrix user id
+  "role":         "heartbeat" | "claude-channel",// which surface this identity serves
+  "systemd_unit": "aqua-matrix-heartbeat",       // managing unit (None for ad-hoc runs)
+  "last_online":  1700000000,                    // unix seconds, refreshed on each upsert
+  "version":      "..."                          // crate version
+}
+```
+
+`AgentClient::update_registry(role, systemd_unit)` performs the upsert. Refresh
+cadence:
+
+- **heartbeat**: every tick (and on each client-cycle start), so `last_online`
+  tracks the heartbeat interval.
+- **claude-channel**: on each client-cycle start. The channel has no periodic
+  tick of its own, so `last_online` is refreshed at the token-rotation cadence
+  (≈270s).
+
+The upsert is always best-effort at the call site — a registry write failure is
+logged at `warn` and never crashes or skips the daemon's primary job.
+
+## Benign `404 Account data not found` log lines on a fresh account
+
+On a brand-new account the matrix-sdk `http_client` logs `ERROR` lines like
+`404 ... Account data not found` for `m.direct` and
+`m.secret_storage.default_key` during initial sync. These are harmless: the SDK
+is probing for account data that has not been written yet.
+
+- The `m.direct` 404 stops once the agent marks its first DM room (see "DM rooms
+  as server-side state").
+- The `m.secret_storage.default_key` 404 stops once SSSS is enabled (see
+  RECOVERY.md § "Secure Secret Storage").
+
+We intentionally do **not** filter the SDK's `http_client` logging to suppress
+these, because that same logger surfaces genuine errors — silencing it would
+hide real problems to cosmetically remove two expected first-run probes.
+
 ## Auto-respawn
 
 All three units are designed to be "always alive" via `Restart=always` (Matrix daemons) or a bash supervisor loop (claude-bridge). Per-unit mechanism, recovery times, manual procedures, and the diagnostic decision tree all live in [`RECOVERY.md`](RECOVERY.md) — start there when something is broken.

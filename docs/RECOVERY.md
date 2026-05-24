@@ -15,6 +15,7 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 | Matrix sync stream errors (homeserver/network down for a while) | inner cycle's sync future returns Err → outer loop reconnects (tier-2 refresh) | seconds after server is back |
 | Access token nears expiry while daemon is running | daemon proactively rotates the matrix-sdk Client `REFRESH_GUARD_SECS` (30s) before `expires_at_unix`. Tier-2 refresh-grant in `AgentClient::connect` mints a new access token, `device_id` preserved, crypto store untouched. No 401 reaches the server | TTL − 30s, no operator-visible disruption |
 | WSL reboots | wsl.conf `systemd=true` + linger + units `enabled` brings all three up | seconds after WSL itself starts |
+| Crypto store wiped but `recovery.key` present | Cold start restores cross-signing/secrets from the persisted recovery key via SSSS — no new identity, no fresh cross-signing bootstrap | next start |
 
 ## At a glance — what requires human intervention
 
@@ -25,6 +26,7 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 | siwx-oidc server permanently down | Cannot authenticate at all | Fix siwx-oidc, then `systemctl --user reset-failed` if guard tripped |
 | Disk full | SQLite writes fail | Free space, then `systemctl --user restart <unit>` |
 | All `.pem` files lost | Identities derive from these | Accept the new identity (binary auto-generates), notify counterparties (they see a new Matrix user) |
+| Crypto store AND `recovery.key` both lost | SSSS has nothing to restore from | A brand-new cross-signing identity is bootstrapped; Tim sees one re-verification. Back up `recovery.key` to avoid this. |
 
 ## Component-by-component
 
@@ -85,6 +87,39 @@ Detailed in [`ARCHITECTURE.md` § "Identity and device-id persistence"](ARCHITEC
 
 `<store_dir>/config.toml` persists `access_token`, `refresh_token`, `did`, `user_id`, `device_id`, and `expires_at_unix`. On startup the daemon picks the cheapest valid tier (cached access token → refresh grant → fresh OAuth). The first two tiers preserve `device_id` and therefore the SQLite crypto store. Tier three is the only path that triggers a crypto-store wipe + cross-signing rebootstrap. This means the only restart that causes visible disruption to your Element timeline is one that happens >24h after the last successful refresh.
 
+## Secure Secret Storage (SSSS) — surviving a crypto-store wipe
+
+Cross-signing normally persists across **ordinary** restarts via the SQLite
+crypto store plus the preserved `device_id` (tiers 1–2 of session resolution).
+SSSS specifically covers the **store-loss** case — a tier-3 fresh auth, a manual
+`rm -f matrix-sdk-*.sqlite3*`, or a corrupted store — where the local crypto
+state is gone but the Matrix account is the same.
+
+What the agent does:
+
+- **First run**: enables Secure Secret Storage on the homeserver and persists
+  the recovery key to `<store_dir>/recovery.key` with mode `0600`. Enabling SSSS
+  also stops the recurring `404 ... m.secret_storage.default_key` probe (see
+  ARCHITECTURE.md § "Benign 404 ... log lines").
+- **Cold start after a store wipe**: if `<store_dir>/recovery.key` is present,
+  the agent restores cross-signing and secrets from SSSS using that key instead
+  of bootstrapping a brand-new cross-signing identity. To Tim this looks like
+  the same verified device, not a re-verification prompt.
+
+What this means per scenario:
+
+| State on cold start | Outcome |
+|---|---|
+| Store intact (tier 1/2) | Nothing to do — cross-signing already in the store |
+| Store wiped, `recovery.key` present | SSSS restore — same cross-signing identity, no re-verify |
+| Store wiped, `recovery.key` absent | Fresh cross-signing bootstrap — Tim sees one re-verification |
+
+**SECURITY NOTE.** The recovery key sits at rest, unencrypted, on the host at
+`<store_dir>/recovery.key` (mode `0600`). It is the master secret for this
+identity's cross-signing. Protect and back it up. Anyone who can read that file
+plus the account can impersonate the verified device. Losing the key **and** the
+store means the next start mints a brand-new cross-signing identity.
+
 ## Manual recovery procedures
 
 ### "Daemon stuck in `failed` state"
@@ -120,7 +155,7 @@ rm -rf ~/.aqua-matrix-<unit-name>/       # everything: store + config + cached s
 systemctl --user start <unit>
 ```
 
-(Removing `config.toml` forces fresh OIDC client registration. Removing the `.pem` forces a brand-new identity — counterparties will see a new Matrix user.)
+(Removing `config.toml` forces fresh OIDC client registration. Removing the `.pem` forces a brand-new identity — counterparties will see a new Matrix user. Note that `rm -rf` of the store dir also deletes `recovery.key`, so SSSS cannot restore the prior cross-signing identity — the next start bootstraps a fresh one. Back up `recovery.key` first if you want to keep it.)
 
 ### "Tail logs"
 

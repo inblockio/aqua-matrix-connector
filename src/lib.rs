@@ -4,6 +4,8 @@
 
 pub mod heartbeat;
 pub mod claude_channel;
+mod recovery;
+mod registry;
 
 use anyhow::{anyhow, Context, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -509,6 +511,12 @@ impl AgentClient {
             .context("initial sync failed")?;
         tracing::info!("connected");
 
+        // Cold-start recovery: if a recovery key was persisted and cross-signing
+        // is NOT yet complete (e.g. after a store wipe), restore cross-signing +
+        // secrets from server-side SSSS BEFORE the bootstrap decision below, so
+        // restored keys make the status complete and bootstrap is skipped.
+        recovery::restore_if_needed(&client, &config.store_dir).await;
+
         // Verify device via cross-signing
         tracing::info!("checking cross-signing status");
         match client.encryption().cross_signing_status().await {
@@ -538,6 +546,11 @@ impl AgentClient {
                 }
             }
         }
+
+        // After cross-signing keys exist, enable recovery (creates SSSS +
+        // server-side backup) and persist the generated recovery key to disk if
+        // it isn't there yet. Best-effort: never fails connect().
+        recovery::enable_and_persist_if_absent(&client, &config.store_dir).await;
 
         Ok(Self {
             client,
@@ -594,6 +607,17 @@ impl AgentClient {
                 .await
                 .context("create_dm failed")?,
         };
+        // Best-effort: mark the room as a direct chat (m.direct global account
+        // data) so it is resolvable server-side after a local store wipe. Never
+        // fail the send because marking failed.
+        if let Err(e) = self
+            .client
+            .account()
+            .mark_as_dm(room.room_id(), &[target.to_owned()])
+            .await
+        {
+            tracing::warn!("failed to mark room as DM (m.direct): {e:#}");
+        }
         // Render the body as Markdown so Element (Web + X) display formatted
         // text. `text_markdown` attaches an `org.matrix.custom.html`
         // formatted_body (rendered HTML) and keeps the raw text as the plain
@@ -604,6 +628,42 @@ impl AgentClient {
             .await
             .context("failed to send message")?;
         Ok(resp.response.event_id.to_string())
+    }
+
+    /// Upsert this agent's fleet-registry entry in global account data under
+    /// the custom type `io.inblock.aqua.registry`. Best-effort by caller.
+    pub async fn update_registry(&self, role: &str, systemd_unit: Option<&str>) -> Result<()> {
+        use matrix_sdk::ruma::events::{
+            AnyGlobalAccountDataEventContent, GlobalAccountDataEventType,
+        };
+        use matrix_sdk::ruma::serde::Raw;
+
+        let last_online = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let content = registry::RegistryContent {
+            did: self.did.clone(),
+            user_id: self.user_id.to_string(),
+            role: role.to_string(),
+            systemd_unit: systemd_unit.map(|s| s.to_string()),
+            last_online,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
+        let raw: Raw<AnyGlobalAccountDataEventContent> = Raw::new(&content)
+            .context("failed to serialize registry content")?
+            .cast_unchecked();
+        let event_type =
+            GlobalAccountDataEventType::from(registry::REGISTRY_EVENT_TYPE.to_string());
+
+        self.client
+            .account()
+            .set_account_data_raw(event_type, raw)
+            .await
+            .context("failed to write registry account data")?;
+        Ok(())
     }
 
     pub async fn messages(&self, room_id: &str, limit: u32) -> Result<Vec<Message>> {
