@@ -608,15 +608,25 @@ impl AgentClient {
                 .context("create_dm failed")?,
         };
         // Best-effort: mark the room as a direct chat (m.direct global account
-        // data) so it is resolvable server-side after a local store wipe. Never
-        // fail the send because marking failed.
-        if let Err(e) = self
+        // data) so it is resolvable server-side after a local store wipe. Only
+        // mark when the room isn't ALREADY recorded as the DM for this target:
+        // matrix-sdk's `mark_as_dm` appends to the m.direct list without
+        // deduping, so marking on every send would grow the list with duplicate
+        // room IDs unboundedly. `get_dm_room` reads the synced m.direct state.
+        // Never fail the send because marking failed.
+        let already_marked = self
             .client
-            .account()
-            .mark_as_dm(room.room_id(), &[target.to_owned()])
-            .await
-        {
-            tracing::warn!("failed to mark room as DM (m.direct): {e:#}");
+            .get_dm_room(target)
+            .is_some_and(|r| r.room_id() == room.room_id());
+        if !already_marked {
+            if let Err(e) = self
+                .client
+                .account()
+                .mark_as_dm(room.room_id(), &[target.to_owned()])
+                .await
+            {
+                tracing::warn!("failed to mark room as DM (m.direct): {e:#}");
+            }
         }
         // Render the body as Markdown so Element (Web + X) display formatted
         // text. `text_markdown` attaches an `org.matrix.custom.html`
