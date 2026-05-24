@@ -20,7 +20,7 @@ e2e = ["dep:uuid"]
 uuid = { version = "1", features = ["v4"], optional = true }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
-matrix-sdk = "0.17"
+matrix-sdk = { version = "0.17", features = ["markdown"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

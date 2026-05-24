@@ -594,8 +594,13 @@ impl AgentClient {
                 .await
                 .context("create_dm failed")?,
         };
+        // Render the body as Markdown so Element (Web + X) display formatted
+        // text. `text_markdown` attaches an `org.matrix.custom.html`
+        // formatted_body (rendered HTML) and keeps the raw text as the plain
+        // `body` fallback. Sending `text_plain` carries no formatted body, so
+        // clients have nothing to render and show the raw markup verbatim.
         let resp = room
-            .send(RoomMessageEventContent::text_plain(message))
+            .send(RoomMessageEventContent::text_markdown(message))
             .await
             .context("failed to send message")?;
         Ok(resp.response.event_id.to_string())

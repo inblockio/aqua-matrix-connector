@@ -305,25 +305,32 @@ fn handle_command(input: &str, stats: &HeartbeatStats) -> String {
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(10)
                 .clamp(1, 50);
-            recent_logs("aqua-matrix-heartbeat", n).unwrap_or_else(|| "could not read journal logs".into())
+            recent_logs("aqua-matrix-heartbeat", n)
+                .map(|logs| format!("```\n{}\n```", logs.trim_end()))
+                .unwrap_or_else(|| "could not read journal logs".into())
         }
         other => format!("unknown command: {other}\n\n{}", help_text()),
     }
 }
 
 fn help_text() -> String {
+    // The aligned command table is wrapped in a fenced code block so it renders
+    // as a monospace panel in Element (HTML collapses the alignment spaces and
+    // would treat the `#shell`-prefixed lines as headings otherwise). The
+    // surrounding sentences stay as prose so they render as normal text.
     [
-        "aqua-matrix-agent heartbeat — supported commands (prefix `#shell`):",
-        "  #shell help              this message",
-        "  #shell status            send a status payload now",
-        "  #shell ping              reply pong + timestamp",
-        "  #shell uptime            agent + host uptime",
-        "  #shell restart           restart the heartbeat systemd unit",
-        "  #shell respawn           restart claude-bridge (local interactive Claude in tmux)",
-        "  #shell respawn-channel   restart aqua-matrix-claude-channel (the Matrix LLM channel)",
-        "  #shell logs [N]          last N journal lines (default 10, max 50)",
-        "",
-        "Commands are honored only when sender matches the configured --target.",
+        "**aqua-matrix-agent heartbeat** — supported commands (prefix `#shell`):",
+        "```",
+        "#shell help              this message",
+        "#shell status            send a status payload now",
+        "#shell ping              reply pong + timestamp",
+        "#shell uptime            agent + host uptime",
+        "#shell restart           restart the heartbeat systemd unit",
+        "#shell respawn           restart claude-bridge (local interactive Claude in tmux)",
+        "#shell respawn-channel   restart aqua-matrix-claude-channel (the Matrix LLM channel)",
+        "#shell logs [N]          last N journal lines (default 10, max 50)",
+        "```",
+        "Commands are honored only when sender matches the configured `--target`.",
     ]
     .join("\n")
 }
@@ -334,7 +341,7 @@ fn spawn_systemctl_restart(unit: &str) -> String {
         .spawn()
     {
         Ok(_) => format!("restarting {unit} (systemctl --user restart {unit})"),
-        Err(e) => format!("#shell restart {unit} failed to spawn systemctl: {e}"),
+        Err(e) => format!("restart of {unit} failed to spawn systemctl: {e}"),
     }
 }
 
@@ -343,7 +350,10 @@ fn spawn_systemctl_restart(unit: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn build_status(stats: &HeartbeatStats) -> String {
-    let mut out = String::new();
+    // Wrapped in a fenced code block: the panel uses a `----` divider and
+    // column-aligned labels, which Element would otherwise mangle (the divider
+    // turns the line above into a setext heading and HTML collapses alignment).
+    let mut out = String::from("```\n");
     out.push_str(&format!("aqua-matrix-agent heartbeat @ {}\n", now_string()));
     out.push_str("----------------------------------------\n");
 
@@ -370,6 +380,7 @@ fn build_status(stats: &HeartbeatStats) -> String {
         out.push_str("claude: no active transcript\n");
     }
 
+    out.push_str("```");
     out
 }
 
