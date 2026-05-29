@@ -89,6 +89,14 @@ pub trait MessageHandler: Send + Sync + 'static {
         None
     }
 
+    /// Human-readable Matrix profile display name set on first connect, so
+    /// people see an alias (e.g. "claude-channel") instead of the raw
+    /// DID-derived MXID. Defaults to [`role`](Self::role); override for a
+    /// friendlier label.
+    fn display_name(&self) -> String {
+        self.role().to_string()
+    }
+
     /// One-time greeting DM'd to `target` on the first successful connect.
     /// `None` stays silent.
     fn hello(&self, _agent: &AgentClient) -> Option<String> {
@@ -171,6 +179,15 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         );
 
         if first_cycle {
+            // Publish a human-readable alias before anything else, so the hello
+            // DM and registry entry surface under a readable name rather than
+            // the DID-derived MXID. Best-effort: never block startup on it.
+            let alias = handler.display_name();
+            if let Err(e) = agent.set_display_name(&alias).await {
+                tracing::warn!("{}: set display name failed: {e:#}", handler.role());
+            } else {
+                tracing::info!("{}: display name set to {:?}", handler.role(), alias);
+            }
             if let Some(hello) = handler.hello(&agent) {
                 if let Err(e) = agent.send_dm(&target, &hello).await {
                     tracing::warn!("{}: hello send failed: {e:#}", handler.role());

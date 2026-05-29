@@ -676,6 +676,26 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Set this agent's Matrix profile display name so humans see a readable
+    /// alias (e.g. "claude-channel") instead of the raw DID-derived MXID.
+    /// Idempotent: skips the homeserver write when the name already matches,
+    /// so reconnect cycles don't issue a redundant profile PUT every time.
+    pub async fn set_display_name(&self, name: &str) -> Result<()> {
+        let account = self.client.account();
+        let current = account
+            .get_display_name()
+            .await
+            .context("failed to read current display name")?;
+        if current.as_deref() == Some(name) {
+            return Ok(());
+        }
+        account
+            .set_display_name(Some(name))
+            .await
+            .context("failed to set display name")?;
+        Ok(())
+    }
+
     pub async fn messages(&self, room_id: &str, limit: u32) -> Result<Vec<Message>> {
         let room_id: &RoomId = room_id
             .try_into()
