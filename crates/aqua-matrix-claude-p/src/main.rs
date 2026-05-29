@@ -21,7 +21,18 @@
 //! Non-destructive prompts keep the original direct-stream behaviour. The
 //! [`pending`] router (the shared `ask_user` primitive) is reused by Phases B/C.
 //!
+//! ## Chat confirmations (Phase B)
+//!
+//! Every non-destructive (`fresh`) run additionally carries an **`ask_human`
+//! MCP tool** (see [`ask_bridge`]): `claude` can pause mid-run and ask the
+//! authenticated user a free-form question over the same channel, blocking on
+//! the answer. The tool is wired via a per-run unix socket that routes through
+//! the same [`pending`] primitive. It is **advisory** (the model chooses to
+//! call it) — enforced per-tool gating is Phase C. Phase A's gated destructive
+//! flow is unchanged and does not carry the tool.
+//!
 //! This is the canonical "drop in a backend" example for [`aqua_matrix_relay`].
+mod ask_bridge;
 mod destructive;
 mod pending;
 
@@ -124,7 +135,7 @@ impl MessageHandler for ClaudePHandler {
 
     fn hello(&self, agent: &AgentClient) -> Option<String> {
         Some(format!(
-            "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. {}s timeout per invocation. Destructive requests (rm, force-push, …) are shown as a plan and only run after you reply `yes`.",
+            "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. {}s timeout per invocation. Destructive requests (rm, force-push, …) are shown as a plan and only run after you reply `yes`. I may also pause mid-task and ask you a question (`[ask] …`) — your next reply is the answer.",
             agent.user_id(),
             CLAUDE_TIMEOUT.as_secs(),
         ))
@@ -162,9 +173,9 @@ impl MessageHandler for ClaudePHandler {
             let res = if destructive::looks_destructive(&prompt) {
                 run_gated(&agent, &pending, &target, &prompt).await
             } else {
-                // Non-destructive: original direct-stream behaviour, no session
-                // continuity needed.
-                stream_claude(&agent, &target, &ClaudeRun::fresh(&prompt))
+                // Non-destructive: original direct-stream behaviour (now with
+                // the Phase B `ask_human` tool available), no session continuity.
+                stream_claude(&agent, &pending, &target, &ClaudeRun::fresh(&prompt))
                     .await
                     .map(|_| ())
             };
@@ -196,7 +207,7 @@ async fn run_gated(
 
     // 1. Plan mode. The streamed message is the plan; we also need its session
     //    id to resume on approval.
-    let plan = stream_claude(agent, target, &ClaudeRun::plan(prompt)).await?;
+    let plan = stream_claude(agent, pending, target, &ClaudeRun::plan(prompt)).await?;
     let Some(session_id) = plan.session_id else {
         // No session id → we cannot resume to execute. Fail closed.
         anyhow::bail!("plan produced no session id to resume; aborting (fail closed)");
@@ -228,6 +239,7 @@ async fn run_gated(
     tracing::info!("claude-channel: {class:?} from {target} approved; resuming {session_id}");
     stream_claude(
         agent,
+        pending,
         target,
         &ClaudeRun::resume(&session_id, "Approved. Proceed with the plan."),
     )
@@ -245,17 +257,22 @@ struct ClaudeRun<'a> {
     permission_mode: Option<&'a str>,
     /// `--resume <session_id>` when `Some`, to continue a prior plan session.
     resume_session: Option<&'a str>,
+    /// Phase B: wire the `ask_human` MCP tool into this run (a per-run socket
+    /// bridge routed through [`PendingMap::ask`]). Enabled for `fresh` runs;
+    /// the Phase A `plan`/`resume` flow does not carry it.
+    ask_human: bool,
 }
 
 impl<'a> ClaudeRun<'a> {
-    /// A normal one-shot run (original behaviour) — no plan gate.
+    /// A normal one-shot run (original behaviour) — no plan gate, but carries
+    /// the Phase B `ask_human` tool so the model can ask before a risky step.
     fn fresh(prompt: &'a str) -> Self {
-        Self { prompt, permission_mode: None, resume_session: None }
+        Self { prompt, permission_mode: None, resume_session: None, ask_human: true }
     }
 
     /// Plan mode: investigate + emit a plan, execute no destructive tool.
     fn plan(prompt: &'a str) -> Self {
-        Self { prompt, permission_mode: Some("plan"), resume_session: None }
+        Self { prompt, permission_mode: Some("plan"), resume_session: None, ask_human: false }
     }
 
     /// Resume a plan session in execution mode (post-approval).
@@ -264,6 +281,7 @@ impl<'a> ClaudeRun<'a> {
             prompt,
             permission_mode: Some("acceptEdits"),
             resume_session: Some(session_id),
+            ask_human: false,
         }
     }
 }
@@ -283,15 +301,17 @@ struct RunOutcome {
 /// can be resumed for execution.
 async fn stream_claude(
     agent: &AgentClient,
+    pending: &PendingMap,
     target: &str,
     run: &ClaudeRun<'_>,
 ) -> anyhow::Result<RunOutcome> {
     let claude_bin = find_claude_bin();
     tracing::debug!(
-        "invoking {} -p (stream-json, mode={:?}, resume={:?})",
+        "invoking {} -p (stream-json, mode={:?}, resume={:?}, ask_human={})",
         claude_bin,
         run.permission_mode,
         run.resume_session,
+        run.ask_human,
     );
 
     let mut cmd = Command::new(&claude_bin);
@@ -302,6 +322,27 @@ async fn stream_claude(
     if let Some(mode) = run.permission_mode {
         cmd.arg("--permission-mode").arg(mode);
     }
+    // Phase B: stand up the `ask_human` bridge for this run and add the MCP
+    // flags. The guard must outlive the child (it serves ask_human calls during
+    // the run), so it is held in this function's scope until after `wait`.
+    let _ask_bridge = if run.ask_human {
+        match ask_bridge::AskBridge::setup(agent, pending, target, APPROVAL_TIMEOUT).await {
+            Ok(bridge) => {
+                cmd.arg("--mcp-config").arg(bridge.config_path());
+                cmd.arg("--allowedTools").arg("mcp__ask__ask_human");
+                cmd.arg("--append-system-prompt").arg(ask_bridge::ASK_SYSTEM_PROMPT);
+                Some(bridge)
+            }
+            Err(e) => {
+                // Degrade gracefully: a missing bridge just means no ask_human
+                // for this run, not a failed run.
+                tracing::warn!("ask-bridge setup failed; running without ask_human: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut child = cmd
         .arg("--output-format")
         .arg("stream-json")

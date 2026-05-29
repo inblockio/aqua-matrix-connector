@@ -5,6 +5,7 @@ members = [
     "crates/aqua-matrix-relay",
     "crates/aqua-matrix-heartbeat",
     "crates/aqua-matrix-claude-p",
+    "crates/aqua-matrix-ask-mcp",
 ]
 
 # Shared metadata for every crate in the workspace. Members opt in with
@@ -21,6 +22,7 @@ repository = "https://github.com/inblockio/aqua-matrix-hello"
 [workspace.dependencies]
 aqua-matrix-agent = { path = "crates/aqua-matrix-agent" }
 aqua-matrix-relay = { path = "crates/aqua-matrix-relay" }
+aqua-matrix-ask-mcp = { path = "crates/aqua-matrix-ask-mcp" }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
 matrix-sdk = { version = "0.17", features = ["markdown"] }

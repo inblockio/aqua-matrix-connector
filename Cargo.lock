@@ -154,10 +154,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqua-matrix-ask-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aqua-matrix-claude-p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aqua-matrix-ask-mcp",
  "aqua-matrix-relay",
  "async-trait",
  "clap",
@@ -165,6 +178,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

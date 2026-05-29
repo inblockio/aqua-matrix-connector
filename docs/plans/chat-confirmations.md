@@ -321,3 +321,112 @@ original direct one-shot stream — no behaviour change.
 - Matcher classifies the **prompt text**, not the eventual tool call — coarse by
   design (fail-loud). Phase C reuses `classify`/`RULES` against concrete
   `Bash(...)` calls for precise enforcement.
+
+## Handover — Phase B
+
+### What shipped
+
+A new workspace crate **`crates/aqua-matrix-ask-mcp`** (the MCP server) plus the
+daemon-side bridge in `aqua-matrix-claude-p`. `claude` runs on the
+non-destructive (`fresh`) path now carry an **`ask_human` MCP tool**: the model
+can pause mid-run and ask the authenticated user a free-form question over the
+same Matrix channel, blocking on their answer — reusing the Phase A `ask_user`
+primitive (`PendingMap::ask`) unchanged.
+
+- **`aqua-matrix-ask-mcp` (new crate)** — a tiny stdio MCP server exposing one
+  tool, `ask_human(question) -> answer`. It owns **no** Matrix session.
+  - `src/jsonrpc.rs` — the minimal MCP JSON-RPC 2.0 surface (`initialize`,
+    `notifications/initialized`, `tools/list`, `tools/call`, `ping`), as a
+    **pure** `handle(req, ask) -> Option<Value>`. 8 unit tests.
+  - `src/ipc.rs` — the daemon⇄server wire types (`AskRequest`, `AskReply`) over a
+    newline-delimited per-run unix socket. `AskReply::{granted,denied}`. 5 tests.
+  - `src/main.rs` — the binary: reads JSON-RPC on stdin, and for an `ask_human`
+    call opens `$ASK_MCP_SOCK`, writes one `AskRequest`, reads one `AskReply`,
+    and returns it. Fail-closed: any IPC error → `isError` "NOT GRANTED" result.
+  - `src/lib.rs` — re-exports `ipc`/`jsonrpc`, `TOOL_NAME = "ask_human"`,
+    `SOCK_ENV = "ASK_MCP_SOCK"`. The lib half is depended on by the daemon so
+    both ends share **one** wire definition.
+- **`aqua-matrix-claude-p/src/ask_bridge.rs` (new module)** — the daemon side.
+  `AskBridge::setup(agent, pending, target, timeout)` binds a per-run unix
+  socket under `$TMPDIR/aqua-ask-<uuid>.sock`, writes a one-server `--mcp-config`
+  JSON (`{"mcpServers":{"ask":{command,args,env:{ASK_MCP_SOCK}}}}`) pointing at
+  the sibling `aqua-matrix-ask-mcp` binary (resolved via `current_exe()`), and
+  spawns an accept loop. Each connection → decode `AskRequest` → route the
+  question through an injected `ask` closure (the daemon backs it with
+  `pending.ask`, prefixing `[ask] …`) → write `AskReply` (granted with the
+  answer, or **fail-closed denied** on `None`). `Drop` aborts the loop and
+  unlinks the socket + config file (RAII, no orphans per run). The accept loop is
+  generic over `Fn(String) -> Future<Option<String>>` so the socket layer is
+  unit-tested with a stub (Matrix leg substituted). 3 unit tests.
+- **`aqua-matrix-claude-p/src/main.rs`** — `ClaudeRun` gained `ask_human: bool`
+  (`fresh` → true; `plan`/`resume` → false, so Phase A is untouched).
+  `stream_claude` now takes `pending` and, when `ask_human`, stands up the
+  `AskBridge` and adds `--mcp-config <file> --allowedTools mcp__ask__ask_human
+  --append-system-prompt <ASK_SYSTEM_PROMPT>`. The guard is held for the whole
+  run (serves calls) and dropped after `wait`. Bridge-setup failure degrades
+  gracefully (run continues without the tool). `hello` advertises the `[ask]`
+  capability.
+
+### Why `fresh`-only (deviation / rationale)
+
+Destructive **prompts** already get the strong Phase A plan→approve gate, so the
+bridge is wired onto the non-destructive `fresh` path — the natural home for a
+risky step the coarse prompt-matcher didn't catch. Phase B is **advisory** (the
+model must choose to call `ask_human`; the plan scopes B that way — enforcement
+is C). On the `fresh` path `claude` has no execution permission (no
+`acceptEdits`), so `ask_human` steers the model's *response*, not a live
+execution; that is the faithful advisory MVP. The Phase A `resume`/execute step
+deliberately does **not** carry the tool (kept identical to its verified flow).
+
+### Verified `claude` MCP behaviour (v2.1.157, empirical)
+
+Drove **real `claude` v2.1.157** with the generated config against a stub socket
+(behaves identically to `accept_loop` — same `ipc` types):
+
+1. **Granted round-trip:** `claude -p "<call ask_human…>" --mcp-config <cfg>
+   --allowedTools mcp__ask__ask_human --append-system-prompt <…>
+   --output-format stream-json --verbose`
+   - `init` event lists `mcp_servers:[{name:"ask",status:"pending"}]`; the model
+     calls `mcp__ask__ask_human {question}`; the server bridges over the socket;
+     the stub's `AskReply{granted:true,answer}` comes back as the tool result and
+     the model reports the verbatim answer. `result.is_error=false`.
+2. **Fail-closed (socket absent):** with no listener, the tool result is
+   `isError:true` "NOT GRANTED by the human operator: bridge unavailable (No such
+   file or directory)…" and the model refuses to proceed.
+
+Protocol shapes in `jsonrpc.rs` (`protocolVersion 2025-11-25`, the
+initialize/initialized/tools-list/tools-call order) match what `claude` actually
+sent.
+
+### Autonomous verification (done, no Matrix client needed)
+
+- `cargo build` (whole workspace) — clean, **zero warnings**.
+- `cargo test` — **25/25** in the two phase crates: `aqua-matrix-ask-mcp` 14
+  (8 jsonrpc + 5 ipc + 1), `aqua-matrix-claude-p` 11 (4 matcher + 4 pending +
+  3 ask_bridge: granted round-trip, fail-closed denial, bin-path fallback).
+- Real-`claude` MCP round-trip + fail-closed confirmed empirically (above).
+
+### Needs a LIVE user Matrix test
+
+- The end-to-end chat round-trip of the **daemon's** bridge: DM a prompt that
+  makes `claude` call `ask_human`, see the streamed `[ask] …` question, reply,
+  and confirm the answer steers the run. The `pending.ask → send_dm → next-DM →
+  try_resolve` leg is the **same Phase A primitive** (already flagged for a live
+  test); only the trigger (an MCP tool call instead of the plan-approval prompt)
+  is new. The socket/protocol legs around it are unit + empirically tested. (Do
+  NOT restart the production daemon — user will run this.)
+
+### Deviations / notes / follow-ups
+
+- `ask_human` timeout = `APPROVAL_TIMEOUT` (180s) == `CLAUDE_TIMEOUT`, so a
+  forgotten question is bounded by the run budget; if the run times out first the
+  child is killed and the (unread) denial is moot — still fail-closed.
+- One question per `target` at a time holds: the per-target `run_lock` blocks a
+  second prompt, and `claude` blocks on each tool result, so connections are
+  served sequentially (no overlap to parallelise).
+- The MCP subprocess is spawned per `fresh` run (tiny Rust binary, sub-10ms
+  startup); the system prompt scopes *when* the model should call it so trivial
+  messages don't trigger spurious questions.
+- Phase C will reuse `classify`/`RULES` + the same `pending.ask` over the
+  stream-json **control protocol** for enforced per-tool gating and did-key
+  scopes; `is_pending` on `PendingMap` is still reserved for it.
