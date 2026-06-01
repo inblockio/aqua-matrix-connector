@@ -662,6 +662,16 @@ impl AgentClient {
         Ok(resp.response.event_id.to_string())
     }
 
+    /// Like [`send_dm`](Self::send_dm) but retries the send until the homeserver
+    /// acknowledges the event (returning its id) or attempts are exhausted. Use
+    /// for a message that must not be silently dropped — e.g. the final
+    /// one-shot reply of a run, or the error notice that explains a failure. A
+    /// failed attempt means nothing landed (`room.send` only yields an event id
+    /// on persistence), so retrying cannot duplicate a delivered message.
+    pub async fn send_dm_reliable(&self, target: &str, message: &str) -> Result<String> {
+        retry_finalize("send-dm", || self.send_dm(target, message)).await
+    }
+
     /// Upsert this agent's fleet-registry entry in global account data under
     /// the custom type `io.inblock.aqua.registry`. Best-effort by caller.
     pub async fn update_registry(&self, role: &str, systemd_unit: Option<&str>) -> Result<()> {
@@ -827,6 +837,52 @@ const STREAM_EDIT_INTERVAL: Duration = Duration::from_millis(700);
 /// Cap on a streamed reply's size. Matrix accepts more, but be polite.
 const STREAM_MAX_BYTES: usize = 16_000;
 
+/// The *final* transmission of a reply must not be silently dropped: throttled
+/// intermediate edits are best-effort (each is superseded by the next), but the
+/// last edit / one-shot send carries the authoritative, complete text. If its
+/// `room.send` fails (a transient network blip, a token-rotation race, an
+/// encryption hiccup) the user is left looking at a half-streamed message that
+/// never resolves. So the finalize path retries until the homeserver
+/// acknowledges the event — a returned event id is that acknowledgement.
+const FINALIZE_MAX_ATTEMPTS: usize = 5;
+/// Linear backoff base between finalize attempts (attempt N waits N×base).
+const FINALIZE_RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Retry `op` until it returns `Ok` (the send was acknowledged by the server)
+/// or [`FINALIZE_MAX_ATTEMPTS`] is exhausted, with linear backoff. `op`'s `Ok`
+/// value is the homeserver's confirmation (an event id), so a success here is a
+/// *programmatic guarantee the message was transmitted*, not a hopeful
+/// fire-and-forget. On exhaustion the last error is returned so the caller can
+/// surface it. Safe to retry: `room.send` only yields an event id once the
+/// event is persisted, so a failed attempt means nothing landed.
+async fn retry_finalize<T, F, Fut>(what: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_err = None;
+    for attempt in 1..=FINALIZE_MAX_ATTEMPTS {
+        match op().await {
+            Ok(v) => {
+                if attempt > 1 {
+                    tracing::info!("{what}: transmission confirmed on attempt {attempt}");
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{what}: transmission attempt {attempt}/{FINALIZE_MAX_ATTEMPTS} failed: {e:#}"
+                );
+                last_err = Some(e);
+                if attempt < FINALIZE_MAX_ATTEMPTS {
+                    tokio::time::sleep(FINALIZE_RETRY_BASE * attempt as u32).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("{what}: transmission failed with no error recorded")))
+}
+
 /// RAII typing indicator, created by [`AgentClient::typing_guard`]. Refreshes
 /// the `m.typing` notice on a timer and clears it on drop.
 pub struct TypingGuard {
@@ -916,7 +972,10 @@ impl ReplyStream {
         } else {
             truncate_bytes(&text, STREAM_MAX_BYTES)
         };
-        self.edit(&text).await
+        // The complete reply must land. Unlike the throttled intermediate edits
+        // (best-effort, each superseded by the next), this final edit is the one
+        // the user is left with — retry until the homeserver acknowledges it.
+        retry_finalize("reply-finalize", || self.edit(&text)).await
     }
 
     async fn edit(&self, body: &str) -> Result<()> {

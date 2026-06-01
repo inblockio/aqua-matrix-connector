@@ -50,12 +50,19 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use pending::PendingMap;
 
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
-/// How long to wait for the user's `yes`/`no` to a plan. Bounded by
-/// [`CLAUDE_TIMEOUT`] per the plan doc (default-DENY on timeout); a separate,
-/// shorter window keeps a forgotten question from holding a run open for the
-/// full claude budget.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(180);
+/// There is intentionally **no cap on total run time** — a legitimate task may
+/// take many minutes. Instead an *inactivity* watchdog stops `claude` only if it
+/// emits no output at all for this long. That still prevents a genuinely hung or
+/// stalled process from holding the per-target run lock (and thus wedging the
+/// channel) forever, without truncating long but healthy work. The watchdog is
+/// reset on every line `claude` prints.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long to wait for the user's `yes`/`no` to a plan, or for an answer to an
+/// `ask_human` question. Independent of run length (runs are now unbounded):
+/// this is a *safety* bound — default-DENY on timeout — so a forgotten question
+/// can never hold a run, and its lock, open indefinitely. Set generously (7 min)
+/// so a slow human reply during a long task isn't cut off.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(420);
 const MAX_REPLY_BYTES: usize = 16_000; // Matrix can take more, but be polite.
 const ROLE: &str = "claude-channel";
 const UNIT: &str = "aqua-matrix-claude-channel";
@@ -97,9 +104,49 @@ fn default_store_dir() -> PathBuf {
     PathBuf::from(home).join(".aqua-matrix-claude-channel")
 }
 
+/// Per-target store of the last `claude` session id, so the next DM resumes the
+/// same conversation (`--resume`) instead of starting cold. `Arc`-backed and
+/// cheap to clone into each run task (mirrors [`PendingMap`]).
+///
+/// Intentionally **in-memory**: a service restart clears it, which is the
+/// documented way to start a fresh conversation (there is no in-chat reset).
+#[derive(Clone, Default)]
+struct SessionStore {
+    inner: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+}
+
+impl SessionStore {
+    /// The session id to resume for `target`, if we've seen one.
+    fn get(&self, target: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(target)
+            .cloned()
+    }
+
+    /// Record the session id of `target`'s most recent run.
+    fn set(&self, target: &str, id: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(target.to_string(), id.to_string());
+    }
+
+    /// Forget `target`'s session — e.g. after a `--resume` failed because the
+    /// stored id was stale, so the next turn self-heals by starting cold.
+    fn clear(&self, target: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(target);
+    }
+}
+
 /// The claude-channel backend. Holds the shared [`PendingMap`] (the `ask_user`
-/// primitive) plus a per-target run lock so only one `claude` run — and thus at
-/// most one open question — exists per user at a time.
+/// primitive), a per-target run lock so only one `claude` run — and thus at most
+/// one open question — exists per user at a time, and the per-target
+/// [`SessionStore`] that gives each user a continuous conversation.
 #[derive(Default)]
 struct ClaudePHandler {
     pending: PendingMap,
@@ -107,6 +154,8 @@ struct ClaudePHandler {
     /// expensive and an open confirmation must not race a second prompt; this
     /// serialises runs per user without blocking other users.
     run_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Last session id per target, for `--resume` continuity across DMs.
+    sessions: SessionStore,
 }
 
 impl ClaudePHandler {
@@ -135,9 +184,9 @@ impl MessageHandler for ClaudePHandler {
 
     fn hello(&self, agent: &AgentClient) -> Option<String> {
         Some(format!(
-            "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. {}s timeout per invocation. Destructive requests (rm, force-push, …) are shown as a plan and only run after you reply `yes`. I may also pause mid-task and ask you a question (`[ask] …`) — your next reply is the answer.",
+            "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. We keep a **continuous conversation** — each message resumes the same session, so I remember context across DMs (restart the service to start fresh). Long tasks run to completion; I only give up if I go silent for {}s. Destructive requests (rm, force-push, …) are shown as a plan and only run after you reply `yes`. I may also pause mid-task and ask you a question (`[ask] …`) — your next reply is the answer.",
             agent.user_id(),
-            CLAUDE_TIMEOUT.as_secs(),
+            IDLE_TIMEOUT.as_secs(),
         ))
     }
 
@@ -164,50 +213,91 @@ impl MessageHandler for ClaudePHandler {
         let prompt = body.to_string();
         let pending = self.pending.clone();
         let run_lock = self.run_lock(&target);
+        let sessions = self.sessions.clone();
         tokio::spawn(async move {
             // Serialise: hold the per-target lock for the whole run so a second
             // prompt can't start (or open a second question) until this one
             // finishes. `try_lock` would drop the prompt; instead we await —
             // the relay watermark already prevents duplicate delivery.
             let _guard = run_lock.lock().await;
-            let res = if destructive::looks_destructive(&prompt) {
-                run_gated(&agent, &pending, &target, &prompt).await
-            } else {
-                // Non-destructive: original direct-stream behaviour (now with
-                // the Phase B `ask_human` tool available), no session continuity.
-                stream_claude(&agent, &pending, &target, &ClaudeRun::fresh(&prompt))
-                    .await
-                    .map(|_| ())
-            };
-            if let Err(e) = res {
-                tracing::warn!("claude-channel run failed: {e:#}");
-                let _ = agent
-                    .send_dm(&target, &format!("[claude-channel error] {e:#}"))
-                    .await;
+
+            // Continuity: resume this user's prior session so context carries
+            // across DMs. The run returns the session id to remember for next
+            // time (the same id when resumed; a new one when starting cold).
+            let prior = sessions.get(&target);
+            let mut result = run_turn(&agent, &pending, &target, &prompt, prior.as_deref()).await;
+
+            // Self-heal a poisoned session id: if a resumed turn failed, the
+            // stored id may be stale (e.g. claude's session store was pruned),
+            // which would wedge every future DM. Clear it and retry once cold.
+            if result.is_err() && prior.is_some() {
+                tracing::warn!(
+                    "claude-channel: turn resuming session {prior:?} failed; clearing it and retrying fresh"
+                );
+                sessions.clear(&target);
+                result = run_turn(&agent, &pending, &target, &prompt, None).await;
+            }
+
+            match result {
+                Ok(Some(session_id)) => sessions.set(&target, &session_id),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("claude-channel run failed: {e:#}");
+                    // The error notice must reach the user — retry its send.
+                    let _ = agent
+                        .send_dm_reliable(&target, &format!("[claude-channel error] {e:#}"))
+                        .await;
+                }
             }
         });
     }
 }
 
+/// Run one conversational turn and return the session id to remember (for
+/// `--resume` next time), or `None` if the run produced none. Routes a
+/// destructive prompt through the gated plan→approve→execute flow and an
+/// ordinary prompt through a direct streamed run; both resume `prior` when set.
+async fn run_turn(
+    agent: &AgentClient,
+    pending: &PendingMap,
+    target: &str,
+    prompt: &str,
+    prior: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if destructive::looks_destructive(prompt) {
+        run_gated(agent, pending, target, prompt, prior).await
+    } else {
+        let outcome =
+            stream_claude(agent, pending, target, &ClaudeRun::conversational(prompt, prior)).await?;
+        Ok(outcome.session_id)
+    }
+}
+
 /// Phase A plan → approve → execute flow for a destructive prompt.
 ///
-/// 1. Run plan mode (no destructive tool executes — verified) and stream the
-///    plan, capturing the session id.
+/// 1. Run plan mode (no destructive tool executes — verified), resuming the
+///    caller's `prior` conversation so "delete the temp files we discussed"
+///    works, and stream the plan while capturing the session id.
 /// 2. Ask the authenticated user to approve.
 /// 3. On `yes` → resume that session in `acceptEdits` mode to execute.
 ///    On `no`/timeout/anything else → abort, fail closed (do nothing).
+///
+/// Returns the session id to remember for continuity — in **all** non-error
+/// cases, including an abort, so the conversation (and the fact that the action
+/// was declined) carries into the next turn.
 async fn run_gated(
     agent: &AgentClient,
     pending: &PendingMap,
     target: &str,
     prompt: &str,
-) -> anyhow::Result<()> {
+    prior: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     let class = destructive::classify(prompt).unwrap_or("destructive action");
     tracing::info!("claude-channel: gating {class:?} prompt from {target}");
 
     // 1. Plan mode. The streamed message is the plan; we also need its session
     //    id to resume on approval.
-    let plan = stream_claude(agent, pending, target, &ClaudeRun::plan(prompt)).await?;
+    let plan = stream_claude(agent, pending, target, &ClaudeRun::plan(prompt, prior)).await?;
     let Some(session_id) = plan.session_id else {
         // No session id → we cannot resume to execute. Fail closed.
         anyhow::bail!("plan produced no session id to resume; aborting (fail closed)");
@@ -232,23 +322,27 @@ async fn run_gated(
         };
         tracing::info!("claude-channel: {class:?} from {target} NOT approved; aborting");
         let _ = agent.send_dm(target, &note).await;
-        return Ok(());
+        // Remember the (planned-but-aborted) session so the conversation
+        // continues — the next message resumes with this context.
+        return Ok(Some(session_id));
     }
 
     // 3. Approved → resume the SAME session in execution mode.
     tracing::info!("claude-channel: {class:?} from {target} approved; resuming {session_id}");
-    stream_claude(
+    let exec = stream_claude(
         agent,
         pending,
         target,
         &ClaudeRun::resume(&session_id, "Approved. Proceed with the plan."),
     )
     .await?;
-    Ok(())
+    // Prefer the execute run's reported id; fall back to the plan's (the
+    // resumed session keeps the same id, so these normally match).
+    Ok(exec.session_id.or(Some(session_id)))
 }
 
-/// One `claude -p` invocation's mode/arguments. Built via [`ClaudeRun::fresh`],
-/// [`ClaudeRun::plan`], or [`ClaudeRun::resume`].
+/// One `claude -p` invocation's mode/arguments. Built via
+/// [`ClaudeRun::conversational`], [`ClaudeRun::plan`], or [`ClaudeRun::resume`].
 struct ClaudeRun<'a> {
     /// The prompt / message to send.
     prompt: &'a str,
@@ -258,21 +352,24 @@ struct ClaudeRun<'a> {
     /// `--resume <session_id>` when `Some`, to continue a prior plan session.
     resume_session: Option<&'a str>,
     /// Phase B: wire the `ask_human` MCP tool into this run (a per-run socket
-    /// bridge routed through [`PendingMap::ask`]). Enabled for `fresh` runs;
-    /// the Phase A `plan`/`resume` flow does not carry it.
+    /// bridge routed through [`PendingMap::ask`]). Enabled for `conversational`
+    /// runs; the Phase A `plan`/`resume` flow does not carry it.
     ask_human: bool,
 }
 
 impl<'a> ClaudeRun<'a> {
-    /// A normal one-shot run (original behaviour) — no plan gate, but carries
-    /// the Phase B `ask_human` tool so the model can ask before a risky step.
-    fn fresh(prompt: &'a str) -> Self {
-        Self { prompt, permission_mode: None, resume_session: None, ask_human: true }
+    /// A normal conversational turn — no plan gate, carries the Phase B
+    /// `ask_human` tool so the model can ask before a risky step. Resumes
+    /// `session` (the user's prior conversation) when set, else starts fresh.
+    fn conversational(prompt: &'a str, session: Option<&'a str>) -> Self {
+        Self { prompt, permission_mode: None, resume_session: session, ask_human: true }
     }
 
     /// Plan mode: investigate + emit a plan, execute no destructive tool.
-    fn plan(prompt: &'a str) -> Self {
-        Self { prompt, permission_mode: Some("plan"), resume_session: None, ask_human: false }
+    /// Resumes `session` when set so the plan has the prior conversation's
+    /// context (read-only — plan mode still executes nothing destructive).
+    fn plan(prompt: &'a str, session: Option<&'a str>) -> Self {
+        Self { prompt, permission_mode: Some("plan"), resume_session: session, ask_human: false }
     }
 
     /// Resume a plan session in execution mode (post-approval).
@@ -295,10 +392,11 @@ struct RunOutcome {
 
 /// Run `claude -p` in streaming mode and pipe its output into a single Matrix
 /// message that is edited in place as tokens arrive. A typing indicator covers
-/// the wait for the first token. Bounded by [`CLAUDE_TIMEOUT`]; uses whatever
-/// `claude` is on PATH plus the absolute fallback matching the systemd unit's
-/// `Environment=PATH`. Returns the run's [`RunOutcome`] (session id) so a plan
-/// can be resumed for execution.
+/// the wait for the first token. There is no total-runtime cap; an inactivity
+/// watchdog ([`IDLE_TIMEOUT`]) stops a run only if `claude` goes silent. Uses
+/// whatever `claude` is on PATH plus the absolute fallback matching the systemd
+/// unit's `Environment=PATH`. Returns the run's [`RunOutcome`] (session id) so a
+/// plan can be resumed for execution and so the conversation can be continued.
 async fn stream_claude(
     agent: &AgentClient,
     pending: &PendingMap,
@@ -366,17 +464,26 @@ async fn stream_claude(
     let mut err: Option<String> = None;
     let mut outcome = RunOutcome::default();
 
-    let deadline = tokio::time::Instant::now() + CLAUDE_TIMEOUT;
+    // Inactivity watchdog: no cap on total runtime (long tasks are legitimate),
+    // but if `claude` emits nothing for `IDLE_TIMEOUT` we treat it as hung and
+    // stop it, so a stalled process can't hold the per-target run lock forever.
+    // Reset on every line received — any output proves liveness.
+    let mut idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
     loop {
         let line = tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(idle_deadline) => {
                 let _ = child.start_kill();
-                err = Some(format!("timed out after {}s", CLAUDE_TIMEOUT.as_secs()));
+                err = Some(format!(
+                    "no output for {}s — assumed stalled and stopped",
+                    IDLE_TIMEOUT.as_secs()
+                ));
                 break;
             }
             l = lines.next_line() => l,
         };
+        // Got a line (or EOF/err) — claude is alive; push the idle deadline out.
+        idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
         let line = match line {
             Ok(Some(l)) => l,
             Ok(None) => break, // EOF — claude exited
@@ -457,15 +564,22 @@ async fn stream_claude(
     typing.take(); // clear the indicator if no token ever streamed
 
     match (stream, err) {
-        // Normal: finalize with the authoritative full result.
+        // Normal: finalize with the authoritative full result. `finish` retries
+        // the final edit internally until the homeserver acknowledges it, so the
+        // complete reply is not left half-streamed by a transient send failure.
         (Some(s), None) => s.finish(final_text.as_deref()).await?,
         // Streamed some, then failed/timed out — finalize gracefully in place.
+        // `finish` already retries; if it still can't land, log it (the partial
+        // text is the best we have and the error is surfaced to the caller too).
         (Some(s), Some(e)) => {
             let mut text = final_text.unwrap_or_default();
             text.push_str(&format!("\n\n[claude-channel error] {e}"));
-            let _ = s.finish(Some(&text)).await;
+            if let Err(fe) = s.finish(Some(&text)).await {
+                tracing::warn!("claude-channel: failed to finalize partial reply after retries: {fe:#}");
+            }
         }
         // Nothing streamed but a final result arrived — send it as one message.
+        // Use the reliable send so this one-shot reply isn't silently dropped.
         (None, None) => {
             let text = final_text.unwrap_or_default();
             let text = if text.trim().is_empty() {
@@ -473,7 +587,7 @@ async fn stream_claude(
             } else {
                 truncate(&text, MAX_REPLY_BYTES)
             };
-            agent.send_dm(target, &text).await?;
+            agent.send_dm_reliable(target, &text).await?;
         }
         // Failed before any output — surface the error to the caller.
         (None, Some(e)) => anyhow::bail!("{e}"),

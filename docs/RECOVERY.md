@@ -49,7 +49,9 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 Identical recovery profile to heartbeat — same outer-loop rotation, same three-tier auth, same `Restart=always`. No periodic tick of its own; the inner cycle parks on `select!` until refresh deadline or sync exit.
 
 Differences in failure modes specific to claude-channel:
-- Per-message `claude -p` invocation has a 180s timeout; on timeout the daemon replies with `[claude-channel error] claude -p timed out after 180s` and stays running.
+- Per-message `claude -p` invocation has **no total-runtime cap** (long tasks run to completion). An *inactivity* watchdog stops it only if `claude` emits no output for 600s; the daemon then replies with `[claude-channel error] no output for 600s — assumed stalled and stopped` and stays running.
+- Sessions are continuous: each DM resumes the user's prior `claude` session (`--resume`). Session ids are held **in memory** per target — restart the service to start a fresh conversation. A stale/invalid session id self-heals: a failed resume clears the stored id and retries the turn cold once.
+- The final reply transmission is retried (up to 5 attempts, linear backoff) until the homeserver acknowledges the event, so a transient send failure can't leave a half-streamed message. If it still can't land after retries, the daemon logs `failed to finalize ... after retries` and stays running.
 - `claude` binary missing: every prompt returns `[claude-channel error] failed to spawn ... claude -p`. Daemon does not crash.
 
 ### `claude-bridge.service`

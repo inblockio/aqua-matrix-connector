@@ -37,8 +37,13 @@ journalctl --user -u aqua-matrix-claude-channel -n 30 | grep "agent DID"
 From `--target` (Tim's account in Element), DM the **claude-channel identity** any plain prose (NOT starting with `#shell` — that prefix is the heartbeat's). The daemon will:
 
 1. See the message via stream sync (~1 sec).
-2. Spawn `claude -p "<your message>"` with a 180s timeout.
-3. DM back the stdout.
+2. Spawn `claude -p "<your message>"`, resuming the user's prior session
+   (`--resume`) so the conversation is continuous across DMs. There is no
+   total-runtime cap; an inactivity watchdog stops a run only if `claude` emits
+   no output for 600s.
+3. DM back the stdout. The final, complete reply is transmission-checked and
+   retried until the homeserver acknowledges it, so the last update is never
+   silently dropped.
 
 Stateless per message: each invocation starts fresh, no conversation continuity. For continuity, attach locally to the `claude-bridge` tmux session (see `claude-bridge` skill).
 
