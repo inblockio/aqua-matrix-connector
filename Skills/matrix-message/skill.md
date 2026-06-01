@@ -34,7 +34,7 @@ cd ~/aqua-matrix-hello && cargo build
 - SIWX-OIDC: `https://siwx-oidc.inblock.io`
 - Override with `--matrix-url` / `--siwx-url` if using a different server
 
-**Default target:** Tim (`@did-pkh-eip155-1-0x0000000000000000000000000000000000000000:matrix.inblock.io`). Override with `--target`.
+**Target:** set `AGENT_TARGET` in a `.env` file (copy `.env.example`); no target is hardcoded in the repo. On this host a `.env` in the repo dir already provides it, so the commands above work without `--target`. Override ad-hoc with `--target`.
 
 **Agent identity:** Ed25519 key at `agent.pem` in CWD (auto-generated if missing). Each key file produces a unique DID and Matrix account.
 

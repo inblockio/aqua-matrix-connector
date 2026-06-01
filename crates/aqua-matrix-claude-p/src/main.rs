@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use aqua_matrix_relay::{async_trait, run_daemon, AgentClient, AgentConfig, MessageHandler, ReplyStream};
+use aqua_matrix_relay::{async_trait, load_dotenv, run_daemon, AgentClient, AgentConfig, MessageHandler, ReplyStream};
 use clap::Parser;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
@@ -90,8 +90,8 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "@did-pkh-eip155-1-0x0000000000000000000000000000000000000000:matrix.inblock.io",
-        help = "Matrix user ID whose DMs are forwarded to claude -p"
+        env = "AGENT_TARGET",
+        help = "Matrix user ID whose DMs are forwarded to claude -p (set AGENT_TARGET, e.g. via this instance's .env file)"
     )]
     target: String,
 
@@ -622,6 +622,10 @@ fn truncate(s: &str, max_bytes: usize) -> String {
 
 #[tokio::main]
 async fn main() {
+    // Load this instance's config from its `.env` before parsing args (see
+    // `load_dotenv`): AGENT_TARGET et al. become file-driven and per-instance.
+    load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

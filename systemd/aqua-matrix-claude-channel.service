@@ -17,6 +17,11 @@ Environment=CONTEXT_WINDOW=1000000
 # claude is at ~/.local/bin/claude; the daemon also resolves this dynamically
 # but setting PATH lets a future PATH-based claude lookup work too.
 Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Per-instance config (AGENT_TARGET, optional MATRIX_URL/SIWX_URL overrides):
+# the daemon loads this `.env` at startup. This file is machine-local and NOT in
+# the repo — copy `.env.example` and fill in your own target. Multi-agent: each
+# instance points AGENT_ENV_FILE at its own file.
+Environment=AGENT_ENV_FILE=%h/.aqua-matrix-claude-channel/agent.env
 # Reference example backend (was `aqua-matrix-agent --claude-channel` before
 # the workspace split). The unit name stays `aqua-matrix-claude-channel` so
 # `#shell respawn-channel`, the registry role, and skills are unaffected.

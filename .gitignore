@@ -5,5 +5,7 @@ target/
 *.db-shm
 .env
 .env.*
+# …but DO track the committed template (real values live only in local .env).
+!.env.example
 .claude/*
 !.claude/skills/

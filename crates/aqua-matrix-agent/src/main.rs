@@ -1,5 +1,5 @@
-use anyhow::Result;
-use aqua_matrix_agent::{did_from_key_file, AgentClient, AgentConfig};
+use anyhow::{Context, Result};
+use aqua_matrix_agent::{did_from_key_file, load_dotenv, AgentClient, AgentConfig};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -34,9 +34,10 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "@did-pkh-eip155-1-0x0000000000000000000000000000000000000000:matrix.inblock.io"
+        env = "AGENT_TARGET",
+        help = "Matrix user ID to message (set AGENT_TARGET, e.g. via a .env file; required for --message/--read)"
     )]
-    target: String,
+    target: Option<String>,
 
     #[arg(long, env = "AGENT_STORE_DIR")]
     store_dir: Option<PathBuf>,
@@ -61,6 +62,10 @@ fn default_store_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load instance config from a `.env` file before parsing args, so the
+    // env-backed flags below (AGENT_TARGET, MATRIX_URL, …) can be file-driven.
+    load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -95,27 +100,36 @@ async fn main() -> Result<()> {
         agent.sync_once().await?;
     }
 
-    if let Some(ref msg) = args.message {
-        let event_id = agent.send_dm(&args.target, msg).await?;
-        println!("sent to {}: {} (event: {event_id})", args.target, msg);
-    }
+    // --message / --read need a target; resolve it once with a clear error if
+    // neither --target nor AGENT_TARGET (e.g. from .env) was provided.
+    if args.message.is_some() || args.read {
+        let target = args
+            .target
+            .as_deref()
+            .context("no target set — pass --target or set AGENT_TARGET (see .env.example)")?;
 
-    if args.read {
-        if args.message.is_some() {
-            agent.sync_once().await?;
+        if let Some(ref msg) = args.message {
+            let event_id = agent.send_dm(target, msg).await?;
+            println!("sent to {target}: {msg} (event: {event_id})");
         }
-        match agent.dm_room_id(&args.target).await? {
-            Some(room_id) => {
-                let messages = agent.messages(&room_id, args.read_limit).await?;
-                if messages.is_empty() {
-                    println!("no messages found");
-                } else {
-                    for msg in &messages {
-                        println!("[{}] {}: {}", msg.timestamp_ms, msg.sender, msg.body);
+
+        if args.read {
+            if args.message.is_some() {
+                agent.sync_once().await?;
+            }
+            match agent.dm_room_id(target).await? {
+                Some(room_id) => {
+                    let messages = agent.messages(&room_id, args.read_limit).await?;
+                    if messages.is_empty() {
+                        println!("no messages found");
+                    } else {
+                        for msg in &messages {
+                            println!("[{}] {}: {}", msg.timestamp_ms, msg.sender, msg.body);
+                        }
                     }
                 }
+                None => println!("no DM room found with {target}"),
             }
-            None => println!("no DM room found with {}", args.target),
         }
     }
 

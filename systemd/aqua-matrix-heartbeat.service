@@ -24,6 +24,9 @@ RestartSec=5s
 WorkingDirectory=%h/aqua-matrix-hello
 # Forward CONTEXT_WINDOW for accurate context% reporting; matches settings.json
 Environment=CONTEXT_WINDOW=1000000
+# Per-instance config (AGENT_TARGET et al.): loaded from this machine-local
+# `.env` at startup. Not in the repo — copy `.env.example` and set your target.
+Environment=AGENT_ENV_FILE=%h/.aqua-matrix-heartbeat/agent.env
 # Log to journal under the unit name
 StandardOutput=journal
 StandardError=journal

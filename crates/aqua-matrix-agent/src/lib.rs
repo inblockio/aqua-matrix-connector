@@ -179,6 +179,35 @@ impl AgentClient {
     }
 }
 
+/// Load configuration from a `.env` file into the process environment, to be
+/// called once at the very start of `main` — **before** parsing args — so that
+/// `clap`'s `env`-backed flags (`AGENT_TARGET`, `MATRIX_URL`, `SIWX_URL`, …)
+/// pick up file-provided values.
+///
+/// This is what makes each agent *instance* self-describing: point it at its own
+/// file via the `AGENT_ENV_FILE` environment variable (the multi-agent path —
+/// every instance gets a distinct `.env`); with `AGENT_ENV_FILE` unset it falls
+/// back to a conventional `.env` discovered in the working directory or an
+/// ancestor.
+///
+/// Already-set process variables are **not** overridden (that is `dotenvy`'s
+/// default), which yields the precedence: explicit CLI flag > process env (e.g.
+/// systemd `Environment=`) > `.env` file > built-in default. Best-effort: a
+/// missing file is not an error — real env vars and defaults still apply.
+pub fn load_dotenv() {
+    match std::env::var_os("AGENT_ENV_FILE") {
+        Some(path) => {
+            if let Err(e) = dotenvy::from_path(Path::new(&path)) {
+                tracing::warn!("AGENT_ENV_FILE={path:?} could not be loaded: {e}");
+            }
+        }
+        None => {
+            // No explicit file: load a conventional `.env` if one exists.
+            let _ = dotenvy::dotenv();
+        }
+    }
+}
+
 pub fn did_from_key_file(path: &Path) -> Result<String> {
     if path.exists() {
         let key = SiwxKey::from_pem_file(path).context("failed to load key")?;

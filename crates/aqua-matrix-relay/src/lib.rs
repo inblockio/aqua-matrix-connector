@@ -57,7 +57,7 @@ use matrix_sdk::{
 // Re-export everything a handler crate needs so it can depend on ONLY this
 // crate (plus tokio for its `main`). A new agent never imports matrix-sdk.
 // ReplyStream / TypingGuard let handlers stream answers and show "typing…".
-pub use aqua_matrix_agent::{AgentClient, AgentConfig, ReplyStream, TypingGuard};
+pub use aqua_matrix_agent::{load_dotenv, AgentClient, AgentConfig, ReplyStream, TypingGuard};
 pub use async_trait::async_trait;
 
 /// Rotate the client `REFRESH_GUARD_SECS` before the access token expires. 30 s

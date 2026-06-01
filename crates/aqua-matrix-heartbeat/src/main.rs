@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aqua_matrix_relay::{run_daemon, AgentConfig};
+use aqua_matrix_relay::{load_dotenv, run_daemon, AgentConfig};
 use clap::Parser;
 
 mod ops;
@@ -40,8 +40,8 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "@did-pkh-eip155-1-0x0000000000000000000000000000000000000000:matrix.inblock.io",
-        help = "Matrix user ID to report to and accept `#shell` commands from"
+        env = "AGENT_TARGET",
+        help = "Matrix user ID to report to and accept `#shell` commands from (set AGENT_TARGET, e.g. via this instance's .env file)"
     )]
     target: String,
 
@@ -63,6 +63,10 @@ fn default_store_dir() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
+    // Load this instance's config from its `.env` before parsing args (see
+    // `load_dotenv`): AGENT_TARGET et al. become file-driven and per-instance.
+    load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

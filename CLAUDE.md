@@ -17,7 +17,7 @@ This repo is your messaging tool. Use `/matrix-message` for the full skill, or f
 ~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "your message here"
 ```
 
-No flags needed beyond `--message`. The agent auto-registers OIDC credentials on first run, caches them in `~/.aqua-matrix-agent/config.toml`, and defaults to messaging Tim.
+The target comes from `AGENT_TARGET` — set it once in a `.env` file (copy `.env.example`; the repo ships **no** hardcoded target) and `--message`/`--read` need no further flags. On this host a `.env` with the right `AGENT_TARGET` already lives in the repo dir, so the command above works as-is. The agent auto-registers OIDC credentials on first run and caches them in `~/.aqua-matrix-agent/config.toml`. Override the target ad-hoc with `--target`.
 
 ### Read messages
 
@@ -100,6 +100,24 @@ cargo test --test e2e --features e2e         # run E2E test (requires live matri
 
 A single `cargo build` builds the whole workspace, producing `target/debug/aqua-matrix-agent` (one-shot CLI), `target/debug/aqua-matrix-heartbeat`, and `target/debug/aqua-matrix-claude-p`. The systemd units point at the debug paths on purpose — keeps rebuild cycles tight.
 
+## Configuration (`.env`, per-instance)
+
+Every binary loads a `.env` file at startup (before parsing flags), so config —
+especially `AGENT_TARGET` — lives in a file, not baked into the code. **The repo
+ships no hardcoded target or secrets**; copy `.env.example` to `.env` and fill in
+your own. Precedence, high → low: explicit CLI flag > process env (e.g. systemd
+`Environment=`) > `.env` file > built-in default.
+
+- **Which file:** `AGENT_ENV_FILE=/path/to/file` selects an explicit file; unset,
+  it loads a conventional `.env` from the working dir. This is how **multiple
+  agents** coexist — each instance points `AGENT_ENV_FILE` at its own file. The
+  systemd units do exactly this (`%h/.aqua-matrix-<role>/agent.env`).
+- **On this host:** machine-local `.env` files already hold the real
+  `AGENT_TARGET` (repo dir for the CLI; each store dir for the daemons). They are
+  gitignored — never commit real values.
+- **URLs** (`MATRIX_URL`, `SIWX_URL`) default to the inblock endpoints and are
+  overridable via `.env`/flag for a different deployment.
+
 ## CLI flags
 
 | Flag | Env var | Default | Description |
@@ -109,7 +127,7 @@ A single `cargo build` builds the whole workspace, producing `target/debug/aqua-
 | `--matrix-url` | `MATRIX_URL` | `https://matrix.inblock.io` | Matrix homeserver URL |
 | `--client-id` | `OIDC_CLIENT_ID` | auto-registered | OIDC client ID |
 | `--redirect-uri` | `OIDC_REDIRECT_URI` | `http://localhost:0/callback` | OIDC redirect URI |
-| `--target` | | Tim's account | Matrix user ID to message |
+| `--target` | `AGENT_TARGET` | none (required for `--message`/`--read`) | Matrix user ID to message; set via `.env` (see `.env.example`) |
 | `--store-dir` | `AGENT_STORE_DIR` | `~/.aqua-matrix-agent` | SQLite + config directory |
 | `--message` | | | Message text to send |
 | `--read` | | | Read recent messages |

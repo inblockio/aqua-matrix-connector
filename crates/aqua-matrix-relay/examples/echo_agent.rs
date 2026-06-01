@@ -42,7 +42,9 @@ async fn main() {
         store_dir: PathBuf::from(home).join(".aqua-matrix-echo"),
     };
 
-    // Replace this target with whoever should be allowed to talk to the agent.
-    let target = "@did-pkh-eip155-1-0x0000000000000000000000000000000000000000:matrix.inblock.io";
-    run_daemon(config, target, EchoHandler).await;
+    // Whoever is allowed to talk to the agent. Set AGENT_TARGET (e.g. in a
+    // `.env` — see `.env.example`) to your own Matrix user ID.
+    let target = std::env::var("AGENT_TARGET")
+        .expect("set AGENT_TARGET to the Matrix user ID this echo agent should serve");
+    run_daemon(config, &target, EchoHandler).await;
 }
