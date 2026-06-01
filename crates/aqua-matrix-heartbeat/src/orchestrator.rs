@@ -8,23 +8,47 @@
 //! [`aqua_matrix_template::ResolvedInstance`] in, one container = one agent =
 //! one self-minted identity out.
 //!
-//! ## The decisive invariant (restart vs. replace)
+//! ## The identity model (persistent volume, reset on replace)
 //!
-//! `/agent` (the container's self-minted `.pem` → DID, its Matrix crypto store,
-//! and its claude memory) MUST live on the container's **writable layer**:
+//! Each instance's durable state — its self-minted `.pem` → DID and Matrix
+//! crypto store (`/agent/store`), plus its claude memory and session logs
+//! (`/agent/memory`, i.e. `CLAUDE_CONFIG_DIR`) — lives on a **per-instance host
+//! volume** keyed by instance `id` (`<sessions>/<id>/persist/{store,memory}`),
+//! NOT on the container's ephemeral writable layer. The binds use the `:U`
+//! option so rootless podman chowns the source to the container user's mapped
+//! uid (the image runs as the non-root `agent`); without it the bind is
+//! unwritable.
 //!
-//! - `restart` (crash → on-failure restart, or `stop`+`start` of the SAME
-//!   container object): the writable layer is intact ⇒ the agent keeps its
-//!   identity + memory.
-//! - `replace` (`rm` + recreate): a fresh writable layer ⇒ a NEW identity, fresh
-//!   context, full re-auth.
+//! - `restart` (crash → on-failure restart, host reboot, or a `stop` + re-
+//!   `spawn` of the same `id`): the volume is reused ⇒ the agent keeps its
+//!   identity, memory, and session history. This is the steady state.
+//! - `replace` ([`ContainerManager::replace`]): deliberately `rm -rf`s the
+//!   instance's `persist` dir *before* re-spawning ⇒ a NEW identity, fresh
+//!   context, full re-auth. This is the explicit "start over" verb, and now the
+//!   only path that resets identity.
 //!
-//! Therefore [`ContainerManager::spawn`] deliberately:
-//!   * does NOT set `readonly_rootfs`, and
-//!   * does NOT put `/agent` on a named or anonymous volume.
-//! Either of those would let identity survive a `replace`, breaking the model.
-//! The only thing that survives replacement is the orchestrator-harvested log on
-//! the host (`<sessions>/<id>/<incarnation>/agent.log`).
+//! Rationale: a containerised agent that lost its Matrix identity on every host
+//! reboot or token-rotation-driven recreate was not viable as a persistent
+//! assistant. Persisting the volume fixes that; `replace` retains an on-demand
+//! path to a clean identity. (The earlier design kept `/agent` wholly on the
+//! writable layer so *any* recreate reset identity — see git history.)
+//!
+//! [`ContainerManager::spawn`] still does NOT set `readonly_rootfs`; the rest of
+//! `/agent` (binaries, the RO `/agent/config.json` mount) is fine as ephemeral
+//! writable-layer state. The host also keeps the harvested per-incarnation log
+//! (`<sessions>/<id>/<incarnation>/agent.log`) as provenance.
+//!
+//! ## Auth token (long-lived by design)
+//!
+//! `claude -p` inside the container authenticates with the secret named by the
+//! agent type's `auth.env_var` (`CLAUDE_CODE_OAUTH_TOKEN`). To avoid baking a
+//! short-lived ambient *session* token into a container (it would 401 a few
+//! hours later with no way to refresh), [`spawn`](ContainerManager::spawn)
+//! sources it via [`resolve_auth_secret`](ContainerManager::resolve_auth_secret):
+//! an explicit env override if set, else the durable **token file**
+//! (`<store_dir>/claude-oauth-token`, overridable with `AQUA_CLAUDE_TOKEN_FILE`).
+//! Populate that file once with a long-lived `claude setup-token` token and every
+//! spawn reuses it. Spawning fails closed if neither source yields a token.
 //!
 //! ## podman compatibility notes
 //!
@@ -98,6 +122,10 @@ pub struct ContainerManager {
     /// the `config.json` mounted into the container and the harvested
     /// `agent.log` (provenance/audit that outlives a container replacement).
     sessions_dir: PathBuf,
+    /// Base store dir (`<store_dir>`, parent of `sessions/`). Root for the
+    /// durable Claude auth token file (`claude-oauth-token`); see
+    /// [`ContainerManager::token_file`].
+    store_dir: PathBuf,
 }
 
 impl ContainerManager {
@@ -121,7 +149,56 @@ impl ContainerManager {
             docker,
             sessions: Mutex::new(HashMap::new()),
             sessions_dir,
+            store_dir: base,
         })
+    }
+
+    /// The per-instance persistent volume dir (`<sessions>/<id>/persist`),
+    /// stable across incarnations. Holds `store/` (identity + matrix crypto) and
+    /// `memory/` (claude session logs), bound into the container with `:U`.
+    /// Survives restarts; wiped by [`replace`](Self::replace).
+    fn persist_dir(&self, id: &str) -> PathBuf {
+        persist_dir_for(&self.sessions_dir, id)
+    }
+
+    /// Path to the durable Claude OAuth token file — the canonical source for a
+    /// **long-lived** `claude setup-token` token, so spawned agents don't inherit
+    /// the orchestrator's short-lived ambient session token. Override with
+    /// `AQUA_CLAUDE_TOKEN_FILE`; defaults to `<store_dir>/claude-oauth-token`.
+    fn token_file(&self) -> PathBuf {
+        match std::env::var("AQUA_CLAUDE_TOKEN_FILE") {
+            Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+            _ => self.store_dir.join("claude-oauth-token"),
+        }
+    }
+
+    /// Resolve the auth secret to inject as `env_var`, preferring a long-lived
+    /// token. Precedence:
+    ///   1. `env_var` in the orchestrator's own environment (explicit override,
+    ///      e.g. a one-off `CLAUDE_CODE_OAUTH_TOKEN=… aqua-matrix-heartbeat`), else
+    ///   2. the durable [`token_file`](Self::token_file).
+    /// Fails closed when neither yields a non-empty value — we never spawn a
+    /// token-less container. The value is trimmed and never logged.
+    fn resolve_auth_secret(&self, env_var: &str) -> Result<String> {
+        if let Ok(v) = std::env::var(env_var) {
+            if !v.trim().is_empty() {
+                return Ok(v);
+            }
+        }
+        let file = self.token_file();
+        match std::fs::read_to_string(&file) {
+            Ok(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+            Ok(_) => bail!(
+                "{env_var} unset and token file {} is empty; run `claude setup-token` \
+                 and write its long-lived token there",
+                file.display()
+            ),
+            Err(e) => bail!(
+                "{env_var} unset and no token file at {} ({e}); run `claude setup-token` \
+                 and write its long-lived token there (or set {env_var})",
+                file.display()
+            ),
+        }
     }
 
     /// Spawn a new typed agent container from a [`ResolvedInstance`].
@@ -148,24 +225,43 @@ impl ContainerManager {
             .ok_or_else(|| anyhow!("non-UTF-8 config path: {}", config_host_path.display()))?
             .to_string();
 
+        // --- persistent per-instance volume (identity + memory + logs) ------
+        // Keyed by `id` (stable across incarnations) so a restart / reboot / re-
+        // spawn reuses the same identity and session history. `replace` wipes
+        // this dir to force a fresh identity. Created if absent; never wiped here.
+        let persist = self.persist_dir(&id);
+        let store_dir = persist.join("store");
+        let memory_dir = persist.join("memory");
+        std::fs::create_dir_all(&store_dir)
+            .with_context(|| format!("create persistent store dir {}", store_dir.display()))?;
+        std::fs::create_dir_all(&memory_dir)
+            .with_context(|| format!("create persistent memory dir {}", memory_dir.display()))?;
+        let store_str = path_str(&store_dir)?;
+        let memory_str = path_str(&memory_dir)?;
+
         // --- env (incl. the auth secret) -----------------------------------
-        // The secret VALUE is read from the orchestrator's own environment and
-        // injected by NAME=value. We never store or log the value. Refuse to
-        // spawn a token-less container.
+        // The secret VALUE comes from `resolve_auth_secret` (env override, else
+        // the durable long-lived token file) and is injected by NAME=value. We
+        // never store or log the value, and refuse to spawn a token-less
+        // container.
         let env_var = &resolved.agent_type.auth.env_var;
-        let secret = std::env::var(env_var).map_err(|_| {
-            anyhow!(
-                "orchestrator env lacks {env_var}; run `claude setup-token` and set it before spawning"
-            )
-        })?;
+        let secret = self.resolve_auth_secret(env_var)?;
         let env = vec![
             format!("AGENT_TARGET={}", resolved.target),
             "AGENT_CONFIG_FILE=/agent/config.json".to_string(),
             format!("{env_var}={secret}"),
         ];
 
-        // --- binds: config.json (RO) + each ref_mount (RO) -----------------
-        let mut binds = vec![format!("{config_host_path_str}:/agent/config.json:ro")];
+        // --- binds: config.json (RO) + persistent store/memory (RW, :U) +
+        //     each ref_mount (RO) ------------------------------------------
+        let mut binds = vec![
+            format!("{config_host_path_str}:/agent/config.json:ro"),
+            // Persistent identity + matrix crypto store. `:U` chowns the source
+            // to the container user's mapped uid (rootless, non-root `agent`).
+            format!("{store_str}:/agent/store:U"),
+            // Persistent claude memory + session logs (CLAUDE_CONFIG_DIR).
+            format!("{memory_str}:/agent/memory:U"),
+        ];
         for m in &resolved.agent_type.ref_mounts {
             let host = resolve_host_path(&m.host_path);
             let host_str = host
@@ -186,12 +282,11 @@ impl ContainerManager {
         let mut tmpfs = HashMap::new();
         tmpfs.insert("/tmp".to_string(), String::new());
 
-        // CRITICAL INVARIANT: NO `readonly_rootfs` and NO volume at `/agent`.
-        // `/agent` must live on the writable layer so that `restart` (same
-        // container) preserves the self-minted identity + memory while `replace`
-        // (rm + recreate) resets them. A read-only rootfs, or a named/anonymous
-        // volume mounted at `/agent`, would let identity survive replacement and
-        // break the restart-vs-replace model. (See module docs.)
+        // Identity + memory live on per-instance host volumes at /agent/store
+        // and /agent/memory (bound above with `:U`); they persist across restarts
+        // and are wiped only by `replace`. See module docs. We still do NOT set
+        // `readonly_rootfs` — the rest of /agent (binaries, the RO config mount)
+        // stays ephemeral on the writable layer.
         let host_config = HostConfig {
             binds: Some(binds),
             memory: Some(memory),
@@ -273,8 +368,9 @@ impl ContainerManager {
     }
 
     /// Replace the container backing `id`: stop + remove the current one (its log
-    /// is drained/harvested first), then `spawn` the SAME [`ResolvedInstance`]
-    /// again. The new container has a fresh writable layer ⇒ a NEW identity.
+    /// is drained/harvested first), wipe its persistent volume, then `spawn` the
+    /// SAME [`ResolvedInstance`] again ⇒ a NEW identity. This is the only path
+    /// that resets identity now that the volume survives ordinary restarts.
     pub async fn replace(&self, id: &str) -> Result<SessionInfo> {
         // Pull the stored ResolvedInstance out so we can re-spawn it.
         let resolved = {
@@ -287,6 +383,13 @@ impl ContainerManager {
 
         // Tear down the current incarnation (drains its log, then rm).
         self.stop(id).await?;
+
+        // Reset identity: wipe the per-instance persistent volume so the re-spawn
+        // self-mints a fresh .pem/DID and starts with empty memory. Now that the
+        // volume survives ordinary restarts, this is the ONLY path that resets
+        // identity — the explicit "start over" verb.
+        let persist = self.persist_dir(id);
+        wipe_persist(&persist).await?;
 
         // Re-spawn ⇒ new incarnation, new identity, same slot/type/target.
         self.spawn(&resolved).await
@@ -511,6 +614,45 @@ fn current_uid() -> String {
 fn default_store_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".aqua-matrix-heartbeat")
+}
+
+/// The per-instance persistent volume dir, `<sessions>/<id>/persist`. Stable
+/// across incarnations; holds `store/` (identity + matrix crypto) and `memory/`
+/// (claude session logs), each bound into the container with `:U`. A free
+/// function so [`ContainerManager::persist_dir`] and the construction path can
+/// share one definition of the layout.
+fn persist_dir_for(sessions_dir: &Path, id: &str) -> PathBuf {
+    sessions_dir.join(id).join("persist")
+}
+
+/// UTF-8 string view of a host path, or a descriptive error. Bind specs are
+/// `String`s, so every host path bound into a container round-trips through this.
+fn path_str(p: &Path) -> Result<String> {
+    p.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("non-UTF-8 path: {}", p.display()))
+}
+
+/// Wipe an instance's persistent volume so the next `spawn` self-mints a fresh
+/// identity (the `replace` "start over" path). The `store/` + `memory/` subdirs
+/// were chowned to the container user's mapped subuid by the `:U` bind, so a
+/// plain host `rm` hits EPERM; `podman unshare` re-enters the rootless user
+/// namespace (where that mapped uid is root) to delete them. No-op if the dir is
+/// already gone.
+async fn wipe_persist(persist: &Path) -> Result<()> {
+    if !persist.exists() {
+        return Ok(());
+    }
+    let persist_str = path_str(persist)?;
+    let status = tokio::process::Command::new("podman")
+        .args(["unshare", "rm", "-rf", &persist_str])
+        .status()
+        .await
+        .with_context(|| format!("spawn `podman unshare rm -rf {persist_str}`"))?;
+    if !status.success() {
+        bail!("`podman unshare rm -rf {persist_str}` failed: {status}");
+    }
+    Ok(())
 }
 
 /// Resolve a `ref_mount` host path to an absolute path. Absolute paths pass
