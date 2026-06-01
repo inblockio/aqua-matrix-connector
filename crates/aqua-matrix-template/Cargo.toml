@@ -1,0 +1,18 @@
+[package]
+name = "aqua-matrix-template"
+version.workspace = true
+edition.workspace = true
+description = "Typed agent-instance data model + loader/validator. Defines the aqua-pinnable AgentType (types/<name>.json), InstanceBinding (instances/<id>.toml), and the ResolvedInstance the orchestrator mounts into a container as /agent/config.json. Pure data + serde; no async, no Matrix, no I/O beyond reading config files."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_matrix_template"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+schemars.workspace = true

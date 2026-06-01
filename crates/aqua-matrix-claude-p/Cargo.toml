@@ -15,6 +15,10 @@ aqua-matrix-relay.workspace = true
 # Phase B: reuse the shared IPC wire types (`ipc::AskReply`, `SOCK_ENV`) so the
 # daemon's ask-bridge and the MCP server agree on exactly one wire definition.
 aqua-matrix-ask-mcp.workspace = true
+# Phase 4: the typed-instance data model. When a `/agent/config.json` is mounted
+# (containerized deployment), the handler reads its role/display/hello/contract/
+# memory from a `ResolvedInstance` instead of the hardcoded consts.
+aqua-matrix-template.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true

@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use aqua_matrix_relay::{async_trait, load_dotenv, run_daemon, AgentClient, AgentConfig, MessageHandler, ReplyStream};
+use aqua_matrix_template::ResolvedInstance;
 use clap::Parser;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
@@ -66,6 +67,14 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(420);
 const MAX_REPLY_BYTES: usize = 16_000; // Matrix can take more, but be polite.
 const ROLE: &str = "claude-channel";
 const UNIT: &str = "aqua-matrix-claude-channel";
+/// The fully-qualified `ask_human` MCP tool name (must match [`ask_bridge`]'s
+/// `SERVER_KEY`). Always merged into `--allowedTools` when the ask bridge is up,
+/// alongside the frozen contract's tools when a config is loaded.
+const ASK_HUMAN_TOOL: &str = "mcp__ask__ask_human";
+/// Default path the orchestrator mounts the resolved config at. Overridable via
+/// `AGENT_CONFIG_FILE`. Absent (host systemd / dev runs) ⇒ fall back to today's
+/// hardcoded behavior.
+const DEFAULT_CONFIG_FILE: &str = "/agent/config.json";
 
 #[derive(Parser)]
 #[command(
@@ -91,9 +100,9 @@ struct Args {
     #[arg(
         long,
         env = "AGENT_TARGET",
-        help = "Matrix user ID whose DMs are forwarded to claude -p (set AGENT_TARGET, e.g. via this instance's .env file)"
+        help = "Matrix user ID whose DMs are forwarded to claude -p (set AGENT_TARGET, e.g. via this instance's .env file). Optional only when a type config (AGENT_CONFIG_FILE) supplies the target; otherwise required."
     )]
-    target: String,
+    target: Option<String>,
 
     #[arg(long, env = "AGENT_STORE_DIR")]
     store_dir: Option<PathBuf>,
@@ -147,7 +156,16 @@ impl SessionStore {
 /// primitive), a per-target run lock so only one `claude` run — and thus at most
 /// one open question — exists per user at a time, and the per-target
 /// [`SessionStore`] that gives each user a continuous conversation.
-#[derive(Default)]
+///
+/// ## Type-driven mode (Phase 4)
+///
+/// When a [`ResolvedInstance`] config was mounted (`AGENT_CONFIG_FILE`, default
+/// `/agent/config.json`), `config` is `Some` and the handler's identity
+/// (`role`/`display_name`/`hello`) and every `claude` run's scope contract are
+/// driven by it. When `config` is `None` (host systemd daemon, dev runs) the
+/// handler behaves byte-for-byte like before: the hardcoded [`ROLE`]/[`UNIT`]
+/// consts and the [`MessageHandler::hello`] string, and only the `ask_human`
+/// tool in `--allowedTools` (no `--disallowedTools`, no `CLAUDE_CONFIG_DIR`).
 struct ClaudePHandler {
     pending: PendingMap,
     /// One async mutex per `target`, gating its active run. `claude` is
@@ -156,9 +174,38 @@ struct ClaudePHandler {
     run_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Last session id per target, for `--resume` continuity across DMs.
     sessions: SessionStore,
+    /// The resolved type config, when one was mounted. `Arc` so each spawned run
+    /// task can cheaply share it for contract injection in [`stream_claude`].
+    config: Option<Arc<ResolvedInstance>>,
+    /// The role string returned by [`MessageHandler::role`]. Owned so `role()`
+    /// (which returns `&str`) can borrow it: config-derived when a config is
+    /// loaded, else the [`ROLE`] const.
+    role: String,
+}
+
+impl Default for ClaudePHandler {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl ClaudePHandler {
+    /// Build a handler. `config` is the mounted [`ResolvedInstance`] in
+    /// type-driven mode, or `None` for the legacy hardcoded behavior.
+    fn new(config: Option<ResolvedInstance>) -> Self {
+        let role = config
+            .as_ref()
+            .map(|c| c.agent_type.role.clone())
+            .unwrap_or_else(|| ROLE.to_string());
+        Self {
+            pending: PendingMap::default(),
+            run_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sessions: SessionStore::default(),
+            config: config.map(Arc::new),
+            role,
+        }
+    }
+
     /// Get-or-create the per-target run lock.
     fn run_lock(&self, target: &str) -> Arc<AsyncMutex<()>> {
         let mut locks = self
@@ -175,14 +222,40 @@ impl ClaudePHandler {
 #[async_trait]
 impl MessageHandler for ClaudePHandler {
     fn role(&self) -> &str {
-        ROLE
+        // Config-derived when loaded (stored at construction), else the const.
+        &self.role
     }
 
     fn systemd_unit(&self) -> Option<&str> {
-        Some(UNIT)
+        // A containerized (config-driven) instance has no supervising host
+        // systemd unit — the orchestrator owns its lifetime. Only report the
+        // host unit in the legacy deployment.
+        if self.config.is_some() {
+            None
+        } else {
+            Some(UNIT)
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match &self.config {
+            Some(c) => c.agent_type.display_name.clone(),
+            None => self.role().to_string(),
+        }
     }
 
     fn hello(&self, agent: &AgentClient) -> Option<String> {
+        // Type-driven: a config may carry its own greeting. Substitute the
+        // documented `{did}` / `{user_id}` placeholders at send time (the
+        // template crate deliberately leaves templating to the consumer). A
+        // config with no `hello` stays silent.
+        if let Some(c) = &self.config {
+            return c.agent_type.hello.as_ref().map(|h| {
+                h.replace("{user_id}", agent.user_id())
+                    .replace("{did}", agent.user_id())
+            });
+        }
+        // Legacy hardcoded greeting — unchanged.
         Some(format!(
             "[hello] aqua-matrix-claude-channel online (identity: {}). DM me any text (without `#shell` prefix) and I will run `claude -p <your message>` and reply with the output. We keep a **continuous conversation** — each message resumes the same session, so I remember context across DMs (restart the service to start fresh). Long tasks run to completion; I only give up if I go silent for {}s. Destructive requests (rm, force-push, …) are shown as a plan and only run after you reply `yes`. I may also pause mid-task and ask you a question (`[ask] …`) — your next reply is the answer.",
             agent.user_id(),
@@ -214,6 +287,9 @@ impl MessageHandler for ClaudePHandler {
         let pending = self.pending.clone();
         let run_lock = self.run_lock(&target);
         let sessions = self.sessions.clone();
+        // Phase 4: share the frozen contract config (when loaded) into the run
+        // task so every `claude` invocation enforces it. `None` ⇒ legacy mode.
+        let config = self.config.clone();
         tokio::spawn(async move {
             // Serialise: hold the per-target lock for the whole run so a second
             // prompt can't start (or open a second question) until this one
@@ -225,7 +301,9 @@ impl MessageHandler for ClaudePHandler {
             // across DMs. The run returns the session id to remember for next
             // time (the same id when resumed; a new one when starting cold).
             let prior = sessions.get(&target);
-            let mut result = run_turn(&agent, &pending, &target, &prompt, prior.as_deref()).await;
+            let mut result =
+                run_turn(&agent, &pending, &target, &prompt, prior.as_deref(), config.as_deref())
+                    .await;
 
             // Self-heal a poisoned session id: if a resumed turn failed, the
             // stored id may be stale (e.g. claude's session store was pruned),
@@ -235,7 +313,8 @@ impl MessageHandler for ClaudePHandler {
                     "claude-channel: turn resuming session {prior:?} failed; clearing it and retrying fresh"
                 );
                 sessions.clear(&target);
-                result = run_turn(&agent, &pending, &target, &prompt, None).await;
+                result =
+                    run_turn(&agent, &pending, &target, &prompt, None, config.as_deref()).await;
             }
 
             match result {
@@ -263,12 +342,14 @@ async fn run_turn(
     target: &str,
     prompt: &str,
     prior: Option<&str>,
+    config: Option<&ResolvedInstance>,
 ) -> anyhow::Result<Option<String>> {
     if destructive::looks_destructive(prompt) {
-        run_gated(agent, pending, target, prompt, prior).await
+        run_gated(agent, pending, target, prompt, prior, config).await
     } else {
         let outcome =
-            stream_claude(agent, pending, target, &ClaudeRun::conversational(prompt, prior)).await?;
+            stream_claude(agent, pending, target, &ClaudeRun::conversational(prompt, prior), config)
+                .await?;
         Ok(outcome.session_id)
     }
 }
@@ -291,13 +372,14 @@ async fn run_gated(
     target: &str,
     prompt: &str,
     prior: Option<&str>,
+    config: Option<&ResolvedInstance>,
 ) -> anyhow::Result<Option<String>> {
     let class = destructive::classify(prompt).unwrap_or("destructive action");
     tracing::info!("claude-channel: gating {class:?} prompt from {target}");
 
     // 1. Plan mode. The streamed message is the plan; we also need its session
     //    id to resume on approval.
-    let plan = stream_claude(agent, pending, target, &ClaudeRun::plan(prompt, prior)).await?;
+    let plan = stream_claude(agent, pending, target, &ClaudeRun::plan(prompt, prior), config).await?;
     let Some(session_id) = plan.session_id else {
         // No session id → we cannot resume to execute. Fail closed.
         anyhow::bail!("plan produced no session id to resume; aborting (fail closed)");
@@ -334,6 +416,7 @@ async fn run_gated(
         pending,
         target,
         &ClaudeRun::resume(&session_id, "Approved. Proceed with the plan."),
+        config,
     )
     .await?;
     // Prefer the execute run's reported id; fall back to the plan's (the
@@ -402,14 +485,16 @@ async fn stream_claude(
     pending: &PendingMap,
     target: &str,
     run: &ClaudeRun<'_>,
+    config: Option<&ResolvedInstance>,
 ) -> anyhow::Result<RunOutcome> {
     let claude_bin = find_claude_bin();
     tracing::debug!(
-        "invoking {} -p (stream-json, mode={:?}, resume={:?}, ask_human={})",
+        "invoking {} -p (stream-json, mode={:?}, resume={:?}, ask_human={}, typed={})",
         claude_bin,
         run.permission_mode,
         run.resume_session,
         run.ask_human,
+        config.is_some(),
     );
 
     let mut cmd = Command::new(&claude_bin);
@@ -420,6 +505,14 @@ async fn stream_claude(
     if let Some(mode) = run.permission_mode {
         cmd.arg("--permission-mode").arg(mode);
     }
+
+    // Phase 4: isolate this run's memory/session state to the config's
+    // `CLAUDE_CONFIG_DIR` (the container's writable layer). Legacy mode (no
+    // config) leaves `CLAUDE_CONFIG_DIR` untouched — Claude uses its default.
+    if let Some(c) = config {
+        cmd.env("CLAUDE_CONFIG_DIR", &c.agent_type.memory.config_dir);
+    }
+
     // Phase B: stand up the `ask_human` bridge for this run and add the MCP
     // flags. The guard must outlive the child (it serves ask_human calls during
     // the run), so it is held in this function's scope until after `wait`.
@@ -427,7 +520,6 @@ async fn stream_claude(
         match ask_bridge::AskBridge::setup(agent, pending, target, APPROVAL_TIMEOUT).await {
             Ok(bridge) => {
                 cmd.arg("--mcp-config").arg(bridge.config_path());
-                cmd.arg("--allowedTools").arg("mcp__ask__ask_human");
                 cmd.arg("--append-system-prompt").arg(ask_bridge::ASK_SYSTEM_PROMPT);
                 Some(bridge)
             }
@@ -441,6 +533,33 @@ async fn stream_claude(
     } else {
         None
     };
+
+    // Phase 4: assemble the frozen scope contract for EVERY run kind
+    // (conversational, plan, resume). `--allowedTools` merges the contract's
+    // allowed tools with `mcp__ask__ask_human` whenever the ask bridge is up
+    // for this run; `--disallowedTools` carries the contract's deny list.
+    //
+    // Legacy mode (no config) reproduces today's behavior exactly: the only
+    // `--allowedTools` entry is the ask tool, and only when the bridge is up;
+    // no `--disallowedTools`.
+    let ask_bridge_active = _ask_bridge.is_some();
+    let mut allowed: Vec<&str> = Vec::new();
+    if let Some(c) = config {
+        allowed.extend(c.agent_type.contract.allowed_tools.iter().map(String::as_str));
+    }
+    if ask_bridge_active {
+        allowed.push(ASK_HUMAN_TOOL);
+    }
+    if !allowed.is_empty() {
+        cmd.arg("--allowedTools").arg(allowed.join(","));
+    }
+    if let Some(c) = config {
+        let deny = &c.agent_type.contract.permissions.deny;
+        if !deny.is_empty() {
+            cmd.arg("--disallowedTools").arg(deny.join(","));
+        }
+    }
+
     let mut child = cmd
         .arg("--output-format")
         .arg("stream-json")
@@ -595,6 +714,28 @@ async fn stream_claude(
     Ok(outcome)
 }
 
+/// Load the mounted [`ResolvedInstance`] config, if one exists.
+///
+/// Reads the file at `AGENT_CONFIG_FILE` (default [`DEFAULT_CONFIG_FILE`] =
+/// `/agent/config.json`). When the file is **absent** (the host systemd daemon,
+/// dev runs) this returns `Ok(None)` so the binary falls back to today's
+/// hardcoded behavior — the non-containerized deployment must not break. A file
+/// that exists but fails to parse is a hard error (a mis-mounted contract must
+/// fail loudly, not silently downgrade to unconstrained legacy mode).
+fn load_resolved_config() -> anyhow::Result<Option<ResolvedInstance>> {
+    let path = std::env::var("AGENT_CONFIG_FILE")
+        .unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_string());
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading agent config file {}", path.display()))?;
+    let resolved: ResolvedInstance = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing agent config file {} as ResolvedInstance", path.display()))?;
+    Ok(Some(resolved))
+}
+
 fn find_claude_bin() -> String {
     // Try absolute path first (matches the systemd unit Environment).
     let home = std::env::var("HOME").unwrap_or_default();
@@ -634,6 +775,51 @@ async fn main() {
         .init();
 
     let args = Args::parse();
+
+    // Phase 4: if the orchestrator mounted a resolved type config, run in
+    // type-driven mode — identity/contract/memory come from it. Otherwise fall
+    // back to today's hardcoded behavior so the host systemd deployment is
+    // unaffected. A present-but-unparseable config is fatal (fail loud).
+    let resolved = match load_resolved_config() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("failed to load AGENT_CONFIG_FILE: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
+    // Target precedence: the config's `target` is authoritative when a config
+    // is loaded; otherwise the existing `--target`/`AGENT_TARGET` arg.
+    let target = match &resolved {
+        Some(r) => {
+            tracing::info!(
+                "type-driven mode: instance={:?} role={:?} display={:?} target={:?} memory_dir={:?} allowed_tools={} deny={}",
+                r.id,
+                r.agent_type.role,
+                r.agent_type.display_name,
+                r.target,
+                r.agent_type.memory.config_dir,
+                r.agent_type.contract.allowed_tools.len(),
+                r.agent_type.contract.permissions.deny.len(),
+            );
+            r.target.clone()
+        }
+        None => {
+            tracing::info!("legacy mode: no AGENT_CONFIG_FILE mounted; using hardcoded role/hello and --target/AGENT_TARGET");
+            match args.target.clone() {
+                Some(t) => t,
+                None => {
+                    // Same effective requirement as before: with no config to
+                    // supply the target, `--target`/`AGENT_TARGET` is mandatory.
+                    tracing::error!(
+                        "no target: set --target/AGENT_TARGET (or mount AGENT_CONFIG_FILE with a target)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
+
     let config = AgentConfig {
         key_file: args.key_file,
         siwx_url: args.siwx_url,
@@ -643,5 +829,5 @@ async fn main() {
         store_dir: args.store_dir.unwrap_or_else(default_store_dir),
     };
 
-    run_daemon(config, &args.target, ClaudePHandler::default()).await;
+    run_daemon(config, &target, ClaudePHandler::new(resolved)).await;
 }

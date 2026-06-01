@@ -15,6 +15,7 @@ use aqua_matrix_relay::{load_dotenv, run_daemon, AgentConfig};
 use clap::Parser;
 
 mod ops;
+mod orchestrator;
 use ops::OpsHandler;
 
 #[derive(Parser)]
@@ -76,14 +77,15 @@ async fn main() {
 
     let args = Args::parse();
     let interval = Duration::from_secs(args.interval);
+    let store_dir = args.store_dir.unwrap_or_else(default_store_dir);
     let config = AgentConfig {
         key_file: args.key_file,
         siwx_url: args.siwx_url,
         matrix_url: args.matrix_url,
         client_id: args.client_id,
         redirect_uri: args.redirect_uri,
-        store_dir: args.store_dir.unwrap_or_else(default_store_dir),
+        store_dir: store_dir.clone(),
     };
 
-    run_daemon(config, &args.target, OpsHandler::new(interval)).await;
+    run_daemon(config, &args.target, OpsHandler::new(interval, &store_dir)).await;
 }

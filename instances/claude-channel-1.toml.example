@@ -1,0 +1,35 @@
+# aqua-matrix typed-instance binding template (Phase 2).
+#
+# An instance is a SLOT: it names a type, the AGENT_TARGET it reports to / its
+# allow-list receiver, a unique label, and (optionally) minimal overrides.
+# It stores NO identity — identity is per-incarnation, self-minted by the
+# container on first run. Replace the container ⇒ new DID + fresh memory, same
+# slot, same type. Restart ⇒ same identity (existing daemon refresh logic).
+#
+# Copy this to a real `instances/<id>.toml` (which is gitignored — *.example is
+# the only thing tracked, mirroring how the real `.env` is gitignored):
+#
+#   cp instances/claude-channel-1.toml.example instances/claude-channel-1.toml
+#   # then edit `target` to a real MXID you control.
+
+# Unique instance label. Convention: <type>-<n>. By convention also the
+# filename stem (instances/<id>.toml), though only the field is authoritative.
+id = "claude-channel-1"
+
+# References an AgentType.name (i.e. types/<type>.json). Field is `type`.
+type = "claude-channel"
+
+# REQUIRED: the Matrix user ID this instance reports to / its allow-list
+# receiver. The relay's dispatch() enforces sender == target. Replace with a
+# real MXID you control.
+target = "@you:matrix.example.com"
+
+# Optional per-instance overrides. Anything set here wins over the type's value
+# at resolve time. Keep minimal — the contract/image/auth are NOT overridable.
+# [overrides]
+# display_name = "claude-channel-prod"
+# hello = "Custom one-time greeting for this instance."
+# [overrides.resources]
+# memory_mb = 4096
+# cpus = 4.0
+# pids_limit = 1024

@@ -9,3 +9,8 @@ target/
 !.env.example
 .claude/*
 !.claude/skills/
+
+# Real typed-instance bindings hold a live AGENT_TARGET — gitignore them, the
+# same way real `.env` is ignored. Only the `*.example` template is tracked.
+instances/*.toml
+!instances/*.toml.example

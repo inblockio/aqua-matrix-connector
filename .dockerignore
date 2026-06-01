@@ -1,0 +1,21 @@
+# Belt-and-suspenders: scripts/build-image.sh assembles a lean, secret-free
+# staging context via rsync excludes. This .dockerignore is a second line of
+# defense in case the build context ever includes the repo directory directly.
+#
+# Lean:
+target
+**/target
+.git
+**/.git
+node_modules
+**/node_modules
+
+# Secret-free — NEVER ship identity keys, env files, or credentials into an image.
+*.pem
+**/*.pem
+.env
+**/.env
+.env.*
+**/.env.*
+.credentials*
+**/.credentials*
