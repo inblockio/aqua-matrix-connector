@@ -2,9 +2,11 @@
 //!
 //! This crate owns the *transport lifecycle* — authenticate via siwx-oidc,
 //! connect to Matrix, stream-sync, rotate the client ahead of token expiry,
-//! deduplicate inbound messages by timestamp watermark, and exit cleanly after
-//! repeated connect failures so systemd can self-heal. It knows nothing about
-//! *what an agent does* with a message.
+//! deduplicate inbound messages by a timestamp watermark that persists across
+//! rotations (so a DM arriving in the rotation gap isn't lost), shut down
+//! cleanly on SIGTERM/SIGINT, and exit cleanly after repeated connect failures
+//! so systemd can self-heal. It knows nothing about *what an agent does* with a
+//! message.
 //!
 //! To build a new agent you implement [`MessageHandler`] and call
 //! [`run_daemon`]. That's the whole surface — no Matrix types appear in the
@@ -38,6 +40,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::Notify;
 
 use matrix_sdk::{
     config::SyncSettings,
@@ -136,6 +140,30 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         target,
         REFRESH_GUARD_SECS,
     );
+
+    // The inbound-message dedupe watermark lives ACROSS cycles, created once
+    // here at "now": the FIRST cycle therefore ignores pre-startup backlog
+    // (preserving prior behavior), while LATER cycles carry it forward. That
+    // carry-forward is what stops the rotation gap from losing a message: when
+    // the client rotates (~30 s before token expiry) the new cycle's initial
+    // sync re-delivers recent timeline; with a per-cycle "now" watermark a DM
+    // that landed during the gap (its ts is just older than the new cycle's
+    // start) would look like backlog and be dropped. Carrying the watermark
+    // means a gap message (ts > carried watermark) is dispatched exactly once,
+    // while already-seen messages (ts <= watermark) stay skipped.
+    //
+    // Edge (acceptable): after MAX_CONNECT_FAILURES the process exits and a
+    // fresh process starts with the watermark reset to "now", re-ignoring any
+    // backlog — fine, that's a hard restart, not a rotation.
+    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
+
+    // Trap SIGTERM/SIGINT once and fan it out via a Notify so every cycle can
+    // unwind cleanly. `podman stop`/`systemctl stop` send SIGTERM and SIGKILL
+    // after a grace period; handling it lets us abort the in-flight sync and
+    // return from `run_daemon` (so `main` exits 0) well before the SIGKILL.
+    // SIGINT (Ctrl-C) is treated identically for local runs.
+    let shutdown = Arc::new(Notify::new());
+    spawn_shutdown_listener(shutdown.clone());
 
     let mut first_cycle = true;
     let mut consecutive_failures: u32 = 0;
@@ -253,20 +281,82 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
             tracing::warn!("{}: registry update failed: {e:#}", handler.role());
         }
 
-        let exit = run_cycle(&agent, &target, &handler, refresh_deadline).await;
+        let exit = run_cycle(
+            &agent,
+            &target,
+            &handler,
+            refresh_deadline,
+            watermark.clone(),
+            &shutdown,
+        )
+        .await;
+        if exit == "shutdown" {
+            // `run_cycle` already aborted the in-flight sync task before
+            // returning the sentinel, so nothing is left dangling. Return so
+            // `main` falls through and the process exits 0 before SIGKILL.
+            tracing::info!("{}: received SIGTERM; shutting down", handler.role());
+            return;
+        }
         tracing::info!("{}: cycle ended ({exit}); reconnecting", handler.role());
     }
 }
 
+/// Spawn a detached task that awaits SIGTERM or SIGINT and then notifies
+/// `shutdown`. Whichever signal fires first triggers the same clean shutdown
+/// path; subsequent signals are irrelevant (we're already unwinding).
+/// If installing a handler fails we log and leave that signal untrapped rather
+/// than abort startup — the other signal (and systemd's SIGKILL) still apply.
+fn spawn_shutdown_listener(shutdown: Arc<Notify>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async move {
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler: {e:#}");
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to install SIGINT handler: {e:#}");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+            _ = sigint.recv() => tracing::info!("SIGINT received"),
+        }
+        // `notify_one` both wakes a waiter that's already parked AND stores a
+        // permit if none is, so a cycle that hasn't yet reached its
+        // `notified()` await still observes shutdown on its next call. Exactly
+        // one cycle runs at a time, so a single permit suffices.
+        shutdown.notify_one();
+    });
+}
+
+/// Run one client cycle: register handlers, sync until the rotation deadline
+/// (or sync end, or shutdown), then abort the sync task and report why it ended.
+///
+/// `watermark` is the cross-cycle inbound-message dedupe key, owned by
+/// [`run_daemon`] and passed in (not created here). It is seeded once at daemon
+/// start to "now", so the FIRST cycle ignores pre-startup backlog; LATER cycles
+/// reuse the SAME watermark, so when this cycle's initial sync re-delivers
+/// recent timeline after a client rotation, a message that arrived in the
+/// rotation gap (ts > watermark) is dispatched exactly once while already-seen
+/// messages (ts <= watermark) stay skipped. [`dispatch`] still advances it
+/// monotonically.
+///
+/// `shutdown` is fired by the daemon's SIGTERM/SIGINT listener; observing it
+/// returns the `"shutdown"` sentinel so [`run_daemon`] can exit cleanly.
 async fn run_cycle<H: MessageHandler>(
     agent: &AgentClient,
     target: &Arc<String>,
     handler: &Arc<H>,
     refresh_deadline: tokio::time::Instant,
+    watermark: Arc<AtomicU64>,
+    shutdown: &Notify,
 ) -> &'static str {
-    // Watermark starts at "now": ignore backlog, only react to messages that
-    // arrive during this cycle. Advanced monotonically as messages are seen.
-    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
     register_handler(agent.clone(), target.clone(), handler.clone(), watermark);
     // Auto-join invites as they arrive on the sync stream (not only at cycle
     // start), so an invite the peer sends mid-cycle — or just after connect,
@@ -286,6 +376,7 @@ async fn run_cycle<H: MessageHandler>(
             loop {
                 tokio::select! {
                     biased;
+                    _ = shutdown.notified() => break "shutdown",
                     _ = tokio::time::sleep_until(refresh_deadline) => break "refresh-deadline",
                     res = &mut sync_task => {
                         log_sync_end(res);
@@ -300,6 +391,7 @@ async fn run_cycle<H: MessageHandler>(
         None => {
             tokio::select! {
                 biased;
+                _ = shutdown.notified() => "shutdown",
                 _ = tokio::time::sleep_until(refresh_deadline) => "refresh-deadline",
                 res = &mut sync_task => {
                     log_sync_end(res);
