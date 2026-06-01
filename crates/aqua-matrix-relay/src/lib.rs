@@ -401,8 +401,16 @@ async fn run_cycle<H: MessageHandler>(
         }
     };
 
-    sync_task.abort();
-    let _ = sync_task.await;
+    // If the sync task already completed (its `res = &mut sync_task` arm fired —
+    // e.g. sync() returned on a 401), it MUST NOT be awaited again: polling a
+    // finished JoinHandle panics ("JoinHandle polled after completion"). Guard on
+    // is_finished() so we only abort+await while it's still running (the
+    // shutdown / refresh-deadline / tick exits). A finished handle is just
+    // dropped — its result was already logged by the sync-ended arm.
+    if !sync_task.is_finished() {
+        sync_task.abort();
+        let _ = sync_task.await;
+    }
     exit
 }
 
