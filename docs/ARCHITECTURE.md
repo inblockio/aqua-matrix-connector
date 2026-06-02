@@ -56,16 +56,43 @@ There are three components running on the host. Each does one thing, has its own
 
 ## Workspace layout
 
-The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. Four crates live under `crates/`:
+The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. **Eight crates** live under `crates/`, split into two conceptual halves: a reusable **connector** substrate and the **agents** that ride on it (see "Repo boundary" below).
+
+**Connector half** (the reusable substrate — these crates know nothing about any specific agent):
 
 | Crate | Role |
 |---|---|
 | `aqua-matrix-agent` | The library (`AgentClient`, `AgentConfig`, OIDC, recovery, registry) plus the one-shot `aqua-matrix-agent` CLI binary (`--message` / `--read` / `--print-did`). |
-| `aqua-matrix-relay` | Generic daemon framework: the `MessageHandler` trait + `run_daemon()` lifecycle (connect-rotate-sync-watermark). Ships `examples/echo_agent.rs`. |
-| `aqua-matrix-heartbeat` | Binary `aqua-matrix-heartbeat` — the ops/heartbeat agent (periodic status DM + `#shell` commands). |
-| `aqua-matrix-claude-p` | Binary `aqua-matrix-claude-p` — the reference example backend that forwards DMs to `claude -p`. |
+| `aqua-matrix-relay` | Generic daemon framework: the `MessageHandler` trait + `InboundMessage` + `authorize()` seam + `run_daemon()` lifecycle (connect-rotate-sync-watermark). Ships `examples/echo_agent.rs`. |
+| `aqua-matrix-ask-mcp` | Tiny stdio MCP server exposing one tool, `ask_human(question) -> answer`, bridged over a per-run unix socket to the daemon. The library half (`ipc`, `jsonrpc`) is reused by the gating crate. |
+| `aqua-matrix-orchestrator` | Transport/agent-agnostic Podman engine: `ContainerManager` (spawn/replace/stop/tail) driven by the `ContainerSpec` seam. **Never sees `AgentType`.** |
+| `aqua-matrix-gating` | Confirmation/gating substrate: `PendingMap` (`ask_user` router), the `destructive` matcher, and `AskBridge` (per-run `ask_human` socket). Keyed on `AgentClient`; mentions no specific LLM. |
+
+**Agents half** (the backends — depend on the connector, never the reverse; extract to `~/aqua-agents` in a future phase):
+
+| Crate | Role |
+|---|---|
+| `aqua-matrix-template` | The agent capability schema: `AgentType` / `InstanceBinding` / `ResolvedInstance`, plus the `build_spawn_spec(agent_type, target, id) -> ContainerSpec` factory that produces a connector `ContainerSpec` (the only place that maps a rich `AgentType` down to the agent-agnostic spawn input). |
+| `aqua-matrix-heartbeat` | Binary `aqua-matrix-heartbeat` — the ops/heartbeat agent (periodic status DM + `#shell` commands). Deps: relay, template, orchestrator. |
+| `aqua-matrix-claude-p` | Binary `aqua-matrix-claude-p` — the reference Claude backend that forwards DMs to `claude -p`. Deps: relay, template, gating. |
 
 A single `cargo build` builds the whole workspace at once.
+
+## Repo boundary
+
+The workspace is deliberately split into two halves with a **strictly one-way dependency rule**, so the connector substrate can evolve (and eventually be extracted to its own repo) independently of any agent that rides on it. This is the invariant the whole split exists to create; see [`docs/plans/repo-split-execution-handover.md`](plans/repo-split-execution-handover.md) (§1 locked decisions, §4 target architecture) for the full rationale.
+
+- **Connector half:** `aqua-matrix-agent`, `aqua-matrix-relay`, `aqua-matrix-ask-mcp`, `aqua-matrix-orchestrator`, `aqua-matrix-gating`. A reusable "run any agent over Matrix + Podman" substrate.
+- **Agents half:** `aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`. The concrete backends + the capability schema.
+
+**The one-way rule:** dependencies flow **agents → connector, NEVER the reverse.** No connector crate may name a backend crate (`aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`) in its `Cargo.toml`. A wrong edge is a compile-time problem now (one workspace) instead of a cross-repo problem after the physical split — that is the point of refactoring in-place first.
+
+Two seams keep the boundary clean:
+
+- **The `ContainerSpec` seam (orchestrator).** The connector's `ContainerManager::spawn` consumes a minimal, agent-agnostic `ContainerSpec`, so the connector **never sees `AgentType`**. The mapping from a rich `AgentType` down to a `ContainerSpec` lives entirely agents-side, in `aqua_matrix_template::build_spawn_spec(agent_type, target, id)` (it resolves ref-mount host paths absolute and serializes the `ResolvedInstance` into `config_blob` mounted RO at `/agent/config.json`). `aqua-matrix-template` therefore gains an `aqua-matrix-orchestrator` dep — an *allowed* agents → connector edge.
+- **The `MessageHandler` / `InboundMessage` / `authorize` seam (relay).** Backends implement `MessageHandler::handle_message(agent, target, &InboundMessage) -> anyhow::Result<()>`. The relay owns the connect-rotate-sync-watermark lifecycle and dispatch, calling `authorize(sender_mxid, target)` (default = case-insensitive equality with the single target) as the allow/deny gate for both message dispatch and invite auto-join. This is the aqua-security allow/deny hook-point (keyed on DID in a future phase), scaffolded inert today.
+
+**The guard:** `scripts/check-dep-direction.sh` enforces the one-way rule mechanically. It greps each connector crate's `Cargo.toml` with an *anchored* dependency-line regex (`^[[:space:]]*aqua-matrix-(template|heartbeat|claude-p)\b`) so it inspects dependency entries only, never `description` metadata; it exits non-zero and names the offending crate/line on any forbidden edge, prints `OK` otherwise. Run it as part of the gate alongside `cargo build` / `cargo test`.
 
 ## Why two Matrix identities (not one)
 

@@ -62,24 +62,38 @@ Default to debug builds (release is much slower for iteration). The systemd unit
 
 ## Architecture
 
-This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. The four crates under `crates/`:
+This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. **Eight crates** under `crates/`, split into a reusable **connector** half and an **agents** half (see "Repo boundary" below and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
 
 ```
 aqua-matrix-agent (virtual workspace)
   |
-  +-- crates/aqua-matrix-agent     -- library (AgentClient, AgentConfig, OIDC, recovery,
-  |                                   registry) + one-shot CLI binary `aqua-matrix-agent`
-  |                                   (--message / --read / --print-did only)
-  +-- crates/aqua-matrix-relay     -- generic daemon: MessageHandler trait + run_daemon()
-  |                                   lifecycle (connect-rotate-sync-watermark); examples/echo_agent.rs
-  +-- crates/aqua-matrix-heartbeat -- binary `aqua-matrix-heartbeat` (ops agent: periodic
-  |                                   status DM + #shell commands)
-  +-- crates/aqua-matrix-claude-p  -- binary `aqua-matrix-claude-p` (reference backend:
-                                      forwards DMs to `claude -p`)
+  | CONNECTOR half (reusable substrate; never names an agents-side crate)
+  +-- crates/aqua-matrix-agent        -- library (AgentClient, AgentConfig, OIDC, recovery,
+  |                                      registry) + one-shot CLI binary `aqua-matrix-agent`
+  |                                      (--message / --read / --print-did only)
+  +-- crates/aqua-matrix-relay        -- generic daemon: MessageHandler trait + InboundMessage +
+  |                                      authorize() seam + run_daemon() lifecycle
+  |                                      (connect-rotate-sync-watermark); examples/echo_agent.rs
+  +-- crates/aqua-matrix-ask-mcp      -- stdio MCP server: one tool ask_human(q)->answer, bridged
+  |                                      over a per-run unix socket; lib half reused by gating
+  +-- crates/aqua-matrix-orchestrator -- transport/agent-agnostic Podman engine: ContainerManager
+  |                                      driven by the ContainerSpec seam (never sees AgentType)
+  +-- crates/aqua-matrix-gating       -- confirmation/gating substrate: PendingMap (ask_user),
+  |                                      destructive matcher, AskBridge (ask_human socket)
+  |
+  | AGENTS half (backends; depend on the connector, never the reverse)
+  +-- crates/aqua-matrix-template     -- AgentType/InstanceBinding/ResolvedInstance + the
+  |                                      build_spawn_spec(agent_type, target, id) -> ContainerSpec factory
+  +-- crates/aqua-matrix-heartbeat    -- binary `aqua-matrix-heartbeat` (ops agent: periodic
+  |                                      status DM + #shell commands); deps: relay, template, orchestrator
+  +-- crates/aqua-matrix-claude-p     -- binary `aqua-matrix-claude-p` (reference Claude backend:
+  |                                      forwards DMs to `claude -p`); deps: relay, template, gating
   |
   +-- siwx-oidc-auth -- Headless OIDC client (CAIP-122 signature auth)
   +-- matrix-sdk     -- Matrix client with E2E encryption (Megolm/Vodozemac)
 ```
+
+**Repo boundary (the one-way rule):** dependencies flow **agents → connector, NEVER the reverse.** No connector crate (`agent`, `relay`, `ask-mcp`, `orchestrator`, `gating`) may name a backend crate (`template`, `heartbeat`, `claude-p`) in its `Cargo.toml`. The connector reaches agents only through two seams: the `ContainerSpec` seam (`aqua_matrix_template::build_spawn_spec` maps a rich `AgentType` down to the agent-agnostic spec the orchestrator consumes) and the `MessageHandler`/`InboundMessage`/`authorize` seam in the relay. The guard `scripts/check-dep-direction.sh` enforces this mechanically (anchored grep of connector `Cargo.toml` dependency lines) — **run it as part of the gate** alongside `cargo build` / `cargo test`. Full rationale: [`docs/plans/repo-split-execution-handover.md`](docs/plans/repo-split-execution-handover.md).
 
 **Authentication flow:** Ed25519 key -> derive DID -> CAIP-122 challenge-response against siwx-oidc -> siwx-oidc verifies signature, provisions user in Synapse via MSC3861 endpoints, issues opaque `mat_*`/`mcr_*` tokens -> Synapse validates tokens via `/oauth2/introspect` (RFC 7662) -> Matrix session restored.
 
