@@ -38,7 +38,7 @@
 > To re-run: `cargo run -p aqua-matrix-agent --example chat_e2e_driver -- --key-file <drv.pem>
 > --store-dir <store> --target <LOWERCASE channel MXID> --approve-canary <path-in-workdir>
 > --deny-canary <path-in-workdir>`. Canaries MUST live inside the daemon's working dir
-> (`~/aqua-matrix-hello`) — `claude -p`'s sandbox blocks file ops outside it. Start order:
+> (`~/aqua-matrix-agent`) — `claude -p`'s sandbox blocks file ops outside it. Start order:
 > create the invite (one-shot driver send) → start the test daemon → run the driver.
 >
 > The original tabled plan and its state-at-table-time are preserved below for history.

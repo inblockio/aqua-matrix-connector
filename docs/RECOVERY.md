@@ -136,7 +136,7 @@ systemctl --user start <unit>           # try again
 
 ```bash
 systemctl --user stop <unit>            # halt the auto-restart cycle
-~/aqua-matrix-hello/target/debug/aqua-matrix-heartbeat   # or aqua-matrix-claude-p, whichever daemon
+~/aqua-matrix-agent/target/debug/aqua-matrix-heartbeat   # or aqua-matrix-claude-p, whichever daemon
 # ... iterate. Ctrl+C when done. systemctl --user start <unit> to resume normal supervision.
 ```
 
@@ -153,7 +153,7 @@ systemctl --user start <unit>
 ```bash
 systemctl --user stop <unit>
 rm -rf ~/.aqua-matrix-<unit-name>/       # everything: store + config + cached session
-# Optionally also: rm ~/aqua-matrix-hello/<unit>.pem  # changes the underlying DID/Matrix account
+# Optionally also: rm ~/aqua-matrix-agent/<unit>.pem  # changes the underlying DID/Matrix account
 systemctl --user start <unit>
 ```
 
@@ -210,7 +210,7 @@ Should NOT happen if refresh tokens are working. Check:
 
 Less of a recovery issue, more of an onboarding one. Both Matrix daemons send a one-shot `[hello]` message on every start. If Tim sees no hello:
 - Verify the daemons did NOT crash on hello: `journalctl --user -u <unit> -n 30 | grep hello`
-- Verify the DM rooms exist on the server: `~/aqua-matrix-hello/target/debug/aqua-matrix-agent --read --key-file heartbeat.pem --store-dir ~/.aqua-matrix-heartbeat --target <tim>` (but stop the unit first to avoid SQLite contention)
+- Verify the DM rooms exist on the server: `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --read --key-file heartbeat.pem --store-dir ~/.aqua-matrix-heartbeat --target <tim>` (but stop the unit first to avoid SQLite contention)
 - Tim's Element may have an unaccepted room invite from the claude-channel identity if this is the first time he is seeing it
 
 ## What this document does not cover

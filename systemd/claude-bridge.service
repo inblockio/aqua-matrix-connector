@@ -1,6 +1,6 @@
 [Unit]
 Description=Persistent claude-ws session in tmux (LLM-Claude-Agent-Bridge)
-Documentation=https://github.com/inblockio/aqua-matrix-hello
+Documentation=https://github.com/inblockio/aqua-matrix-agent
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -17,7 +17,7 @@ StartLimitBurst=10
 #
 # If the supervisor itself dies, systemd respawns it via Restart=always.
 Type=simple
-WorkingDirectory=%h/aqua-matrix-hello
+WorkingDirectory=%h/aqua-matrix-agent
 ExecStart=/bin/bash -c 'while true; do if ! /usr/bin/tmux has-session -t claude-bridge 2>/dev/null; then /usr/bin/tmux new-session -d -s claude-bridge -- "$HOME/.local/bin/claude" --dangerously-skip-permissions && echo "[claude-bridge supervisor] spawned tmux session" || echo "[claude-bridge supervisor] spawn failed"; fi; sleep 10; done'
 ExecStop=/usr/bin/tmux kill-session -t claude-bridge
 Restart=always

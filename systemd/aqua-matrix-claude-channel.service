@@ -1,6 +1,6 @@
 [Unit]
 Description=Aqua Matrix claude-channel (LLM bridge — DM in, `claude -p` reply out)
-Documentation=https://github.com/inblockio/aqua-matrix-hello
+Documentation=https://github.com/inblockio/aqua-matrix-agent
 After=network-online.target
 Wants=network-online.target
 # Crash-loop guard belongs in [Unit] in modern systemd; [Service] placement
@@ -10,7 +10,7 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-WorkingDirectory=%h/aqua-matrix-hello
+WorkingDirectory=%h/aqua-matrix-agent
 # Forward CONTEXT_WINDOW for consistency with the heartbeat (status payloads
 # only matter on the heartbeat side, but keep envs aligned).
 Environment=CONTEXT_WINDOW=1000000
@@ -25,7 +25,7 @@ Environment=AGENT_ENV_FILE=%h/.aqua-matrix-claude-channel/agent.env
 # Reference example backend (was `aqua-matrix-agent --claude-channel` before
 # the workspace split). The unit name stays `aqua-matrix-claude-channel` so
 # `#shell respawn-channel`, the registry role, and skills are unaffected.
-ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-claude-p --key-file claude-channel.pem --store-dir %h/.aqua-matrix-claude-channel
+ExecStart=%h/aqua-matrix-agent/target/debug/aqua-matrix-claude-p --key-file claude-channel.pem --store-dir %h/.aqua-matrix-claude-channel
 Restart=always
 RestartSec=5s
 StandardOutput=journal

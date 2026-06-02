@@ -13,7 +13,7 @@ the product — it is the worked example.
 ## Workspace layout
 
 ```
-aqua-matrix-hello/                  # virtual Cargo workspace
+aqua-matrix-agent/                  # virtual Cargo workspace
 ├── Cargo.toml                      # [workspace] + shared [workspace.dependencies]
 └── crates/
     ├── aqua-matrix-agent/          # LIBRARY: AgentClient, AgentConfig, OIDC,

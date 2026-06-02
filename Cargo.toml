@@ -15,7 +15,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/inblockio/aqua-matrix-hello"
+repository = "https://github.com/inblockio/aqua-matrix-agent"
 
 # Single source of truth for dependency versions. Path deps here resolve
 # relative to THIS file (the workspace root), so the siwx-oidc sibling keeps

@@ -9,20 +9,20 @@ Send and receive end-to-end encrypted Matrix messages using `aqua-matrix-agent`.
 
 ## Prerequisites
 
-Binary at `~/aqua-matrix-hello/target/debug/aqua-matrix-agent`. If missing:
+Binary at `~/aqua-matrix-agent/target/debug/aqua-matrix-agent`. If missing:
 
 ```bash
-cd ~/aqua-matrix-hello && cargo build
+cd ~/aqua-matrix-agent && cargo build
 ```
 
 ## Quick Reference
 
 | Operation | Command |
 |---|---|
-| Send message | `~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "text" --target "@user:matrix.inblock.io"` |
-| Read messages | `~/aqua-matrix-hello/target/debug/aqua-matrix-agent --read --read-limit 20 --target "@user:matrix.inblock.io"` |
-| Send + read | `~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "text" --read --target "@user:matrix.inblock.io"` |
-| Print agent DID | `~/aqua-matrix-hello/target/debug/aqua-matrix-agent --print-did` |
+| Send message | `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --message "text" --target "@user:matrix.inblock.io"` |
+| Read messages | `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --read --read-limit 20 --target "@user:matrix.inblock.io"` |
+| Send + read | `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --message "text" --read --target "@user:matrix.inblock.io"` |
+| Print agent DID | `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --print-did` |
 | Use different identity | Add `--key-file path/to/other.pem` |
 
 ## Setup
@@ -58,7 +58,7 @@ aqua-matrix-agent --key-file agent-b.pem --store-dir ~/.aqua-matrix-agent-b \
   --read --target "@agent-a-user:matrix.inblock.io"
 ```
 
-Pre-existing keys: `~/aqua-matrix-hello/agent.pem` (Agent A) and `~/aqua-matrix-hello/agent-b.pem` (Agent B).
+Pre-existing keys: `~/aqua-matrix-agent/agent.pem` (Agent A) and `~/aqua-matrix-agent/agent-b.pem` (Agent B).
 
 ## Environment Variables
 

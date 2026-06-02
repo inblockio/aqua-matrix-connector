@@ -14,7 +14,7 @@ This repo is your messaging tool. Use `/matrix-message` for the full skill, or f
 ### Send a message
 
 ```bash
-~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "your message here"
+~/aqua-matrix-agent/target/debug/aqua-matrix-agent --message "your message here"
 ```
 
 The target comes from `AGENT_TARGET` — set it once in a `.env` file (copy `.env.example`; the repo ships **no** hardcoded target) and `--message`/`--read` need no further flags. On this host a `.env` with the right `AGENT_TARGET` already lives in the repo dir, so the command above works as-is. The agent auto-registers OIDC credentials on first run and caches them in `~/.aqua-matrix-agent/config.toml`. Override the target ad-hoc with `--target`.
@@ -22,25 +22,25 @@ The target comes from `AGENT_TARGET` — set it once in a `.env` file (copy `.en
 ### Read messages
 
 ```bash
-~/aqua-matrix-hello/target/debug/aqua-matrix-agent --read --read-limit 20
+~/aqua-matrix-agent/target/debug/aqua-matrix-agent --read --read-limit 20
 ```
 
 ### Send and read in one call
 
 ```bash
-~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "ping" --read
+~/aqua-matrix-agent/target/debug/aqua-matrix-agent --message "ping" --read
 ```
 
 ### Message a specific user
 
 ```bash
-~/aqua-matrix-hello/target/debug/aqua-matrix-agent --message "hello" --target "@user:matrix.inblock.io"
+~/aqua-matrix-agent/target/debug/aqua-matrix-agent --message "hello" --target "@user:matrix.inblock.io"
 ```
 
 ### Use a different agent identity
 
 ```bash
-~/aqua-matrix-hello/target/debug/aqua-matrix-agent --key-file other.pem --store-dir ~/.other-agent --message "hi"
+~/aqua-matrix-agent/target/debug/aqua-matrix-agent --key-file other.pem --store-dir ~/.other-agent --message "hi"
 ```
 
 Each key file produces a unique DID and separate Matrix account. Convention on this host:
@@ -55,7 +55,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the rationale (one daemon
 ### Build if binary is missing
 
 ```bash
-cd ~/aqua-matrix-hello && cargo build
+cd ~/aqua-matrix-agent && cargo build
 ```
 
 Default to debug builds (release is much slower for iteration). The systemd units intentionally point at `target/debug/`.
@@ -65,7 +65,7 @@ Default to debug builds (release is much slower for iteration). The systemd unit
 This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. The four crates under `crates/`:
 
 ```
-aqua-matrix-hello (virtual workspace)
+aqua-matrix-agent (virtual workspace)
   |
   +-- crates/aqua-matrix-agent     -- library (AgentClient, AgentConfig, OIDC, recovery,
   |                                   registry) + one-shot CLI binary `aqua-matrix-agent`

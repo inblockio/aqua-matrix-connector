@@ -1,6 +1,6 @@
 [Unit]
 Description=Aqua Matrix heartbeat (10-minute status DM to default target)
-Documentation=https://github.com/inblockio/aqua-matrix-hello
+Documentation=https://github.com/inblockio/aqua-matrix-agent
 After=network-online.target
 Wants=network-online.target
 # Crash-loop guard belongs in [Unit] in modern systemd; [Service] placement
@@ -17,11 +17,11 @@ Type=simple
 # M_UNKNOWN_TOKEN.
 # Dedicated ops binary (was `aqua-matrix-agent --heartbeat` before the
 # workspace split; the relay lifecycle now lives in aqua-matrix-relay).
-ExecStart=%h/aqua-matrix-hello/target/debug/aqua-matrix-heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
+ExecStart=%h/aqua-matrix-agent/target/debug/aqua-matrix-heartbeat --key-file heartbeat.pem --store-dir %h/.aqua-matrix-heartbeat
 Restart=always
 RestartSec=5s
 # Run in the repo dir so the default agent.pem key file is picked up
-WorkingDirectory=%h/aqua-matrix-hello
+WorkingDirectory=%h/aqua-matrix-agent
 # Forward CONTEXT_WINDOW for accurate context% reporting; matches settings.json
 Environment=CONTEXT_WINDOW=1000000
 # Per-instance config (AGENT_TARGET et al.): loaded from this machine-local

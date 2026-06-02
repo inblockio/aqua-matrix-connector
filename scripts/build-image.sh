@@ -4,7 +4,7 @@
 # with rootless podman. See docs/plans/typed-agent-instances.md.
 #
 # The image's Cargo path deps point at siblings OUTSIDE this repo:
-#   aqua-matrix-hello/Cargo.toml   ->  ../siwx-oidc/siwx-oidc-auth
+#   aqua-matrix-agent/Cargo.toml   ->  ../siwx-oidc/siwx-oidc-auth
 #   siwx-oidc/siwx-oidc-auth       ->  ../../aqua-auth
 # so a single COPY of this repo is not enough. This script stages all three
 # sibling dirs (plus the host `claude` binary) into one mktemp context that
@@ -29,10 +29,10 @@ export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/podman/podman.sock}
 # This script lives in <repo>/scripts/ ; the repo is its parent, and the three
 # sibling dirs live one level above the repo (all under /home/<user>/).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"            # aqua-matrix-hello
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"            # aqua-matrix-agent
 SIBLINGS_ROOT="$(cd "${REPO_DIR}/.." && pwd)"          # /home/<user>
 
-REPO_NAME="$(basename "${REPO_DIR}")"                  # aqua-matrix-hello
+REPO_NAME="$(basename "${REPO_DIR}")"                  # aqua-matrix-agent
 SIWX_DIR="${SIBLINGS_ROOT}/siwx-oidc"
 AQUA_AUTH_DIR="${SIBLINGS_ROOT}/aqua-auth"
 
@@ -107,7 +107,7 @@ stage_dir() {
     rsync -a --delete "${RSYNC_EXCLUDES[@]}" "${src}/" "${CONTEXT}/${dest_name}/"
 }
 
-stage_dir "${REPO_DIR}"      "${REPO_NAME}"   # aqua-matrix-hello/
+stage_dir "${REPO_DIR}"      "${REPO_NAME}"   # aqua-matrix-agent/
 stage_dir "${SIWX_DIR}"      "siwx-oidc"      # siwx-oidc/
 stage_dir "${AQUA_AUTH_DIR}" "aqua-auth"      # aqua-auth/
 

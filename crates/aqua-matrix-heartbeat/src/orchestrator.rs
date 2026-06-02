@@ -78,7 +78,7 @@ const CONTAINER_PREFIX: &str = "aqua-agent-";
 /// The repo root that relative `ref_mounts` host paths resolve against. A
 /// `host_path` like `../aqua-rs-sdk` is interpreted relative to this directory
 /// (so it points at the sibling checkout next to the repo).
-const REPO_ROOT: &str = "/home/waldknoten-01/aqua-matrix-hello";
+const REPO_ROOT: &str = "/home/waldknoten-01/aqua-matrix-agent";
 /// How long to poll for the agent's self-minted MXID in its logs after start.
 /// Best-effort: a DID-pending container is still a successful spawn.
 const DID_DISCOVERY_TIMEOUT_SECS: u64 = 15;

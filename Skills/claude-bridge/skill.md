@@ -23,7 +23,7 @@ tmux attach -t claude-bridge
 ## Install
 
 ```bash
-cp ~/aqua-matrix-hello/systemd/claude-bridge.service ~/.config/systemd/user/
+cp ~/aqua-matrix-agent/systemd/claude-bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now claude-bridge
 ```
@@ -49,7 +49,7 @@ Both paths run `ExecStop` (`tmux kill-session -t claude-bridge`) followed by `Ex
 | Directive | Value | Why |
 |---|---|---|
 | `Type=oneshot` + `RemainAfterExit=yes` | | `tmux new-session -d` exits as soon as the session is detached; oneshot reports success and stays active. |
-| `WorkingDirectory=%h/aqua-matrix-hello` | | Claude reads `.claude/` from cwd up; this puts it in the project. Change to `%h` if you want a workspace-agnostic bridge. |
+| `WorkingDirectory=%h/aqua-matrix-agent` | | Claude reads `.claude/` from cwd up; this puts it in the project. Change to `%h` if you want a workspace-agnostic bridge. |
 | `ExecStart=/usr/bin/tmux new-session -d -s claude-bridge -- %h/.local/bin/claude --dangerously-skip-permissions` | | Absolute path to claude — systemd's PATH does not include `~/.local/bin`. |
 | `ExecStop=/usr/bin/tmux kill-session -t claude-bridge` | | Lets `systemctl restart` cycle cleanly. |
 

@@ -38,7 +38,7 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 ## Quick start (foreground)
 
 ```bash
-cd ~/aqua-matrix-hello
+cd ~/aqua-matrix-agent
 ./target/debug/aqua-matrix-heartbeat
 ```
 
@@ -78,7 +78,7 @@ The unit ships in the repo at `systemd/aqua-matrix-heartbeat.service`. Install a
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ~/aqua-matrix-hello/systemd/aqua-matrix-heartbeat.service ~/.config/systemd/user/
+cp ~/aqua-matrix-agent/systemd/aqua-matrix-heartbeat.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now aqua-matrix-heartbeat
 loginctl enable-linger "$USER"   # so it keeps running after logout
@@ -111,7 +111,7 @@ aqua-matrix-agent heartbeat @ 2026-05-23 09:00:00Z
 ----------------------------------------
 agent : up 1h23m, sent 8
 host  : my-host | up 2d3h | load 0.34 0.42 0.45 | mem 12.3/16.0GB free (23% used) | disk 234G free (12% used)
-claude: -home-user-aqua-matrix-hello | ctx ~38% of 1M (claude-opus-4-7) | session b1865bef | last_tool: Bash | last_user: "build the binary"
+claude: -home-user-aqua-matrix-agent | ctx ~38% of 1M (claude-opus-4-7) | session b1865bef | last_tool: Bash | last_user: "build the binary"
 ```
 
 | Row | Source |

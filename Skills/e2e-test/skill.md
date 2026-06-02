@@ -12,7 +12,7 @@ The test lives at `tests/e2e.rs` and is gated behind the `e2e` Cargo feature so 
 ## Run it
 
 ```bash
-cd ~/aqua-matrix-hello && cargo test --test e2e --features e2e -- --nocapture
+cd ~/aqua-matrix-agent && cargo test --test e2e --features e2e -- --nocapture
 ```
 
 `--nocapture` is recommended — the test prints the user IDs, DIDs, and message tags it exchanged. Without it you only see pass/fail.
@@ -42,8 +42,8 @@ If this ordering is changed, expect `[unable to decrypt]` on one side.
 
 ## Required state
 
-- `~/aqua-matrix-hello/agent.pem` (Agent A key) — pre-existing in the repo
-- `~/aqua-matrix-hello/agent-b.pem` (Agent B key) — pre-existing in the repo
+- `~/aqua-matrix-agent/agent.pem` (Agent A key) — pre-existing in the repo
+- `~/aqua-matrix-agent/agent-b.pem` (Agent B key) — pre-existing in the repo
 - Network access to `https://siwx-oidc.inblock.io` and `https://matrix.inblock.io`
 - The corresponding Matrix accounts already provisioned (they were on first run)
 

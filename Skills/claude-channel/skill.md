@@ -20,7 +20,7 @@ cat ~/.aqua-matrix-claude-channel/config.toml            # session cache + OIDC
 The unit ships at `systemd/aqua-matrix-claude-channel.service`. First run also generates the identity:
 
 ```bash
-cp ~/aqua-matrix-hello/systemd/aqua-matrix-claude-channel.service ~/.config/systemd/user/
+cp ~/aqua-matrix-agent/systemd/aqua-matrix-claude-channel.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now aqua-matrix-claude-channel
 ```
@@ -28,7 +28,7 @@ systemctl --user enable --now aqua-matrix-claude-channel
 Verify the new identity was minted:
 
 ```bash
-ls ~/aqua-matrix-hello/claude-channel.pem                # the Ed25519 key
+ls ~/aqua-matrix-agent/claude-channel.pem                # the Ed25519 key
 journalctl --user -u aqua-matrix-claude-channel -n 30 | grep "agent DID"
 ```
 
