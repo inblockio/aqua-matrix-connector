@@ -486,6 +486,7 @@ fn normalize(p: &Path) -> PathBuf {
 /// description of the type definition that a later aqua-fication pass can
 /// hash-pin. We currently only *produce* it (and assert its shape in tests);
 /// validate-on-load against it is a deliberate seam left for later.
+// TODO(aqua-security): validate-on-load + hash-pin
 pub fn agent_type_schema() -> serde_json::Value {
     let schema = schemars::schema_for!(AgentType);
     serde_json::to_value(schema).expect("AgentType JSON Schema is serializable")

@@ -240,6 +240,7 @@ fn is_store_mismatch(err: &anyhow::Error) -> bool {
         || chain.contains("crypto store the account in the store")
 }
 
+// TODO(aqua-security): seal/audit
 fn wipe_crypto_store(store_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(store_dir) else { return };
     for entry in entries.flatten() {

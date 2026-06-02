@@ -124,6 +124,7 @@ impl PendingMap {
         }
 
         match tokio::time::timeout(timeout, rx).await {
+            // TODO(aqua-security): append-only/signed writer seam
             Ok(Ok(answer)) => Some(answer),
             Ok(Err(_)) => {
                 // Sender dropped (e.g. overwritten by a newer ask). Deny.

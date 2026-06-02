@@ -43,6 +43,7 @@ impl AskBridge {
     ///
     /// `timeout` bounds each `ask_human` wait (passed straight to
     /// [`PendingMap::ask`]); on timeout the model gets a fail-closed denial.
+    // TODO: per-run socket auth token
     pub async fn setup(
         agent: &AgentClient,
         pending: &PendingMap,

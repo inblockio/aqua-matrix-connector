@@ -113,6 +113,7 @@ pub(crate) async fn enable_and_persist_if_absent(client: &Client, store_dir: &Pa
 }
 
 /// Write `contents` to `path` with file mode 0600, creating or truncating.
+// TODO(aqua-security): seal/audit
 fn write_key_0600(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()

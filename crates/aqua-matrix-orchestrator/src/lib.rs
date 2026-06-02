@@ -261,6 +261,7 @@ impl ContainerManager {
     ///      names a specific file to read instead.
     /// Fails closed when neither yields a non-empty value — we never spawn a
     /// token-less container. The value is trimmed and never logged.
+    // TODO(aqua-security): brokered/minted key
     fn resolve_auth_secret(&self, env_var: &str, file_override: Option<&Path>) -> Result<String> {
         if let Ok(v) = std::env::var(env_var) {
             if !v.trim().is_empty() {
@@ -585,6 +586,7 @@ impl ContainerManager {
     /// Spawn a tokio task that follows the container's stdout+stderr and appends
     /// each line to the host-side `agent.log` (provenance that survives a
     /// `replace`). Returns the JoinHandle so `stop` can let it drain.
+    // TODO(aqua-security): append-only/signed writer seam
     fn start_log_capture(
         &self,
         container_id: &str,
