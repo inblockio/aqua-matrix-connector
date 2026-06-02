@@ -62,6 +62,13 @@ pub struct AgentType {
     /// only carry the string here; templating happens at send time, not load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hello: Option<String>,
+    /// Optional system prompt for the agent's `claude -p` runs. When set, it is
+    /// passed via `--system-prompt`, **replacing** Claude Code's built-in default
+    /// — this defines the agent's persona + operating scope. `None` ⇒ Claude's
+    /// default is used unchanged. Any per-run `--append-system-prompt` (e.g. the
+    /// ask-bridge nudge) appends *after* this value rather than after the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Immutable pre-session scope contract.
     pub contract: Contract,
     /// Memory / transcript policy.
@@ -387,6 +394,7 @@ mod tests {
             role: "claude-channel".into(),
             display_name: "claude-channel".into(),
             hello: Some("hi {user_id}".into()),
+            system_prompt: Some("You are a test agent.".into()),
             contract: Contract {
                 allowed_tools: vec!["Read".into(), "mcp__ask__ask_human".into()],
                 permissions: Permissions {
@@ -425,6 +433,10 @@ mod tests {
 
         // AuthMethod renames to snake_case on the wire.
         assert!(json.contains("\"subscription_oauth_token\""));
+
+        // The optional system prompt round-trips when present.
+        assert!(json.contains("\"system_prompt\""));
+        assert_eq!(parsed.system_prompt.as_deref(), Some("You are a test agent."));
     }
 
     #[test]
@@ -589,6 +601,7 @@ mod tests {
         }
         // Optional fields must NOT be required.
         assert!(!required.contains(&"hello".to_string()));
+        assert!(!required.contains(&"system_prompt".to_string()));
         assert!(!required.contains(&"egress_allowlist".to_string()));
     }
 }

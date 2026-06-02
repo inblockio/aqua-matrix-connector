@@ -511,6 +511,16 @@ async fn stream_claude(
     // config) leaves `CLAUDE_CONFIG_DIR` untouched — Claude uses its default.
     if let Some(c) = config {
         cmd.env("CLAUDE_CONFIG_DIR", &c.agent_type.memory.config_dir);
+
+        // A type may carry a system prompt that REPLACES Claude's built-in
+        // default (the agent's persona + operating scope). Applied to every run
+        // kind so the persona is constant across conversational/plan/resume.
+        // `--append-system-prompt` (the ask-bridge nudge below, when active)
+        // appends to THIS value rather than the built-in default, so a type
+        // prompt and the ask nudge compose cleanly.
+        if let Some(system_prompt) = &c.agent_type.system_prompt {
+            cmd.arg("--system-prompt").arg(system_prompt);
+        }
     }
 
     // Phase B: stand up the `ask_human` bridge for this run and add the MCP
