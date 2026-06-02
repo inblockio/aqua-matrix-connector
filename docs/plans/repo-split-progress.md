@@ -26,7 +26,7 @@ Agents crates    = template, heartbeat, claude-p.
 ## Phase status
 - [x] Phase 0 — baseline GREEN. build exit0/0 warnings; `cargo test` = 45 passed / 0 failed (2+14+11+12+6 across crates). e2e NOT RUN (pems absent). One pre-existing fix applied: added `system_prompt: None` to the `AgentType` test literal in heartbeat/src/orchestrator.rs (broken on source branch by commit 6252fdb). Committed as baseline.
 - [x] Phase 1 — extract aqua-matrix-gating (connector). Commit b03f01c. build 0 warn, test 46/0. Files tracked as renames (history preserved). gating names no backend ✓. claude-p now deps relay+gating+template; uuid+ask-mcp moved to gating. ASK_HUMAN_TOOL/ASK_SERVER_KEY/ASK_SYSTEM_PROMPT single-sourced in gating w/ drift-guard test.
-- [ ] Phase 2 — extract aqua-matrix-orchestrator (verbatim move)
+- [x] Phase 2 — extract aqua-matrix-orchestrator (verbatim move). Commit 55ef47c. build 0 warn, test 46/0. `git mv` → zero content delta. heartbeat now deps orchestrator; bollard+futures-util moved out. ops.rs imports `aqua_matrix_orchestrator::{build_spawn_instance, ContainerManager}`. NOTE: orchestrator STILL deps template (REPO_ROOT/resolve_host_path/ResolvedInstance) — REMOVED in Phase 3; dep-check would flag this now, expected. (IDE diagnostics after this phase were stale; verified on-disk correct.)
 - [ ] Phase 3 — ContainerSpec redesign (load-bearing; drop template dep from connector)
 - [ ] Phase 4 — MessageHandler Moderate formalization (SENSITIVE: dispatch/authorize; inspect diff)
 - [ ] Phase 5 — aqua-security inert scaffolding (comments + authorize hook only)
