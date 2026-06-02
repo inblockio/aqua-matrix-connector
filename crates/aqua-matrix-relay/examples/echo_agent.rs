@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use aqua_matrix_relay::{async_trait, run_daemon, AgentClient, AgentConfig, MessageHandler};
+use aqua_matrix_relay::{
+    async_trait, run_daemon, AgentClient, AgentConfig, InboundMessage, MessageHandler,
+};
 
 struct EchoHandler;
 
@@ -23,10 +25,14 @@ impl MessageHandler for EchoHandler {
         Some(format!("[echo] online as {}. I echo whatever you DM me.", agent.user_id()))
     }
 
-    async fn handle_message(&self, agent: &AgentClient, target: &str, body: &str) {
-        if let Err(e) = agent.send_dm(target, &format!("echo: {body}")).await {
-            eprintln!("echo reply failed: {e:#}");
-        }
+    async fn handle_message(
+        &self,
+        agent: &AgentClient,
+        target: &str,
+        msg: &InboundMessage<'_>,
+    ) -> anyhow::Result<()> {
+        agent.send_dm(target, &format!("echo: {}", msg.body)).await?;
+        Ok(())
     }
 }
 

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use aqua_matrix_relay::{async_trait, AgentClient, MessageHandler};
+use aqua_matrix_relay::{async_trait, AgentClient, InboundMessage, MessageHandler};
 use aqua_matrix_template::{build_spawn_spec, load_instances, load_types, AgentType, InstanceBinding};
 use tokio::sync::Mutex;
 
@@ -330,12 +330,18 @@ impl MessageHandler for OpsHandler {
         }
     }
 
-    async fn handle_message(&self, agent: &AgentClient, target: &str, body: &str) {
+    async fn handle_message(
+        &self,
+        agent: &AgentClient,
+        target: &str,
+        msg: &InboundMessage<'_>,
+    ) -> anyhow::Result<()> {
+        let body = msg.body;
         // The relay forwards every text message from `target`; the ops channel
         // only acts on `#shell` commands and ignores the rest.
         let lower = body.to_lowercase();
         if !(lower.starts_with("#shell ") || lower == "#shell") {
-            return;
+            return Ok(());
         }
 
         tracing::info!("command from {}: {}", target, body);
@@ -360,6 +366,7 @@ impl MessageHandler for OpsHandler {
         if let Err(e) = agent.send_dm(target, &reply).await {
             tracing::warn!("command reply send failed: {e:#}");
         }
+        Ok(())
     }
 }
 

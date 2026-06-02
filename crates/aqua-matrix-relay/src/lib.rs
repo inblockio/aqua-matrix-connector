@@ -78,6 +78,28 @@ const MIN_CYCLE_SECS: u64 = 15;
 /// restarts.
 const MAX_CONNECT_FAILURES: u32 = 3;
 
+/// One inbound text message, decoded from Matrix for a [`MessageHandler`].
+///
+/// All borrowed fields point at the live sync event (or a local owned by
+/// [`dispatch`]) for the duration of the `handle_message` call; nothing here
+/// outlives it.
+pub struct InboundMessage<'a> {
+    pub sender_mxid: &'a str,
+    // SEAM(aqua-security): user proxy key. `sender_did` is `None` this phase; it
+    // is the DID allow/deny key and the anchor for a future user-minted
+    // proxy/delegation key. That key may ride here as a new field OR arrive via
+    // existing Matrix message artefacts (event signatures, `m.room.member`
+    // state, custom content keys) — and Matrix artefacts may well suffice, so no
+    // new field is added now. This lives where messages are parsed, not at the
+    // container-auth layer.
+    pub sender_did: Option<String>,
+    pub event_id: &'a str,
+    pub room_id: &'a str,
+    pub timestamp_ms: u64,
+    pub msgtype: &'a str, // "m.text", …
+    pub body: &'a str,
+}
+
 /// A concrete agent backend. The relay owns the Matrix lifecycle; the handler
 /// owns "what to do with a message" and "what to do on each tick".
 ///
@@ -120,11 +142,28 @@ pub trait MessageHandler: Send + Sync + 'static {
     /// `Some`). The default is a no-op.
     async fn on_tick(&self, _agent: &AgentClient, _target: &str) {}
 
+    /// DID/MXID allow-deny SEAM. Default == today's exact behavior (single
+    /// target, case-insensitive). [`dispatch`] and `register_invite_autojoin`
+    /// call THIS instead of the inline equality check. SEAM(aqua-security):
+    /// this is the white/blacklist hook keyed on DIDs — a future signature will
+    /// take `sender_did: Option<&str>` plus a per-template allow/deny policy
+    /// object (BOTH an allow-list AND a deny-list); the bool default stays
+    /// `{target}` this phase so behavior is unchanged.
+    fn authorize(&self, sender_mxid: &str, target: &str) -> bool {
+        sender_mxid.eq_ignore_ascii_case(target)
+    }
+
     /// Handle one inbound text message from `target`. The relay has already
     /// confirmed the sender and deduplicated by timestamp watermark, so this
-    /// fires at most once per message. Errors are the handler's to log; the
-    /// relay does not unwind on them.
-    async fn handle_message(&self, agent: &AgentClient, target: &str, body: &str);
+    /// fires at most once per message. Now takes a structured message and
+    /// returns `Result` so the relay owns uniform error logging (the relay
+    /// still never unwinds; it logs the `Err`).
+    async fn handle_message(
+        &self,
+        agent: &AgentClient,
+        target: &str,
+        msg: &InboundMessage<'_>,
+    ) -> anyhow::Result<()>;
 }
 
 /// Run the agent daemon forever: connect, serve, rotate, repeat. Only returns
@@ -361,7 +400,7 @@ async fn run_cycle<H: MessageHandler>(
     // Auto-join invites as they arrive on the sync stream (not only at cycle
     // start), so an invite the peer sends mid-cycle — or just after connect,
     // before the startup join sees it — is still joined and recorded as the DM.
-    register_invite_autojoin(agent.clone(), target.clone(), handler.role().to_string());
+    register_invite_autojoin(agent.clone(), target.clone(), handler.clone());
 
     let sync_client = agent.client().clone();
     let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
@@ -426,20 +465,33 @@ fn log_sync_end(res: Result<matrix_sdk::Result<()>, tokio::task::JoinError>) {
 /// with our peer), so the daemon converges on the SAME room the peer created
 /// rather than `create_dm` later spawning a duplicate. Registered on the sync
 /// stream so it fires whenever an invite arrives, not just at cycle start.
-fn register_invite_autojoin(agent: AgentClient, target: Arc<String>, role: String) {
+fn register_invite_autojoin<H: MessageHandler>(
+    agent: AgentClient,
+    target: Arc<String>,
+    handler: Arc<H>,
+) {
     let own = agent.user_id().to_string();
+    let role = handler.role().to_string();
     agent.client().add_event_handler({
         let agent = agent.clone();
         move |ev: StrippedRoomMemberEvent, room: Room| {
             let agent = agent.clone();
             let target = target.clone();
             let role = role.clone();
+            let handler = handler.clone();
             let own = own.clone();
             async move {
                 // Only act on an invite addressed to us.
                 if ev.state_key.as_str() != own
                     || ev.content.membership != MembershipState::Invite
                 {
+                    return;
+                }
+                // Invite auto-join is intentionally narrowed to the target only
+                // (was: any inviter) — the default `authorize` keeps the
+                // case-insensitive single-peer check. Safe under the strict
+                // single-peer DM design; messaging/dispatch behavior unchanged.
+                if !handler.authorize(ev.sender.as_str(), &target) {
                     return;
                 }
                 match room.join().await {
@@ -486,11 +538,12 @@ async fn dispatch<H: MessageHandler>(
     watermark: &AtomicU64,
 ) {
     // Only messages from the configured peer, and only ones newer than anything
-    // we've already seen this cycle. Compare case-insensitively: Synapse
-    // canonicalises MXIDs to lowercase, so `ev.sender` is lowercased, while a
-    // `--target` derived from a mixed-case `did:key` is not — an exact compare
-    // would silently drop every inbound message from such a peer.
-    if !ev.sender.as_str().eq_ignore_ascii_case(target) {
+    // we've already seen this cycle. The default `authorize` compares
+    // case-insensitively: Synapse canonicalises MXIDs to lowercase, so
+    // `ev.sender` is lowercased, while a `--target` derived from a mixed-case
+    // `did:key` is not — an exact compare would silently drop every inbound
+    // message from such a peer.
+    if !handler.authorize(ev.sender.as_str(), target) {
         return;
     }
     let ts_ms = u64::from(ev.origin_server_ts.0);
@@ -533,7 +586,21 @@ async fn dispatch<H: MessageHandler>(
         return;
     }
 
-    handler.handle_message(agent, target, &body).await;
+    let msg = InboundMessage {
+        sender_mxid: ev.sender.as_str(),
+        sender_did: None,
+        event_id: ev.event_id.as_str(),
+        room_id: room.room_id().as_str(),
+        timestamp_ms: ts_ms,
+        msgtype: ev.content.msgtype.msgtype(),
+        body: &body,
+    };
+
+    // The relay never unwinds on a handler error: log it at `warn` and keep
+    // serving. (Errors are the handler's domain; the transport stays up.)
+    if let Err(e) = handler.handle_message(agent, target, &msg).await {
+        tracing::warn!("{}: handle_message failed: {e:#}", handler.role());
+    }
 }
 
 fn unix_now_secs() -> u64 {

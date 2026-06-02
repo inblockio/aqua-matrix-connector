@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use aqua_matrix_gating::{destructive, AskBridge, PendingMap, ASK_HUMAN_TOOL, ASK_SYSTEM_PROMPT};
-use aqua_matrix_relay::{async_trait, load_dotenv, run_daemon, AgentClient, AgentConfig, MessageHandler, ReplyStream};
+use aqua_matrix_relay::{async_trait, load_dotenv, run_daemon, AgentClient, AgentConfig, InboundMessage, MessageHandler, ReplyStream};
 use aqua_matrix_template::ResolvedInstance;
 use clap::Parser;
 use tokio::io::AsyncBufReadExt;
@@ -266,10 +266,16 @@ impl MessageHandler for ClaudePHandler {
         ))
     }
 
-    async fn handle_message(&self, agent: &AgentClient, target: &str, body: &str) {
+    async fn handle_message(
+        &self,
+        agent: &AgentClient,
+        target: &str,
+        msg: &InboundMessage<'_>,
+    ) -> anyhow::Result<()> {
+        let body = msg.body;
         // `#shell` belongs to the ops/heartbeat channel, not the LLM channel.
         if body.to_lowercase().starts_with("#shell") {
-            return;
+            return Ok(());
         }
 
         // FIRST: if a run is waiting on this user's answer, this DM IS the
@@ -277,7 +283,7 @@ impl MessageHandler for ClaudePHandler {
         // run. This is the pending-reply inversion at the heart of `ask_user`.
         if self.pending.try_resolve(target, body) {
             tracing::info!("claude-channel: DM from {target} resolved a pending question");
-            return;
+            return Ok(());
         }
 
         tracing::info!("claude-channel prompt from {}: {} chars", target, body.len());
@@ -332,6 +338,7 @@ impl MessageHandler for ClaudePHandler {
                 }
             }
         });
+        Ok(())
     }
 }
 
