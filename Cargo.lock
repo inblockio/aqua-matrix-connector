@@ -200,16 +200,28 @@ name = "aqua-matrix-heartbeat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aqua-matrix-orchestrator",
  "aqua-matrix-relay",
  "aqua-matrix-template",
  "async-trait",
- "bollard",
  "clap",
- "futures-util",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aqua-matrix-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-template",
+ "bollard",
+ "futures-util",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

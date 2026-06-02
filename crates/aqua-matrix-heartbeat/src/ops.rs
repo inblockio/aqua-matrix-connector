@@ -12,7 +12,7 @@ use aqua_matrix_relay::{async_trait, AgentClient, MessageHandler};
 use aqua_matrix_template::{load_instances, load_types, AgentType, InstanceBinding};
 use tokio::sync::Mutex;
 
-use crate::orchestrator::{build_spawn_instance, ContainerManager};
+use aqua_matrix_orchestrator::{build_spawn_instance, ContainerManager};
 
 const ROLE: &str = "heartbeat";
 const UNIT: &str = "aqua-matrix-heartbeat";

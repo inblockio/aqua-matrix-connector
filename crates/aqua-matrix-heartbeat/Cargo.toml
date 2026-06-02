@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 aqua-matrix-relay.workspace = true
 aqua-matrix-template.workspace = true
+# Container orchestration moved to the connector crate (Phase 2). bollard +
+# futures-util now live there, not here.
+aqua-matrix-orchestrator.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
@@ -20,5 +23,3 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
-bollard.workspace = true
-futures-util.workspace = true

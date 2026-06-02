@@ -15,7 +15,6 @@ use aqua_matrix_relay::{load_dotenv, run_daemon, AgentConfig};
 use clap::Parser;
 
 mod ops;
-mod orchestrator;
 use ops::OpsHandler;
 
 #[derive(Parser)]

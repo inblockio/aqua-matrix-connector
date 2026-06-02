@@ -8,6 +8,7 @@ members = [
     "crates/aqua-matrix-ask-mcp",
     "crates/aqua-matrix-template",
     "crates/aqua-matrix-gating",
+    "crates/aqua-matrix-orchestrator",
 ]
 
 # Shared metadata for every crate in the workspace. Members opt in with
@@ -27,6 +28,7 @@ aqua-matrix-relay = { path = "crates/aqua-matrix-relay" }
 aqua-matrix-ask-mcp = { path = "crates/aqua-matrix-ask-mcp" }
 aqua-matrix-template = { path = "crates/aqua-matrix-template" }
 aqua-matrix-gating = { path = "crates/aqua-matrix-gating" }
+aqua-matrix-orchestrator = { path = "crates/aqua-matrix-orchestrator" }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
 matrix-sdk = { version = "0.17", features = ["markdown"] }

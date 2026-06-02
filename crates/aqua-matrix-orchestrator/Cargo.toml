@@ -1,0 +1,24 @@
+[package]
+name = "aqua-matrix-orchestrator"
+version.workspace = true
+edition.workspace = true
+description = "Connector-side container orchestration substrate: drives rootless Podman (via bollard) to spawn / replace / stop / tail typed agent containers and harvest their logs host-side. Transport-agnostic; reused by any backend daemon."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_matrix_orchestrator"
+path = "src/lib.rs"
+
+[dependencies]
+# Same bollard version as the reference ContainerManager.
+bollard.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# TEMPORARY (Phase 2 only): the verbatim move still consumes ResolvedInstance /
+# AgentType. Phase 3 (ContainerSpec redesign) removes this dependency entirely so
+# the connector stops naming any agents-side crate. Do NOT rely on it long-term.
+aqua-matrix-template.workspace = true
