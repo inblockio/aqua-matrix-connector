@@ -3,10 +3,7 @@ resolver = "2"
 members = [
     "crates/aqua-matrix-agent",
     "crates/aqua-matrix-relay",
-    "crates/aqua-matrix-heartbeat",
-    "crates/aqua-matrix-claude-p",
     "crates/aqua-matrix-ask-mcp",
-    "crates/aqua-matrix-template",
     "crates/aqua-matrix-gating",
     "crates/aqua-matrix-orchestrator",
 ]
@@ -26,7 +23,6 @@ repository = "https://github.com/inblockio/aqua-matrix-agent"
 aqua-matrix-agent = { path = "crates/aqua-matrix-agent" }
 aqua-matrix-relay = { path = "crates/aqua-matrix-relay" }
 aqua-matrix-ask-mcp = { path = "crates/aqua-matrix-ask-mcp" }
-aqua-matrix-template = { path = "crates/aqua-matrix-template" }
 aqua-matrix-gating = { path = "crates/aqua-matrix-gating" }
 aqua-matrix-orchestrator = { path = "crates/aqua-matrix-orchestrator" }
 

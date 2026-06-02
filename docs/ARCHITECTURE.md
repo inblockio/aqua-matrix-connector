@@ -56,9 +56,9 @@ There are three components running on the host. Each does one thing, has its own
 
 ## Workspace layout
 
-The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. **Eight crates** live under `crates/`, split into two conceptual halves: a reusable **connector** substrate and the **agents** that ride on it (see "Repo boundary" below).
+The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. After the **physical repo split**, this repo is the **connector substrate only: five crates** under `crates/`. The three backend crates (`aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`) plus the agent content (`types/*.json`, `instances/*.toml.example`, `Dockerfile`, `scripts/build-image.sh`) now live in the sibling **`../aqua-agents`** repo, which path-deps back into this connector (the same cross-repo path-dep pattern `siwx-oidc-auth` uses). See "Repo boundary" below.
 
-**Connector half** (the reusable substrate — these crates know nothing about any specific agent):
+**Connector half** (this repo — the reusable substrate; these crates know nothing about any specific agent):
 
 | Crate | Role |
 |---|---|
@@ -68,7 +68,7 @@ The repo is a Cargo workspace (virtual root manifest) and a **reference implemen
 | `aqua-matrix-orchestrator` | Transport/agent-agnostic Podman engine: `ContainerManager` (spawn/replace/stop/tail) driven by the `ContainerSpec` seam. **Never sees `AgentType`.** |
 | `aqua-matrix-gating` | Confirmation/gating substrate: `PendingMap` (`ask_user` router), the `destructive` matcher, and `AskBridge` (per-run `ask_human` socket). Keyed on `AgentClient`; mentions no specific LLM. |
 
-**Agents half** (the backends — depend on the connector, never the reverse; extract to `~/aqua-agents` in a future phase):
+**Agents half** (the backends — depend on the connector, never the reverse; **now live in the sibling `../aqua-agents` repo**, path-dep'd back here):
 
 | Crate | Role |
 |---|---|
@@ -76,16 +76,18 @@ The repo is a Cargo workspace (virtual root manifest) and a **reference implemen
 | `aqua-matrix-heartbeat` | Binary `aqua-matrix-heartbeat` — the ops/heartbeat agent (periodic status DM + `#shell` commands). Deps: relay, template, orchestrator. |
 | `aqua-matrix-claude-p` | Binary `aqua-matrix-claude-p` — the reference Claude backend that forwards DMs to `claude -p`. Deps: relay, template, gating. |
 
-A single `cargo build` builds the whole workspace at once.
+These three crates, plus the agent content (`types/*.json`, `instances/*.toml.example`, `Dockerfile`, `scripts/build-image.sh`), have been **moved out of this repo** into `../aqua-agents`; their `[dependencies]` resolve the connector crates by path back into this repo. To build them, run `cargo build` from `../aqua-agents` (this connector must be checked out alongside as a sibling). A `cargo build` in *this* repo builds only the five connector crates.
 
 ## Repo boundary
 
-The workspace is deliberately split into two halves with a **strictly one-way dependency rule**, so the connector substrate can evolve (and eventually be extracted to its own repo) independently of any agent that rides on it. This is the invariant the whole split exists to create; see [`docs/plans/repo-split-execution-handover.md`](plans/repo-split-execution-handover.md) (§1 locked decisions, §4 target architecture) for the full rationale.
+The two halves now live in **two repos** with a **strictly one-way dependency rule**, so the connector substrate can evolve independently of any agent that rides on it. This is the invariant the whole split exists to create; see [`docs/plans/repo-split-execution-handover.md`](plans/repo-split-execution-handover.md) (§1 locked decisions, §4 target architecture) for the full rationale.
 
-- **Connector half:** `aqua-matrix-agent`, `aqua-matrix-relay`, `aqua-matrix-ask-mcp`, `aqua-matrix-orchestrator`, `aqua-matrix-gating`. A reusable "run any agent over Matrix + Podman" substrate.
-- **Agents half:** `aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`. The concrete backends + the capability schema.
+- **Connector half (this repo, `aqua-matrix-agent`):** `aqua-matrix-agent`, `aqua-matrix-relay`, `aqua-matrix-ask-mcp`, `aqua-matrix-orchestrator`, `aqua-matrix-gating`. A reusable "run any agent over Matrix + Podman" substrate.
+- **Agents half (sibling repo, `../aqua-agents`):** `aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`. The concrete backends + the capability schema + the agent content. Its `[workspace.dependencies]` pull the connector crates in by path (`../aqua-matrix-agent/crates/...`), the same cross-repo path-dep pattern `siwx-oidc-auth` uses.
 
-**The one-way rule:** dependencies flow **agents → connector, NEVER the reverse.** No connector crate may name a backend crate (`aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`) in its `Cargo.toml`. A wrong edge is a compile-time problem now (one workspace) instead of a cross-repo problem after the physical split — that is the point of refactoring in-place first.
+**The one-way rule:** dependencies flow **agents → connector, NEVER the reverse.** No connector crate may name a backend crate (`aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`) in its `Cargo.toml`. With the split now physical, an inverted edge is a cross-repo dependency-cycle problem; the in-place refactor that preceded the split proved the boundary holds as a compile-time check first.
+
+> **Deployment glue still here pending a migration pass:** `Skills/` and `systemd/` remain in this connector repo for now (the agent systemd units' `ExecStart` still point at `%h/aqua-matrix-agent/target/debug/...`, and the `Dockerfile`/`build-image.sh` in `../aqua-agents` need a cross-repo build context with both repos present — flagged as a known follow-up in the aqua-agents README). A later deployment-migration pass reconciles the unit paths, image build context, and skill homes. The existing `localhost/aqua-matrix-agent:poc` image remains usable meanwhile.
 
 Two seams keep the boundary clean:
 
