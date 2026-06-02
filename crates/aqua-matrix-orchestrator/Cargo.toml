@@ -18,7 +18,3 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-# TEMPORARY (Phase 2 only): the verbatim move still consumes ResolvedInstance /
-# AgentType. Phase 3 (ContainerSpec redesign) removes this dependency entirely so
-# the connector stops naming any agents-side crate. Do NOT rely on it long-term.
-aqua-matrix-template.workspace = true

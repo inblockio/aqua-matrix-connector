@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use aqua_matrix_relay::{async_trait, AgentClient, MessageHandler};
-use aqua_matrix_template::{load_instances, load_types, AgentType, InstanceBinding};
+use aqua_matrix_template::{build_spawn_spec, load_instances, load_types, AgentType, InstanceBinding};
 use tokio::sync::Mutex;
 
-use aqua_matrix_orchestrator::{build_spawn_instance, ContainerManager};
+use aqua_matrix_orchestrator::ContainerManager;
 
 const ROLE: &str = "heartbeat";
 const UNIT: &str = "aqua-matrix-heartbeat";
@@ -196,9 +196,11 @@ impl OpsHandler {
             Err(e) => return e,
         };
 
-        let incarnation_ts = unix_now_secs();
-        let resolved = build_spawn_instance(agent_type, target, incarnation_ts);
-        match mgr.spawn(&resolved).await {
+        // Agents-side owns id generation now (the orchestrator no longer mints
+        // ids). The connector keeps its own independent per-incarnation ts.
+        let id = format!("{}-{}", agent_type.name, unix_now_secs());
+        let spec = build_spawn_spec(agent_type, target, &id);
+        match mgr.spawn(&spec).await {
             Ok(info) => format!(
                 "spawned {} (container {}) → {} | did {}",
                 info.id,

@@ -34,7 +34,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Type definition (`types/<name>.json`)
@@ -43,6 +43,7 @@ use std::path::Path;
 /// An agent **type**: the aqua-pinnable definition of a kind of agent.
 ///
 /// Deserialized from `types/<name>.json`; the file stem must equal `name`.
+// TODO(extensibility): optional compose_ref for multi-container agent types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentType {
@@ -348,6 +349,134 @@ pub fn resolve(
 }
 
 // ---------------------------------------------------------------------------
+// Spawn-spec factory (agents → connector seam)
+// ---------------------------------------------------------------------------
+
+/// The repo root that relative `ref_mounts` host paths resolve against when
+/// `AQUA_REPO_ROOT` is unset. A `host_path` like `../aqua-rs-sdk` is interpreted
+/// relative to this directory (so it points at the sibling checkout next to the
+/// repo). Copied verbatim from the orchestrator's old `REPO_ROOT` — path
+/// resolution is agent-knowledge, so it now lives agents-side.
+const REPO_ROOT: &str = "/home/waldknoten-01/aqua-matrix-agent";
+
+/// Build the agent/transport-agnostic [`ContainerSpec`] for
+/// `#shell spawn <type> <target>`: the given type tagged with
+/// `id` (caller-supplied, e.g. `<type>-<incarnation_ts>`) and `target`.
+///
+/// `id` is an injectable param (not generated here) so this function stays pure
+/// — no clock, no I/O beyond env reads — and unit-testable with a fixed id.
+///
+/// This is the seam that decouples the connector from `AgentType`: all
+/// agent-knowledge is applied here and the connector receives only a flat
+/// [`ContainerSpec`]. Specifically it:
+///   - resolves relative `ref_mounts[].host_path` to ABSOLUTE (against
+///     `AQUA_REPO_ROOT` env, falling back to [`REPO_ROOT`]),
+///   - serializes the resolved [`ResolvedInstance`] into `config_blob`
+///     (structurally identical to what the orchestrator used to write),
+///   - emits the secret-env descriptor (env var name + source) the connector
+///     dispatches on,
+///   - carries `env`, `resources`, `image`, `target`, `id` from the type.
+pub fn build_spawn_spec(
+    agent_type: &AgentType,
+    target: &str,
+    id: &str,
+) -> aqua_matrix_orchestrator::ContainerSpec {
+    use aqua_matrix_orchestrator::{
+        ContainerSpec, SecretEnv, SecretSource, SpecMount, SpecResources,
+    };
+
+    // The ResolvedInstance the in-container agent reads back from
+    // /agent/config.json. Tag the type with this id + target. Mirrors the old
+    // orchestrator `build_spawn_instance`.
+    let resolved = ResolvedInstance {
+        id: id.to_string(),
+        target: target.to_string(),
+        agent_type: agent_type.clone(),
+    };
+
+    // Structurally identical to the orchestrator's old writer
+    // (`serde_json::to_string_pretty`). Formatting is irrelevant to the
+    // third-party reader; the field set/values must match.
+    let config_blob = serde_json::to_string_pretty(&resolved)
+        .expect("ResolvedInstance is always serializable to JSON");
+
+    let ref_mounts = agent_type
+        .ref_mounts
+        .iter()
+        .map(|m| SpecMount {
+            host_path: resolve_host_path(&m.host_path).to_string_lossy().into_owned(),
+            container_path: m.container_path.clone(),
+            read_only: m.read_only,
+        })
+        .collect();
+
+    let res = &agent_type.resources;
+
+    ContainerSpec {
+        id: id.to_string(),
+        target: target.to_string(),
+        image: agent_type.image.clone(),
+        env: vec![
+            ("AGENT_TARGET".to_string(), target.to_string()),
+            (
+                "AGENT_CONFIG_FILE".to_string(),
+                "/agent/config.json".to_string(),
+            ),
+        ],
+        ref_mounts,
+        resources: SpecResources {
+            memory_mb: res.memory_mb,
+            cpus: res.cpus,
+            pids_limit: res.pids_limit,
+        },
+        secret_env: SecretEnv {
+            env_var: agent_type.auth.env_var.clone(),
+            source: SecretSource::EnvOverrideThenTokenFile,
+        },
+        config_blob: Some(config_blob),
+    }
+}
+
+/// Resolve a `ref_mount` host path to an absolute path. Absolute paths pass
+/// through; relative paths (e.g. `../aqua-rs-sdk`) are resolved against the repo
+/// root (`AQUA_REPO_ROOT` env, else [`REPO_ROOT`]) so siblings of the repo are
+/// reachable. Lexically normalized (no filesystem touch) so it works even
+/// before the path exists. Ported verbatim from the orchestrator (path
+/// resolution is agent-knowledge).
+fn resolve_host_path(host_path: &str) -> PathBuf {
+    let p = Path::new(host_path);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let base = match std::env::var("AQUA_REPO_ROOT") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => REPO_ROOT.to_string(),
+    };
+    normalize(&Path::new(&base).join(p))
+}
+
+/// Lexical path normalization: collapse `.` and `..` components without hitting
+/// the filesystem (so `/repo/../aqua-rs-sdk` → `/aqua-rs-sdk`).
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(comp);
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
+// ---------------------------------------------------------------------------
 // Schema artifact
 // ---------------------------------------------------------------------------
 
@@ -551,6 +680,92 @@ mod tests {
             "load_types should reject stem mismatch, got: {err}"
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn relative_ref_mount_resolves_against_repo_root() {
+        // With AQUA_REPO_ROOT unset the const default applies. We don't mutate
+        // process env in parallel tests, so this only holds when AQUA_REPO_ROOT
+        // is not set in the test environment (the default for `cargo test`).
+        if std::env::var("AQUA_REPO_ROOT").is_ok() {
+            return;
+        }
+        let resolved = resolve_host_path("../aqua-rs-sdk");
+        assert_eq!(resolved, PathBuf::from("/home/waldknoten-01/aqua-rs-sdk"));
+
+        let resolved = resolve_host_path("../aqua-spec");
+        assert_eq!(resolved, PathBuf::from("/home/waldknoten-01/aqua-spec"));
+    }
+
+    #[test]
+    fn absolute_ref_mount_passes_through() {
+        let resolved = resolve_host_path("/opt/refs/thing");
+        assert_eq!(resolved, PathBuf::from("/opt/refs/thing"));
+    }
+
+    #[test]
+    fn build_spawn_spec_tags_id_and_target() {
+        let ty = AgentType {
+            name: "claude-channel".into(),
+            version: "0.1.0".into(),
+            description: "t".into(),
+            image: "aqua-matrix-agent:poc".into(),
+            role: "claude-channel".into(),
+            display_name: "claude-channel".into(),
+            system_prompt: None,
+            hello: None,
+            contract: Contract {
+                allowed_tools: vec![],
+                permissions: Permissions {
+                    allow: vec![],
+                    deny: vec![],
+                },
+            },
+            memory: MemoryPolicy {
+                config_dir: "/agent/memory".into(),
+                log_transcripts: true,
+            },
+            ref_mounts: vec![],
+            resources: Resources {
+                memory_mb: 2048,
+                cpus: 2.0,
+                pids_limit: 512,
+            },
+            auth: Auth {
+                method: AuthMethod::SubscriptionOauthToken,
+                env_var: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            },
+            egress_allowlist: None,
+        };
+        // `id` is injectable → the assertion is deterministic.
+        let spec = build_spawn_spec(&ty, "@tim:matrix.inblock.io", "claude-channel-1717245000");
+        assert_eq!(spec.id, "claude-channel-1717245000");
+        assert_eq!(spec.target, "@tim:matrix.inblock.io");
+        assert_eq!(spec.image, "aqua-matrix-agent:poc");
+    }
+
+    #[test]
+    fn build_spawn_spec_config_blob_roundtrips_to_resolved_instance() {
+        // The in-container claude-p reads /agent/config.json back via
+        // serde_json::from_str::<ResolvedInstance>. The config_blob must be a
+        // STRUCTURALLY identical ResolvedInstance to a freshly-built one.
+        let ty = sample_type();
+        let target = "@tim:matrix.inblock.io";
+        let id = "claude-channel-1717245000";
+
+        let spec = build_spawn_spec(&ty, target, id);
+        let blob = spec.config_blob.expect("build_spawn_spec sets config_blob");
+        let parsed: ResolvedInstance =
+            serde_json::from_str(&blob).expect("config_blob parses as ResolvedInstance");
+
+        // Construct the expected ResolvedInstance the same way build_spawn_spec
+        // does (id + target tag the type) and assert structural equality.
+        let expected = ResolvedInstance {
+            id: id.to_string(),
+            target: target.to_string(),
+            agent_type: ty,
+        };
+        assert_eq!(parsed, expected);
     }
 
     #[test]

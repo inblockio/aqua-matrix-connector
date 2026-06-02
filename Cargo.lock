@@ -216,7 +216,6 @@ name = "aqua-matrix-orchestrator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aqua-matrix-template",
  "bollard",
  "futures-util",
  "serde_json",
@@ -241,6 +240,7 @@ name = "aqua-matrix-template"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aqua-matrix-orchestrator",
  "schemars 1.2.1",
  "serde",
  "serde_json",

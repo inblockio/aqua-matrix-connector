@@ -4,9 +4,10 @@
 //! heartbeat's Matrix `#shell` / status surface.
 //!
 //! Modeled on `../agent-customer-portal/src/docker.rs` (the reference bollard
-//! `ContainerManager`), adapted to the typed-agent-instance model:
-//! [`aqua_matrix_template::ResolvedInstance`] in, one container = one agent =
-//! one self-minted identity out.
+//! `ContainerManager`), adapted to the typed-agent-instance model: a flat,
+//! agent-agnostic [`ContainerSpec`] in (the agents side resolves all
+//! agent-knowledge into it), one container = one agent = one self-minted
+//! identity out.
 //!
 //! ## The identity model (persistent volume, reset on replace)
 //!
@@ -63,7 +64,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use aqua_matrix_template::ResolvedInstance;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, LogOutput, LogsOptions,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -75,13 +75,90 @@ use tokio::sync::Mutex;
 
 /// Container name prefix; the full name is `aqua-agent-<id>`.
 const CONTAINER_PREFIX: &str = "aqua-agent-";
-/// The repo root that relative `ref_mounts` host paths resolve against. A
-/// `host_path` like `../aqua-rs-sdk` is interpreted relative to this directory
-/// (so it points at the sibling checkout next to the repo).
-const REPO_ROOT: &str = "/home/waldknoten-01/aqua-matrix-agent";
 /// How long to poll for the agent's self-minted MXID in its logs after start.
 /// Best-effort: a DID-pending container is still a successful spawn.
 const DID_DISCOVERY_TIMEOUT_SECS: u64 = 15;
+
+// ---------------------------------------------------------------------------
+// ContainerSpec — the agent/transport-agnostic spawn input
+// ---------------------------------------------------------------------------
+
+/// The agent/transport-agnostic input to [`ContainerManager::spawn`]. Replaces
+/// the old agent-typed spawn input: the connector no longer names any
+/// agent-side type. All
+/// agent-knowledge (path resolution, config serialization, secret-source
+/// choice, id generation) is done on the agents side
+/// (`build_spawn_spec`) and handed to the connector as a flat,
+/// already-resolved description of one container to run. The connector never
+/// names any agent-side type.
+///
+/// **Single-container by design** (`image: String`). A future
+/// multi-container / docker-compose spawn shape is a documented forward seam
+/// (see the handover §5.1) — treat this as *one* spawn shape, not the only one.
+#[derive(Debug, Clone)]
+pub struct ContainerSpec {
+    /// Instance id, e.g. `"claude-channel-<ts>"` (the agents side owns this).
+    pub id: String,
+    /// `AGENT_TARGET` MXID — opaque to the connector.
+    pub target: String,
+    /// Container image ref, e.g. `"aqua-matrix-agent:poc"`.
+    pub image: String,
+    /// Non-secret env (`AGENT_TARGET`, `AGENT_CONFIG_FILE`, …). The secret env
+    /// is injected separately from [`secret_env`](Self::secret_env).
+    pub env: Vec<(String, String)>,
+    /// Reference mounts. `host_path` is ABSOLUTE (the agents side resolves
+    /// relatives). Bound RO regardless of [`SpecMount::read_only`].
+    pub ref_mounts: Vec<SpecMount>,
+    /// Container resource caps.
+    pub resources: SpecResources,
+    /// The secret env var name + its source. Drives secret injection; the
+    /// connector never derives it from any agent-side auth config.
+    pub secret_env: SecretEnv,
+    /// Pre-serialized JSON mounted RO at `/agent/config.json` (the agents side
+    /// serializes its resolved-instance config into this). `None` ⇒ no config
+    /// mount.
+    pub config_blob: Option<String>,
+}
+
+/// One reference mount. `host_path` is absolute; `read_only` is carried for
+/// future use but is currently IGNORED — the connector binds every ref_mount
+/// `:ro` unconditionally (preserves the historic orchestrator semantics).
+#[derive(Debug, Clone)]
+pub struct SpecMount {
+    pub host_path: String,
+    pub container_path: String,
+    pub read_only: bool,
+}
+
+/// Container resource caps.
+#[derive(Debug, Clone)]
+pub struct SpecResources {
+    pub memory_mb: u64,
+    pub cpus: f64,
+    pub pids_limit: u64,
+}
+
+/// The secret env var to inject and where its value comes from. The connector
+/// owns the `<store_dir>`-relative token-file default; the agents side only
+/// names the env var + picks a [`SecretSource`].
+#[derive(Debug, Clone)]
+pub struct SecretEnv {
+    pub env_var: String,
+    pub source: SecretSource,
+}
+
+/// Where the secret value is sourced from.
+#[derive(Debug, Clone)]
+pub enum SecretSource {
+    /// Today's path: env override → `AQUA_CLAUDE_TOKEN_FILE` else
+    /// `<store_dir>/claude-oauth-token` → fail-closed.
+    EnvOverrideThenTokenFile,
+    /// Env override only; never read a file.
+    EnvOverride,
+    /// Read this explicit token file (overrides the `<store_dir>` default),
+    /// with the env override still preferred first.
+    TokenFile(std::path::PathBuf),
+}
 
 /// A public, cloneable snapshot of one live agent session. No secrets.
 #[derive(Debug, Clone)]
@@ -104,12 +181,12 @@ pub struct SessionInfo {
 }
 
 /// Internal per-session record: the public [`SessionInfo`] plus the things the
-/// manager needs but does not expose — the [`ResolvedInstance`] (so `replace`
+/// manager needs but does not expose — the [`ContainerSpec`] (so `replace`
 /// can re-spawn the same slot) and the log-capture task handle (so `stop` can
 /// let it drain).
 struct Session {
     info: SessionInfo,
-    resolved: ResolvedInstance,
+    spec: ContainerSpec,
     log_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -130,8 +207,12 @@ pub struct ContainerManager {
 
 impl ContainerManager {
     /// Connect to rootless podman and root the host-side session store under
-    /// `store_dir` (defaulting to `~/.aqua-matrix-heartbeat`). Sync: bollard
-    /// sets the connection up lazily, so no I/O happens here.
+    /// `store_dir`. Sync: bollard sets the connection up lazily, so no I/O
+    /// happens here.
+    ///
+    /// Callers pass `Some`; this `None` default is dormant. It uses a neutral,
+    /// agent-agnostic location (`~/.aqua-orchestrator`) rather than any
+    /// specific backend's store dir.
     pub fn new(store_dir: Option<&Path>) -> Result<Self> {
         let docker_host = podman_socket_uri();
         // `connect_with_socket` wants the cleaned path; it strips the scheme
@@ -176,16 +257,20 @@ impl ContainerManager {
     /// token. Precedence:
     ///   1. `env_var` in the orchestrator's own environment (explicit override,
     ///      e.g. a one-off `CLAUDE_CODE_OAUTH_TOKEN=… aqua-matrix-heartbeat`), else
-    ///   2. the durable [`token_file`](Self::token_file).
+    ///   2. the durable [`token_file`](Self::token_file), unless `file_override`
+    ///      names a specific file to read instead.
     /// Fails closed when neither yields a non-empty value — we never spawn a
     /// token-less container. The value is trimmed and never logged.
-    fn resolve_auth_secret(&self, env_var: &str) -> Result<String> {
+    fn resolve_auth_secret(&self, env_var: &str, file_override: Option<&Path>) -> Result<String> {
         if let Ok(v) = std::env::var(env_var) {
             if !v.trim().is_empty() {
                 return Ok(v);
             }
         }
-        let file = self.token_file();
+        let file = match file_override {
+            Some(p) => p.to_path_buf(),
+            None => self.token_file(),
+        };
         match std::fs::read_to_string(&file) {
             Ok(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
             Ok(_) => bail!(
@@ -201,13 +286,15 @@ impl ContainerManager {
         }
     }
 
-    /// Spawn a new typed agent container from a [`ResolvedInstance`].
+    /// Spawn a new typed agent container from a [`ContainerSpec`].
     ///
     /// Returns a successful [`SessionInfo`] even when the DID is still pending —
     /// DID discovery is best-effort and must not gate the spawn.
-    pub async fn spawn(&self, resolved: &ResolvedInstance) -> Result<SessionInfo> {
-        let id = resolved.id.clone();
+    pub async fn spawn(&self, spec: &ContainerSpec) -> Result<SessionInfo> {
+        let id = spec.id.clone();
         let container_name = format!("{CONTAINER_PREFIX}{id}");
+        // The connector keeps its OWN per-incarnation timestamp for the persist
+        // dir / log dir — independent of the timestamp embedded in `spec.id`.
         let incarnation_ts = unix_now_secs();
 
         // --- host-side incarnation dir + config.json -----------------------
@@ -215,15 +302,6 @@ impl ContainerManager {
         std::fs::create_dir_all(&incarnation_dir).with_context(|| {
             format!("create incarnation dir {}", incarnation_dir.display())
         })?;
-        let config_host_path = incarnation_dir.join("config.json");
-        let config_json = serde_json::to_string_pretty(resolved)
-            .context("serialize ResolvedInstance to config.json")?;
-        std::fs::write(&config_host_path, &config_json)
-            .with_context(|| format!("write {}", config_host_path.display()))?;
-        let config_host_path_str = config_host_path
-            .to_str()
-            .ok_or_else(|| anyhow!("non-UTF-8 config path: {}", config_host_path.display()))?
-            .to_string();
 
         // --- persistent per-instance volume (identity + memory + logs) ------
         // Keyed by `id` (stable across incarnations) so a restart / reboot / re-
@@ -239,41 +317,64 @@ impl ContainerManager {
         let store_str = path_str(&store_dir)?;
         let memory_str = path_str(&memory_dir)?;
 
-        // --- env (incl. the auth secret) -----------------------------------
-        // The secret VALUE comes from `resolve_auth_secret` (env override, else
-        // the durable long-lived token file) and is injected by NAME=value. We
-        // never store or log the value, and refuse to spawn a token-less
-        // container.
-        let env_var = &resolved.agent_type.auth.env_var;
-        let secret = self.resolve_auth_secret(env_var)?;
-        let env = vec![
-            format!("AGENT_TARGET={}", resolved.target),
-            "AGENT_CONFIG_FILE=/agent/config.json".to_string(),
-            format!("{env_var}={secret}"),
-        ];
-
-        // --- binds: config.json (RO) + persistent store/memory (RW, :U) +
-        //     each ref_mount (RO) ------------------------------------------
+        // --- binds: persistent store/memory (RW, :U) + optional config.json
+        //     (RO) + each ref_mount (RO) -----------------------------------
         let mut binds = vec![
-            format!("{config_host_path_str}:/agent/config.json:ro"),
             // Persistent identity + matrix crypto store. `:U` chowns the source
             // to the container user's mapped uid (rootless, non-root `agent`).
             format!("{store_str}:/agent/store:U"),
             // Persistent claude memory + session logs (CLAUDE_CONFIG_DIR).
             format!("{memory_str}:/agent/memory:U"),
         ];
-        for m in &resolved.agent_type.ref_mounts {
-            let host = resolve_host_path(&m.host_path);
-            let host_str = host
-                .to_str()
-                .ok_or_else(|| anyhow!("non-UTF-8 ref_mount host path: {}", host.display()))?;
+
+        // --- env (incl. the auth secret) -----------------------------------
+        // The non-secret env comes verbatim from the spec (the agents side set
+        // AGENT_TARGET / AGENT_CONFIG_FILE / …). The secret VALUE is sourced
+        // per `spec.secret_env.source` (NEVER from any agent-side auth config)
+        // and injected by NAME=value. We never store or log the value, and
+        // refuse to spawn a token-less container.
+        let mut env: Vec<String> =
+            spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let env_var = &spec.secret_env.env_var;
+        let secret = match &spec.secret_env.source {
+            SecretSource::EnvOverrideThenTokenFile => {
+                self.resolve_auth_secret(env_var, None)?
+            }
+            SecretSource::TokenFile(p) => self.resolve_auth_secret(env_var, Some(p))?,
+            SecretSource::EnvOverride => match std::env::var(env_var) {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => bail!(
+                    "{env_var} unset and secret source is EnvOverride (no token file consulted)"
+                ),
+            },
+        };
+        env.push(format!("{env_var}={secret}"));
+
+        // --- config.json mount (RO) ----------------------------------------
+        // The agents side already serialized its resolved-instance config into
+        // `config_blob`; the connector just writes the provided blob to the
+        // incarnation dir and binds it RO. The in-container agent reads it back
+        // via AGENT_CONFIG_FILE (set in `spec.env`).
+        if let Some(config_blob) = &spec.config_blob {
+            let config_host_path = incarnation_dir.join("config.json");
+            std::fs::write(&config_host_path, config_blob)
+                .with_context(|| format!("write {}", config_host_path.display()))?;
+            let config_host_path_str = config_host_path.to_str().ok_or_else(|| {
+                anyhow!("non-UTF-8 config path: {}", config_host_path.display())
+            })?;
+            binds.push(format!("{config_host_path_str}:/agent/config.json:ro"));
+        }
+
+        // --- ref_mounts (RO) -----------------------------------------------
+        for m in &spec.ref_mounts {
             // ref_mounts are reference knowledge — always RO regardless of the
-            // (carried) read_only flag; the model never writes to them.
-            binds.push(format!("{host_str}:{}:ro", m.container_path));
+            // (carried) read_only flag; the model never writes to them. The
+            // agents side has already resolved host_path to absolute.
+            binds.push(format!("{}:{}:ro", m.host_path, m.container_path));
         }
 
         // --- resources -----------------------------------------------------
-        let res = &resolved.agent_type.resources;
+        let res = &spec.resources;
         let memory = (res.memory_mb * 1024 * 1024) as i64;
         let nano_cpus = (res.cpus * 1e9) as i64;
         let pids_limit = res.pids_limit as i64;
@@ -306,7 +407,7 @@ impl ContainerManager {
         };
 
         let config = Config {
-            image: Some(resolved.agent_type.image.clone()),
+            image: Some(spec.image.clone()),
             env: Some(env),
             host_config: Some(host_config),
             ..Default::default()
@@ -333,7 +434,7 @@ impl ContainerManager {
             short_id(&created.id),
             container_name,
             id,
-            resolved.target,
+            spec.target,
         );
 
         // --- host-side log capture task ------------------------------------
@@ -349,7 +450,7 @@ impl ContainerManager {
             id: id.clone(),
             container_id: created.id.clone(),
             container_name,
-            target: resolved.target.clone(),
+            target: spec.target.clone(),
             did,
             incarnation_ts,
             started_at: Instant::now(),
@@ -359,7 +460,7 @@ impl ContainerManager {
             id,
             Session {
                 info: info.clone(),
-                resolved: resolved.clone(),
+                spec: spec.clone(),
                 log_task: Some(log_task),
             },
         );
@@ -369,15 +470,15 @@ impl ContainerManager {
 
     /// Replace the container backing `id`: stop + remove the current one (its log
     /// is drained/harvested first), wipe its persistent volume, then `spawn` the
-    /// SAME [`ResolvedInstance`] again ⇒ a NEW identity. This is the only path
+    /// SAME [`ContainerSpec`] again ⇒ a NEW identity. This is the only path
     /// that resets identity now that the volume survives ordinary restarts.
     pub async fn replace(&self, id: &str) -> Result<SessionInfo> {
-        // Pull the stored ResolvedInstance out so we can re-spawn it.
-        let resolved = {
+        // Pull the stored ContainerSpec out so we can re-spawn it.
+        let spec = {
             let sessions = self.sessions.lock().await;
             sessions
                 .get(id)
-                .map(|s| s.resolved.clone())
+                .map(|s| s.spec.clone())
                 .ok_or_else(|| anyhow!("no active session {id:?} to replace"))?
         };
 
@@ -392,7 +493,7 @@ impl ContainerManager {
         wipe_persist(&persist).await?;
 
         // Re-spawn ⇒ new incarnation, new identity, same slot/type/target.
-        self.spawn(&resolved).await
+        self.spawn(&spec).await
     }
 
     /// Stop and remove the container for `id`: let its log task drain, then
@@ -611,9 +712,12 @@ fn current_uid() -> String {
     "1000".to_string()
 }
 
+/// Neutral, agent-agnostic default store dir for the dormant `new(None)` path.
+/// Real callers pass `Some(<their own store dir>)`; this default no longer
+/// hard-codes any specific backend's location.
 fn default_store_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".aqua-matrix-heartbeat")
+    PathBuf::from(home).join(".aqua-orchestrator")
 }
 
 /// The per-instance persistent volume dir, `<sessions>/<id>/persist`. Stable
@@ -655,39 +759,6 @@ async fn wipe_persist(persist: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a `ref_mount` host path to an absolute path. Absolute paths pass
-/// through; relative paths (e.g. `../aqua-rs-sdk`) are resolved against the repo
-/// root [`REPO_ROOT`] so siblings of the repo are reachable. Lexically
-/// normalized (no filesystem touch) so it works even before the path exists.
-fn resolve_host_path(host_path: &str) -> PathBuf {
-    let p = Path::new(host_path);
-    if p.is_absolute() {
-        return p.to_path_buf();
-    }
-    normalize(&Path::new(REPO_ROOT).join(p))
-}
-
-/// Lexical path normalization: collapse `.` and `..` components without hitting
-/// the filesystem (so `/repo/../aqua-rs-sdk` → `/aqua-rs-sdk`).
-fn normalize(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out: Vec<Component> = Vec::new();
-    for comp in p.components() {
-        match comp {
-            Component::ParentDir => {
-                if matches!(out.last(), Some(Component::Normal(_))) {
-                    out.pop();
-                } else {
-                    out.push(comp);
-                }
-            }
-            Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out.iter().collect()
-}
-
 /// Extract the raw bytes of a [`LogOutput`] frame (stdout/stderr/console).
 fn log_output_bytes(output: &LogOutput) -> &[u8] {
     match output {
@@ -723,26 +794,13 @@ fn short_id(id: &str) -> &str {
     &id[..12.min(id.len())]
 }
 
+/// The connector's own per-incarnation timestamp for the persist/log dir —
+/// independent of any timestamp the agents side embedded in `spec.id`.
 fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Build an on-the-fly [`ResolvedInstance`] for `#shell spawn <type> <target>`:
-/// the given type with `id = <type>-<incarnation_ts>` and `target` = the MXID.
-/// Pure (no I/O), so it is unit-testable without podman.
-pub fn build_spawn_instance(
-    agent_type: &aqua_matrix_template::AgentType,
-    target: &str,
-    incarnation_ts: u64,
-) -> ResolvedInstance {
-    ResolvedInstance {
-        id: format!("{}-{}", agent_type.name, incarnation_ts),
-        target: target.to_string(),
-        agent_type: agent_type.clone(),
-    }
 }
 
 #[cfg(test)]
@@ -757,21 +815,6 @@ mod tests {
         let uri = format!("unix:///run/user/{uid}/podman/podman.sock");
         assert!(uri.starts_with("unix:///run/user/"));
         assert!(uri.ends_with("/podman/podman.sock"));
-    }
-
-    #[test]
-    fn relative_ref_mount_resolves_against_repo_root() {
-        let resolved = resolve_host_path("../aqua-rs-sdk");
-        assert_eq!(resolved, PathBuf::from("/home/waldknoten-01/aqua-rs-sdk"));
-
-        let resolved = resolve_host_path("../aqua-spec");
-        assert_eq!(resolved, PathBuf::from("/home/waldknoten-01/aqua-spec"));
-    }
-
-    #[test]
-    fn absolute_ref_mount_passes_through() {
-        let resolved = resolve_host_path("/opt/refs/thing");
-        assert_eq!(resolved, PathBuf::from("/opt/refs/thing"));
     }
 
     #[test]
@@ -790,45 +833,5 @@ mod tests {
         // Only a target MXID (hyphen form), no `did:key:` ⇒ None.
         assert_eq!(scan_agent_did("only @did-key-z6mktarget:matrix.inblock.io here\n"), None);
         assert_eq!(scan_agent_did("no dids here at all\n"), None);
-    }
-
-    #[test]
-    fn build_spawn_instance_tags_id_and_target() {
-        let ty = aqua_matrix_template::AgentType {
-            name: "claude-channel".into(),
-            version: "0.1.0".into(),
-            description: "t".into(),
-            image: "aqua-matrix-agent:poc".into(),
-            role: "claude-channel".into(),
-            display_name: "claude-channel".into(),
-            system_prompt: None,
-            hello: None,
-            contract: aqua_matrix_template::Contract {
-                allowed_tools: vec![],
-                permissions: aqua_matrix_template::Permissions {
-                    allow: vec![],
-                    deny: vec![],
-                },
-            },
-            memory: aqua_matrix_template::MemoryPolicy {
-                config_dir: "/agent/memory".into(),
-                log_transcripts: true,
-            },
-            ref_mounts: vec![],
-            resources: aqua_matrix_template::Resources {
-                memory_mb: 2048,
-                cpus: 2.0,
-                pids_limit: 512,
-            },
-            auth: aqua_matrix_template::Auth {
-                method: aqua_matrix_template::AuthMethod::SubscriptionOauthToken,
-                env_var: "CLAUDE_CODE_OAUTH_TOKEN".into(),
-            },
-            egress_allowlist: None,
-        };
-        let r = build_spawn_instance(&ty, "@tim:matrix.inblock.io", 1717245000);
-        assert_eq!(r.id, "claude-channel-1717245000");
-        assert_eq!(r.target, "@tim:matrix.inblock.io");
-        assert_eq!(r.agent_type.image, "aqua-matrix-agent:poc");
     }
 }
