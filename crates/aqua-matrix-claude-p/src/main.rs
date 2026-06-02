@@ -6,7 +6,7 @@
 //! ## Chat confirmations (Phase A)
 //!
 //! A prompt that looks **destructive** (`rm`, `git push --force`, …; see
-//! [`destructive`]) is not run blindly. Instead it follows a
+//! [`aqua_matrix_gating::destructive`]) is not run blindly. Instead it follows a
 //! **plan → approve → execute** flow:
 //!   1. run `claude -p --permission-mode plan <prompt>` — this investigates
 //!      with read-only tools and emits a *plan* but **executes no destructive
@@ -19,22 +19,30 @@
 //!      abort, touching nothing.
 //!
 //! Non-destructive prompts keep the original direct-stream behaviour. The
-//! [`pending`] router (the shared `ask_user` primitive) is reused by Phases B/C.
+//! [`aqua_matrix_gating::PendingMap`] router (the shared `ask_user` primitive)
+//! is reused by Phases B/C.
 //!
 //! ## Chat confirmations (Phase B)
 //!
 //! Every non-destructive (`fresh`) run additionally carries an **`ask_human`
-//! MCP tool** (see [`ask_bridge`]): `claude` can pause mid-run and ask the
-//! authenticated user a free-form question over the same channel, blocking on
-//! the answer. The tool is wired via a per-run unix socket that routes through
-//! the same [`pending`] primitive. It is **advisory** (the model chooses to
+//! MCP tool** (see [`aqua_matrix_gating::AskBridge`]): `claude` can pause
+//! mid-run and ask the authenticated user a free-form question over the same
+//! channel, blocking on the answer. The tool is wired via a per-run unix socket
+//! that routes through the same [`aqua_matrix_gating::PendingMap`] primitive. It
+//! is **advisory** (the model chooses to
 //! call it) — enforced per-tool gating is Phase C. Phase A's gated destructive
 //! flow is unchanged and does not carry the tool.
 //!
 //! This is the canonical "drop in a backend" example for [`aqua_matrix_relay`].
-mod ask_bridge;
-mod destructive;
-mod pending;
+//!
+//! ## Cross-boundary invariant (agents ↔ connector)
+//!
+//! The connector-side [`aqua_matrix_gating::PendingMap`] alone does NOT
+//! serialize runs. The "one open question per target" guarantee also needs this
+//! backend's per-target `run_lock` ([`ClaudePHandler::run_lock`]), which stays
+//! agents-side. So that invariant is deliberately split across the crate
+//! boundary: gating routes the pending reply; this backend holds the per-target
+//! run lock so at most one question is ever open per target.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -42,14 +50,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use aqua_matrix_gating::{destructive, AskBridge, PendingMap, ASK_HUMAN_TOOL, ASK_SYSTEM_PROMPT};
 use aqua_matrix_relay::{async_trait, load_dotenv, run_daemon, AgentClient, AgentConfig, MessageHandler, ReplyStream};
 use aqua_matrix_template::ResolvedInstance;
 use clap::Parser;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
-
-use pending::PendingMap;
 
 /// There is intentionally **no cap on total run time** — a legitimate task may
 /// take many minutes. Instead an *inactivity* watchdog stops `claude` only if it
@@ -67,10 +74,6 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(420);
 const MAX_REPLY_BYTES: usize = 16_000; // Matrix can take more, but be polite.
 const ROLE: &str = "claude-channel";
 const UNIT: &str = "aqua-matrix-claude-channel";
-/// The fully-qualified `ask_human` MCP tool name (must match [`ask_bridge`]'s
-/// `SERVER_KEY`). Always merged into `--allowedTools` when the ask bridge is up,
-/// alongside the frozen contract's tools when a config is loaded.
-const ASK_HUMAN_TOOL: &str = "mcp__ask__ask_human";
 /// Default path the orchestrator mounts the resolved config at. Overridable via
 /// `AGENT_CONFIG_FILE`. Absent (host systemd / dev runs) ⇒ fall back to today's
 /// hardcoded behavior.
@@ -527,10 +530,10 @@ async fn stream_claude(
     // flags. The guard must outlive the child (it serves ask_human calls during
     // the run), so it is held in this function's scope until after `wait`.
     let _ask_bridge = if run.ask_human {
-        match ask_bridge::AskBridge::setup(agent, pending, target, APPROVAL_TIMEOUT).await {
+        match AskBridge::setup(agent, pending, target, APPROVAL_TIMEOUT).await {
             Ok(bridge) => {
                 cmd.arg("--mcp-config").arg(bridge.config_path());
-                cmd.arg("--append-system-prompt").arg(ask_bridge::ASK_SYSTEM_PROMPT);
+                cmd.arg("--append-system-prompt").arg(ASK_SYSTEM_PROMPT);
                 Some(bridge)
             }
             Err(e) => {

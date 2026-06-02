@@ -1,0 +1,23 @@
+[package]
+name = "aqua-matrix-gating"
+version.workspace = true
+edition.workspace = true
+description = "Connector-side confirmation/gating substrate: the agent-agnostic ask_user pending-reply router (PendingMap), the destructive-command matcher, and the per-run ask_human unix-socket bridge. Reused by any backend; mentions no specific LLM."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_matrix_gating"
+path = "src/lib.rs"
+
+[dependencies]
+aqua-matrix-relay.workspace = true
+# The shared IPC wire types (`ipc::AskReply`, `SOCK_ENV`) so the ask-bridge and
+# the MCP server agree on exactly one wire definition.
+aqua-matrix-ask-mcp.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# Per-run socket/config filenames.
+uuid.workspace = true

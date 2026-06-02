@@ -26,20 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::pending::PendingMap;
-
-/// The MCP server key in the generated config. The fully-qualified tool name
-/// `claude` sees is therefore `mcp__ask__ask_human`.
-const SERVER_KEY: &str = "ask";
-
-/// System-prompt nudge appended to a run that carries the bridge: tells the
-/// model the tool exists and *when* to reach for it. Phase B is advisory — the
-/// model must choose to call it (enforcement is Phase C).
-pub const ASK_SYSTEM_PROMPT: &str = "You have an `ask_human` tool (mcp__ask__ask_human) that puts a \
-question to the authenticated human operator over the chat channel and blocks until they answer. \
-Before any destructive or irreversible action (deleting files, `rm`/`rm -rf`, `git push --force`, \
-`git reset --hard`, dropping data, or anything you cannot undo), you MUST call `ask_human` with the \
-exact command and its blast radius, and proceed only if the answer authorises it. If it returns an \
-error or a denial, do NOT perform the action — stop and report it.";
+use crate::ASK_SERVER_KEY;
 
 /// A per-run `ask_human` bridge. Holds the bound socket, the generated
 /// `--mcp-config` file, and the accept-loop task. Dropping it aborts the loop
@@ -76,7 +63,7 @@ impl AskBridge {
         let mcp_bin = ask_mcp_bin_path();
         let config = serde_json::json!({
             "mcpServers": {
-                SERVER_KEY: {
+                ASK_SERVER_KEY: {
                     "command": mcp_bin,
                     "args": [],
                     "env": { SOCK_ENV: sock_path.to_string_lossy() }
@@ -135,7 +122,7 @@ impl Drop for AskBridge {
 ///
 /// `ask` is `async fn(question) -> Option<answer>`: `Some` grants with the
 /// human's answer, `None` is the fail-closed deny (timeout / send failure).
-async fn accept_loop<F, Fut>(listener: UnixListener, ask: F)
+pub async fn accept_loop<F, Fut>(listener: UnixListener, ask: F)
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,

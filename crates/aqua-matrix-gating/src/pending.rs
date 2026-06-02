@@ -33,6 +33,15 @@ use tokio::sync::oneshot;
 
 /// Shared pending-question state, embedded in the handler and cloned into each
 /// run task. Cheap to clone (`Arc`).
+///
+/// ## Cross-boundary invariant (connector ↔ agents)
+///
+/// `PendingMap` alone does **NOT** serialize runs. The "one open question per
+/// target" guarantee also needs the backend's per-target `run_lock`, which stays
+/// **agents-side** (e.g. `aqua-matrix-claude-p`). So the invariant is split
+/// across the crate boundary: this connector crate provides the pending-reply
+/// router; the agent backend must hold its own per-target run lock to ensure at
+/// most one question is ever open per target.
 #[derive(Clone, Default)]
 pub struct PendingMap {
     // did (target MXID) -> sender that resolves that target's open question.
@@ -42,10 +51,15 @@ pub struct PendingMap {
 }
 
 impl PendingMap {
+    /// Construct an empty `PendingMap`. Alias for [`Default::default`], provided
+    /// as a documented public constructor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Is a question currently open for `target`? Part of the `ask_user` router
     /// surface reused by Phases B/C; Phase A's flow uses [`Self::try_resolve`]
-    /// instead, hence `allow(dead_code)` for now.
-    #[allow(dead_code)]
+    /// instead.
     pub fn is_pending(&self, target: &str) -> bool {
         self.inner
             .lock()
@@ -127,7 +141,7 @@ impl PendingMap {
     }
 
     /// Drop any pending entry for `target` without resolving it.
-    fn clear(&self, target: &str) {
+    pub fn clear(&self, target: &str) {
         if let Ok(mut map) = self.inner.lock() {
             map.remove(target);
         }

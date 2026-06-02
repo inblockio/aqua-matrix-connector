@@ -12,9 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 aqua-matrix-relay.workspace = true
-# Phase B: reuse the shared IPC wire types (`ipc::AskReply`, `SOCK_ENV`) so the
-# daemon's ask-bridge and the MCP server agree on exactly one wire definition.
-aqua-matrix-ask-mcp.workspace = true
+# The connector-side confirmation/gating substrate: PendingMap (ask_user
+# router), the destructive matcher, the ask_human bridge, and the shared ASK_*
+# consts. Extracted from this crate; `aqua-matrix-ask-mcp` + `uuid` moved with it.
+aqua-matrix-gating.workspace = true
 # Phase 4: the typed-instance data model. When a `/agent/config.json` is mounted
 # (containerized deployment), the handler reads its role/display/hello/contract/
 # memory from a `ResolvedInstance` instead of the hardcoded consts.
@@ -26,4 +27,3 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
-uuid.workspace = true

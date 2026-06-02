@@ -171,7 +171,7 @@ name = "aqua-matrix-claude-p"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aqua-matrix-ask-mcp",
+ "aqua-matrix-gating",
  "aqua-matrix-relay",
  "aqua-matrix-template",
  "async-trait",
@@ -180,6 +180,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aqua-matrix-gating"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-ask-mcp",
+ "aqua-matrix-relay",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
