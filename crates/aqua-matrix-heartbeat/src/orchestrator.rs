@@ -801,6 +801,7 @@ mod tests {
             image: "aqua-matrix-agent:poc".into(),
             role: "claude-channel".into(),
             display_name: "claude-channel".into(),
+            system_prompt: None,
             hello: None,
             contract: aqua_matrix_template::Contract {
                 allowed_tools: vec![],
