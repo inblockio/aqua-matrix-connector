@@ -173,8 +173,8 @@ The hook reads the latest `usage.input_tokens` from the active transcript, so to
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
-| `/heartbeat` | Run the `aqua-matrix-heartbeat` binary — DMs status every 10min AND honors `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell logs` commands sent from `--target` |
-| `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawnable via `#shell respawn` |
+| `/heartbeat` | Run the `aqua-matrix-heartbeat` binary — DMs status every 10min AND honors `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell respawn-channel`, `#shell logs`, `#shell import <message>` commands sent from `--target` |
+| `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawnable via `#shell respawn`. Messages can be injected into it via `#shell import` → `~/import` inbox → `aqua-import-watch` (see `/heartbeat`). |
 | `/claude-channel` | Matrix LLM channel daemon (`aqua-matrix-claude-p` binary) — separate identity, forwards DMs from `--target` to `claude -p` and replies with stdout; respawnable via `#shell respawn-channel` |
 
 **Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:

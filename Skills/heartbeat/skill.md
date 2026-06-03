@@ -24,6 +24,7 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 | `#shell respawn` | Restart the LOCAL interactive Claude in tmux: `systemctl --user restart claude-bridge`. For local `tmux attach`, not Matrix replies. |
 | `#shell respawn-channel` | Restart the Matrix LLM channel daemon: `systemctl --user restart aqua-matrix-claude-channel`. |
 | `#shell logs [N]` | Last N lines from `journalctl --user -u aqua-matrix-heartbeat` (default 10, max 50) |
+| `#shell import <message>` | Verbatim remainder → host `import` binary → control-bridge inbox (`~/import`) → the `aqua-import-watch` service injects it into the `claude-bridge` orchestrator. Replies with the inbox path. (See "control-bridge inbox" below.) |
 
 **Security**: only messages whose sender matches `--target` are honored. Anyone else who DMs the heartbeat identity is ignored. Anything not matching a known subcommand yields `unknown command: ...` plus the help text.
 
@@ -34,6 +35,49 @@ Sent as plain Matrix DMs from the configured `--target` to the heartbeat's ident
 **Restart reliability**: handled in code, not via systemd. `AgentClient::connect` caches the access token + device_id in `~/.aqua-matrix-heartbeat/config.toml` and reuses them on restart if still valid (~5 min window). If the cached token has expired, fresh auth mints a new device_id; if that triggers `account in the store doesn't match`, the connect code wipes `matrix-sdk-*.sqlite3*` and retries `restore_session` once. No more `ExecStartPre` wipe. See `docs/ARCHITECTURE.md` "Identity and device-id persistence".
 
 **Sync model**: stream sync, not polling. `client.sync(...)` runs forever in a background tokio task; a registered event handler dispatches incoming `#shell` commands within ~1 second of receipt (not a 30s tick).
+
+## `#shell import` → control-bridge inbox
+
+`#shell import <message>` is the one-way path for injecting text into the **local
+interactive orchestrator** (`claude-bridge` — the supervised `claude` tmux
+session; see `/claude-bridge`). Everything after `import` is taken **verbatim**
+as the message (internal spacing preserved). Unlike the other subcommands, it is
+*not* whitespace-split into args — `arg_remainder()` in `ops.rs` slices the raw
+remainder after the `import` token.
+
+Pipeline:
+
+```
+#shell import <message>             Matrix DM from --target → heartbeat ops channel
+  → host `import` binary            resolved on PATH, else /usr/local/bin/import, else ~/bin/import
+  → ~/import/<ms-UTC-ts>-<rand>.md  the "control-bridge inbox" (untracked; written atomically)
+  → aqua-import-watch.service       host-level watcher daemon, NOT tied to any Claude session
+  → tmux send-keys → claude-bridge  injected as one submitted prompt; file moved to ~/import/.read/
+```
+
+Properties:
+
+- **Session-independent.** The watcher is a systemd *user* service
+  (`aqua-import-watch`), so delivery survives the heartbeat restarting, the
+  orchestrator restarting, and reboots. If `claude-bridge` is down the messages
+  queue in `~/import` and flush when it returns.
+- **Durable + ordered.** `import` writes `~/import/<millisecond-UTC-ts>-<rand>.md`
+  atomically (temp → rename), so the watcher never sees a half-written file and
+  same-second messages keep their order.
+- **Direct host use.** `import "<message>"` (or `echo … | import`) works from any
+  host shell; `#shell import` is just the Matrix entry point to the same binary.
+- **Reply.** The heartbeat replies `queued to control-bridge inbox → <path>`.
+
+Host components (live on the machine, outside this repo's build):
+
+- `~/bin/import` — the injector, symlinked to `/usr/local/bin/import` so it is on
+  the orchestrator's PATH.
+- `~/bin/aqua-import-watchd` + `~/.config/systemd/user/aqua-import-watch.service` —
+  the watcher daemon and its unit.
+
+> ⚠️ The orchestrator runs `claude --dangerously-skip-permissions`, so a delivered
+> message becomes a prompt it acts on. `#shell import` is honored only from the
+> configured `--target`, same as every other command.
 
 ## Quick start (foreground)
 
