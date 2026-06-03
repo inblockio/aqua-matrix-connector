@@ -62,10 +62,10 @@ Default to debug builds (release is much slower for iteration). The systemd unit
 
 ## Architecture
 
-This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. After the **physical repo split**, this repo is the **connector substrate: five crates** under `crates/`. The three backend crates + agent content now live in the sibling **`../aqua-agents`** repo, which path-deps back here (see "Repo boundary" below and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
+This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. After the **physical repo split**, this repo is the **connector substrate: six crates** under `crates/`. The three backend crates + agent content now live in the sibling **`../aqua-agents`** repo, which path-deps back here (see "Repo boundary" below and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
 
 ```
-aqua-matrix-agent (virtual workspace — CONNECTOR substrate, 5 crates)
+aqua-matrix-agent (virtual workspace — CONNECTOR substrate, 6 crates)
   |
   | CONNECTOR half (this repo; reusable substrate; never names an agents-side crate)
   +-- crates/aqua-matrix-agent        -- library (AgentClient, AgentConfig, OIDC, recovery,
@@ -80,6 +80,10 @@ aqua-matrix-agent (virtual workspace — CONNECTOR substrate, 5 crates)
   |                                      driven by the ContainerSpec seam (never sees AgentType)
   +-- crates/aqua-matrix-gating       -- confirmation/gating substrate: PendingMap (ask_user),
   |                                      destructive matcher, AskBridge (ask_human socket)
+  +-- crates/aqua-activity-watch      -- host-side activity tracker (binary): tails an agent's
+  |                                      inbound.jsonl + DMs the operator on the peer's first message
+  |                                      and every Nth; dependency-free (no Matrix/crypto), so it
+  |                                      trivially satisfies the one-way rule
   |
   +-- siwx-oidc-auth -- Headless OIDC client (CAIP-122 signature auth)
   +-- matrix-sdk     -- Matrix client with E2E encryption (Megolm/Vodozemac)
@@ -94,9 +98,9 @@ aqua-matrix-agent (virtual workspace — CONNECTOR substrate, 5 crates)
   +-- types/*.json, instances/*.toml.example, Dockerfile, scripts/build-image.sh  -- agent content
 ```
 
-**Repo boundary (the one-way rule):** dependencies flow **agents → connector, NEVER the reverse.** The two halves now live in **two repos**: this connector and the sibling `../aqua-agents` (which must be checked out alongside this repo for its path-deps to resolve). No connector crate (`agent`, `relay`, `ask-mcp`, `orchestrator`, `gating`) may name a backend crate (`template`, `heartbeat`, `claude-p`) in its `Cargo.toml`. The connector reaches agents only through two seams: the `ContainerSpec` seam (`aqua_matrix_template::build_spawn_spec` maps a rich `AgentType` down to the agent-agnostic spec the orchestrator consumes) and the `MessageHandler`/`InboundMessage`/`authorize` seam in the relay. The guard `scripts/check-dep-direction.sh` enforces this mechanically (anchored grep of connector `Cargo.toml` dependency lines) — **run it as part of the gate** alongside `cargo build` / `cargo test`. Full rationale: [`docs/plans/repo-split-execution-handover.md`](docs/plans/repo-split-execution-handover.md).
+**Repo boundary (the one-way rule):** dependencies flow **agents → connector, NEVER the reverse.** The two halves now live in **two repos**: this connector and the sibling `../aqua-agents` (which must be checked out alongside this repo for its path-deps to resolve). No connector crate (`agent`, `relay`, `ask-mcp`, `orchestrator`, `gating`, `activity-watch`) may name a backend crate (`template`, `heartbeat`, `claude-p`) in its `Cargo.toml`. The connector reaches agents only through two seams: the `ContainerSpec` seam (`aqua_matrix_template::build_spawn_spec` maps a rich `AgentType` down to the agent-agnostic spec the orchestrator consumes) and the `MessageHandler`/`InboundMessage`/`authorize` seam in the relay. The guard `scripts/check-dep-direction.sh` enforces this mechanically (anchored grep of connector `Cargo.toml` dependency lines) — **run it as part of the gate** alongside `cargo build` / `cargo test`. Full rationale: [`docs/plans/repo-split-execution-handover.md`](docs/plans/repo-split-execution-handover.md).
 
-**Deployment glue stays here (for now):** `Skills/` and `systemd/` remain in this connector repo pending a later deployment-migration pass (the agent systemd units still `ExecStart` from `%h/aqua-matrix-agent/target/debug/...`, and the moved `Dockerfile`/`build-image.sh` need a cross-repo build context with both repos present). The existing `localhost/aqua-matrix-agent:poc` image remains usable meanwhile.
+**Deployment glue stays here (for now):** `Skills/` and `systemd/` remain in this connector repo pending a later deployment-migration pass — the agent systemd units still `ExecStart` from `%h/aqua-matrix-agent/target/debug/...`. (The `Dockerfile`/`build-image.sh` half of that pass is **done as of 2026-06-03**: both — now in `../aqua-agents` — stage a cross-repo two-workspace context, building `claude-p` from the agents workspace and `ask-mcp` from the connector, and rebuild `localhost/aqua-matrix-agent:poc` correctly.)
 
 **Authentication flow:** Ed25519 key -> derive DID -> CAIP-122 challenge-response against siwx-oidc -> siwx-oidc verifies signature, provisions user in Synapse via MSC3861 endpoints, issues opaque `mat_*`/`mcr_*` tokens -> Synapse validates tokens via `/oauth2/introspect` (RFC 7662) -> Matrix session restored.
 
@@ -115,7 +119,7 @@ cargo test                                   # run unit tests (config roundtrip,
 cargo test --test e2e --features e2e         # run E2E test (requires live matrix.inblock.io)
 ```
 
-A `cargo build` in this connector repo builds the five connector crates, producing `target/debug/aqua-matrix-agent` (the one-shot CLI). The `aqua-matrix-heartbeat` and `aqua-matrix-claude-p` binaries now build from the **sibling `../aqua-agents` repo** (`cd ../aqua-agents && cargo build`, which path-deps this connector). The systemd units still point at `%h/aqua-matrix-agent/target/debug/...` — reconciling that build/output location is part of the deferred deployment-migration pass.
+A `cargo build` in this connector repo builds the six connector crates, producing `target/debug/aqua-matrix-agent` (the one-shot CLI) and `target/debug/aqua-activity-watch` (the host-side activity tracker). The `aqua-matrix-heartbeat` and `aqua-matrix-claude-p` binaries now build from the **sibling `../aqua-agents` repo** (`cd ../aqua-agents && cargo build`, which path-deps this connector). The systemd units still point at `%h/aqua-matrix-agent/target/debug/...` — reconciling that build/output location is part of the deferred deployment-migration pass.
 
 ## Configuration (`.env`, per-instance)
 
