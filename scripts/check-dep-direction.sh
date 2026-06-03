@@ -37,6 +37,7 @@ CONNECTOR_CRATES=(
   aqua-matrix-ask-mcp
   aqua-matrix-orchestrator
   aqua-matrix-gating
+  aqua-activity-watch
 )
 
 # Anchored dependency-line regex (backend crate names only).

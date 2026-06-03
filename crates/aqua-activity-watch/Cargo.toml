@@ -1,0 +1,22 @@
+[package]
+name = "aqua-activity-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aqua-activity-watch"
+path = "src/main.rs"
+
+# Host-side watcher. Intentionally links NO Matrix/crypto code: it tails a
+# JSONL activity log and shells out to the existing notify channel
+# (notify-tim.sh) to alert the operator. So it has no internal deps and
+# trivially satisfies the connector->never-backend dependency rule.
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

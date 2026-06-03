@@ -6,6 +6,7 @@ members = [
     "crates/aqua-matrix-ask-mcp",
     "crates/aqua-matrix-gating",
     "crates/aqua-matrix-orchestrator",
+    "crates/aqua-activity-watch",
 ]
 
 # Shared metadata for every crate in the workspace. Members opt in with
