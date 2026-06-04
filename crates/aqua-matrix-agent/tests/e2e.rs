@@ -155,6 +155,200 @@ async fn e2ee_bidirectional_messaging() {
     println!("  Messages verified decryptable in both directions");
 }
 
+/// Decode a base64url (no padding) string — the encoding used by JWT segments.
+/// Returns `None` on any invalid byte so a malformed claim can't panic the test.
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in bytes {
+        let v = val(c)? as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Verify LIVE that an aqua agent can complete the MatrixRTC join handshake
+/// (HW2/HW3): obtain a Matrix OpenID token, present it to the Element Call
+/// `lk-jwt-service` behind `matrix.inblock.io`, and receive a scoped LiveKit
+/// access token in return. This proves the openid_token shape the connector
+/// emits is exactly what lk-jwt-service expects.
+#[tokio::test]
+async fn rtc_jwt_handshake() {
+    tracing_subscriber::fmt()
+        .with_env_filter("warn,aqua_matrix_agent=info")
+        .try_init()
+        .ok();
+
+    clean_store("/tmp/aqua-e2e-rtc");
+
+    // 1. Connect agent A.
+    let agent = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-rtc"))
+        .await
+        .expect("Agent A failed to connect");
+    println!("Agent connected: {} ({})", agent.user_id(), agent.did());
+
+    // 2. device_id + openid token.
+    let device_id = agent.device_id().expect("agent has no device_id");
+    println!("device_id: {device_id}");
+
+    let openid_token = agent
+        .request_openid_token()
+        .await
+        .expect("request_openid_token failed");
+    // Show the shape (but NOT the secret access_token) so the body is auditable.
+    {
+        let redacted = {
+            let mut t = openid_token.clone();
+            if let Some(at) = t.get_mut("access_token") {
+                let len = at.as_str().map(|s| s.len()).unwrap_or(0);
+                *at = serde_json::json!(format!("<{len} chars redacted>"));
+            }
+            t
+        };
+        println!("openid_token (access_token redacted): {redacted}");
+    }
+    // Sanity: the four fields lk-jwt-service reads must be present.
+    for field in ["access_token", "token_type", "matrix_server_name", "expires_in"] {
+        assert!(
+            openid_token.get(field).is_some(),
+            "openid_token missing field `{field}`: {openid_token}"
+        );
+    }
+
+    // 3. Synthetic-but-plausible LiveKit room name. lk-jwt-service mints a token
+    //    for the requested room and verifies the USER via the openid token, not
+    //    room membership — so any room string works for the handshake proof.
+    let room = format!("rtc-probe-{}", uuid::Uuid::new_v4());
+    println!("requesting LiveKit token for room: {room}");
+
+    // 4. Build the lk-jwt request body and POST to the focus's /sfu/get.
+    let body = serde_json::json!({
+        "room": room,
+        "openid_token": openid_token,
+        "device_id": device_id,
+    });
+    let endpoint = "https://matrix.inblock.io/livekit/jwt/sfu/get";
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(endpoint)
+        .json(&body)
+        .send()
+        .await
+        .expect("POST to lk-jwt-service failed (transport)");
+
+    let status = resp.status();
+    let resp_text = resp.text().await.expect("read lk-jwt response body");
+    println!("lk-jwt-service HTTP {status}");
+
+    // 5. Assert success + inspect the minted token.
+    assert!(
+        status.is_success(),
+        "lk-jwt-service did not return 2xx — HTTP {status}, body: {resp_text}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&resp_text).expect("lk-jwt response was not JSON");
+
+    let jwt = json
+        .get("jwt")
+        .or_else(|| json.get("token"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| panic!("no non-empty `jwt`/`token` field in response: {json}"));
+    let url = json
+        .get("url")
+        .or_else(|| json.get("sfu_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("no `url` field in response: {json}"));
+
+    let preview: String = jwt.chars().take(12).collect();
+    println!("LiveKit SFU url: {url}");
+    println!("JWT length: {} chars, prefix: {preview}…", jwt.len());
+
+    // Decode the JWT payload (segment 2 of header.payload.signature) and surface
+    // the LiveKit claims so we can confirm it's scoped to our room + identity.
+    let segments: Vec<&str> = jwt.split('.').collect();
+    assert!(
+        segments.len() >= 2,
+        "JWT is not in header.payload.signature form: {} segments",
+        segments.len()
+    );
+    if let Some(hdr) = b64url_decode(segments[0]).and_then(|b| String::from_utf8(b).ok()) {
+        println!("JWT header: {hdr}");
+    }
+    let payload = b64url_decode(segments[1])
+        .and_then(|b| String::from_utf8(b).ok())
+        .expect("JWT payload was not valid base64url/UTF-8");
+    let claims: serde_json::Value =
+        serde_json::from_str(&payload).expect("JWT payload was not JSON");
+
+    // Pretty-print full claims (a LiveKit access token has no user secret in it —
+    // it's the room grant), then call out the room + identity specifically.
+    println!(
+        "JWT claims:\n{}",
+        serde_json::to_string_pretty(&claims).unwrap_or_else(|_| payload.clone())
+    );
+    let identity = claims
+        .get("sub")
+        .or_else(|| claims.get("identity"))
+        .and_then(|v| v.as_str());
+    let claim_room = claims.pointer("/video/room").and_then(|v| v.as_str());
+    let room_join = claims
+        .pointer("/video/roomJoin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    println!("LiveKit identity (sub): {identity:?}");
+    println!("LiveKit room claim:     {claim_room:?}");
+    println!("LiveKit roomJoin:       {room_join}");
+
+    // The identity must encode THIS session: lk-jwt-service builds it as
+    // `<user_id>:<device_id>`, so confirm both halves are present — that's what
+    // ties the LiveKit participant back to our Matrix device.
+    if let Some(id) = identity {
+        assert!(
+            id.contains(agent.user_id()),
+            "JWT identity {id:?} does not contain our user_id {}",
+            agent.user_id()
+        );
+        assert!(
+            id.contains(&device_id),
+            "JWT identity {id:?} does not contain our device_id {device_id}"
+        );
+    }
+
+    // The token MUST be room-scoped. lk-jwt-service does NOT echo the room name
+    // verbatim — it grants on `unpaddedBase64(sha256(json([room, slotId])))`, so
+    // the claim is an opaque, non-empty, room-derived alias rather than our raw
+    // string. Assert presence + join grant, not literal equality.
+    let claim_room = claim_room.expect("minted JWT has no /video/room claim — not room-scoped");
+    assert!(!claim_room.is_empty(), "JWT /video/room claim is empty");
+    assert!(room_join, "JWT does not grant roomJoin");
+
+    println!("\nMatrixRTC JWT handshake PASSED");
+    println!("  HTTP status : {status}");
+    println!("  SFU url     : {url}");
+    println!("  JWT length  : {} chars", jwt.len());
+    println!("  Identity    : {identity:?}");
+    println!("  Room alias  : {claim_room} (room-scoped grant for requested {room})");
+}
+
 /// A minimal but structurally-valid 2x2 PNG (signature + IHDR + IDAT + IEND).
 /// Its IHDR declares 2x2 so `imagesize::blob_size` reads dimensions from the
 /// header, and the pixel data is a real (if tiny) zlib stream so it's a genuine

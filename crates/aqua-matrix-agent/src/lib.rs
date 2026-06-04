@@ -602,6 +602,12 @@ impl AgentClient {
         self.user_id.as_str()
     }
 
+    /// This session's Matrix device id, if the client has one yet. Needed by the
+    /// MatrixRTC join flow (the lk-jwt-service keys a LiveKit identity on it).
+    pub fn device_id(&self) -> Option<String> {
+        self.client.device_id().map(|d| d.to_string())
+    }
+
     pub async fn join_invited_rooms(&self) -> Result<Vec<String>> {
         let mut joined = Vec::new();
         for room in self.client.invited_rooms() {

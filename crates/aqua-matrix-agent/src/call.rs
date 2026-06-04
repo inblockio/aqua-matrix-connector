@@ -54,6 +54,31 @@ impl AgentClient {
     }
 }
 
+impl AgentClient {
+    /// Request a Matrix **OpenID token** (`POST /user/{id}/openid/request_token`),
+    /// returned as the JSON object an Element Call / `lk-jwt-service` expects in
+    /// its `openid_token` field. This is the credential a MatrixRTC focus
+    /// (LiveKit JWT service) exchanges — together with the room id and
+    /// [`device_id`](AgentClient::device_id) — for a LiveKit access token at
+    /// `POST {rtc_foci.livekit_service_url}/sfu/get`. The connector deliberately
+    /// stops here (token minting is a Matrix-session operation); the LiveKit
+    /// connection + media live in the agents-side call backend.
+    pub async fn request_openid_token(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .client()
+            .account()
+            .request_openid_token()
+            .await
+            .context("openid request_token failed")?;
+        Ok(serde_json::json!({
+            "access_token": resp.access_token,
+            "token_type": resp.token_type,
+            "matrix_server_name": resp.matrix_server_name,
+            "expires_in": resp.expires_in.as_secs(),
+        }))
+    }
+}
+
 /// A fresh, collision-resistant call id. We have no RNG in the default feature
 /// set, so derive it from the wall clock in nanoseconds — unique enough for a
 /// ring (a real MatrixRTC session id would come from the media layer we don't
