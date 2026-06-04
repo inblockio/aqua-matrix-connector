@@ -52,8 +52,14 @@ pub trait MessageHandler: Send + Sync + 'static {
     fn tick_interval(&self) -> Option<Duration> { None } // periodic timer; None = react-only
     async fn on_tick(&self, _agent: &AgentClient, _target: &str) {}
     async fn handle_message(&self, agent: &AgentClient, target: &str, body: &str);
+    async fn on_call(&self, _agent: &AgentClient, _target: &str,         // default no-op
+                     _call: &InboundCall) {}
 }
 ```
+
+(`handle_message` takes a `&str` body for the text path; the full inbound record,
+including any attachment, is exposed as `InboundMessage` — see "Rich media and
+calls" below.)
 
 Contract:
 
@@ -68,6 +74,70 @@ Contract:
   and every spawned task. Put mutable state behind a `Mutex`/atomics (see
   `OpsHandler`'s stats in `aqua-matrix-heartbeat`).
 - Errors are yours to log; the relay never unwinds on a handler error.
+
+## Rich media and calls
+
+The connector sends and receives rich media as `AgentClient` methods and surfaces
+inbound media/calls through the same `MessageHandler` seam. matrix-sdk
+auto-encrypts attachments on send and auto-decrypts on download, so this all works
+inside E2E DMs. The connector does **no** audio decoding or transcoding — for a
+voice message the caller supplies `duration_ms` and an optional waveform.
+
+`AgentClient` methods (all async, `anyhow::Result`):
+
+| Method | Sends |
+|---|---|
+| `send_image(target, path, caption: Option<&str>)` | `m.image` (dimensions read from header bytes, no full decode) |
+| `send_file(target, path, caption: Option<&str>)` | `m.file` |
+| `send_audio(target, path)` | plain `m.audio` |
+| `send_video(target, path, caption: Option<&str>)` | `m.video` |
+| `send_voice_message(target, path, duration_ms: u64, waveform: Option<Vec<f32>>)` | `m.audio` with MSC3245 voice markers (Element X waveform bubble); content-type forced to `audio/*`, defaults `audio/ogg`; waveform synthesised when `None` |
+| `download_media(&handle)` | → `Vec<u8>` (auto-decrypted) |
+| `download_media_to_temp(&handle, dir)` | → `PathBuf` |
+| `ring_call(target)` | `m.call.notify` Ring (MSC4075) — makes a peer's Element X show an incoming call |
+
+Inbound: `InboundMessage` gains a `media: Option<InboundMedia>` field (a captioned
+attachment puts its caption in `body`). Download bytes on demand via
+`agent.download_media(&media.handle)`.
+
+```rust
+pub struct InboundMedia {
+    pub kind: MediaKind,           // Image | Audio | Voice | Video | File
+    pub filename: String,
+    pub mimetype: String,
+    pub size: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub is_voice: bool,
+    pub waveform: Option<Vec<f32>>,
+    pub handle: MediaHandle,       // pass to download_media[_to_temp]
+}
+```
+
+Calls are forwarded to the default-no-op `MessageHandler::on_call`. The relay
+registers handlers for `m.call.invite`, `m.call.notify` (Element-Call ring) and
+`m.call.hangup`:
+
+```rust
+pub struct InboundCall {
+    pub signal: CallSignal,        // Invite | Ring | Hangup
+    pub call_id: String,
+    pub sender_mxid: String,
+    pub room_id: String,
+}
+```
+
+**Scope boundary — calls are SIGNALING + DETECTION ONLY, there is no live media.**
+matrix-sdk 0.17 ships no WebRTC/LiveKit stack, so the agent can ring a peer and
+detect inbound invites/rings/hangups but cannot place or carry an actual
+audio/video stream. Real call-media participation would require embedding a
+WebRTC engine (e.g. webrtc-rs) plus the Element Call SFU — a separate, much
+larger follow-up. Files, images and voice messages are fully functional.
+
+See [`crates/aqua-matrix-relay/examples/media_agent.rs`](../crates/aqua-matrix-relay/examples/media_agent.rs)
+for a worked handler, and [`docs/plans/2026-06-04-rich-media.md`](plans/2026-06-04-rich-media.md)
+for design rationale and source-verified feasibility.
 
 ## What `run_daemon` does for you
 

@@ -60,6 +60,42 @@ aqua-matrix-agent --key-file agent-b.pem --store-dir ~/.aqua-matrix-agent-b \
 
 Pre-existing keys: `~/aqua-matrix-agent/agent.pem` (Agent A) and `~/aqua-matrix-agent/agent-b.pem` (Agent B).
 
+## Rich media (files, images, voice, calls)
+
+Beyond text, the connector can send and receive rich media over E2E DMs. These are
+**`AgentClient` library methods for agent backends** (a `MessageHandler` that calls
+`run_daemon`), not flags on the one-shot CLI. matrix-sdk auto-encrypts attachments
+on send and auto-decrypts them on download, so this works transparently in encrypted
+DMs. The connector does **no** audio decoding — for a voice message you supply the
+duration (and optionally a waveform).
+
+**Send** (all async, return `anyhow::Result`; `target` = peer MXID, `caption` becomes the body):
+
+- `agent.send_image(target, path, caption)` — `m.image` (dimensions read from header bytes, no full decode)
+- `agent.send_file(target, path, caption)` — `m.file`
+- `agent.send_audio(target, path)` / `agent.send_video(target, path, caption)`
+- `agent.send_voice_message(target, path, duration_ms, waveform)` — `m.audio` with MSC3245 voice markers so Element X shows a waveform bubble; pass the known `duration_ms`, and `waveform: Option<Vec<f32>>` (synthesised if `None`)
+
+**Receive:** inbound attachments arrive on `InboundMessage.media: Option<InboundMedia>`
+(captioned attachments put the caption in `body`). `InboundMedia` carries `kind`
+(`Image|Audio|Voice|Video|File`), `filename`, `mimetype`, `size`, `duration_ms`,
+`width`/`height`, `is_voice`, `waveform`, and a `handle`. Fetch the bytes on demand:
+
+- `agent.download_media(&media.handle)` → `Vec<u8>` (auto-decrypted)
+- `agent.download_media_to_temp(&media.handle, dir)` → `PathBuf`
+
+**Calls — signaling and detection only.** `agent.ring_call(target)` sends an
+`m.call.notify` Ring (MSC4075) so a peer's Element X shows an incoming call, and the
+default-no-op `MessageHandler::on_call` receives inbound `m.call.invite` /
+`m.call.notify` / `m.call.hangup` events as an `InboundCall { signal, call_id,
+sender_mxid, room_id }`. **The agent can ring and detect calls but cannot place or
+carry an actual audio/video stream** — matrix-sdk 0.17 ships no WebRTC/LiveKit media
+stack; live call-media participation would need a separate WebRTC engine plus the
+Element Call SFU. Files, images and voice messages are fully functional.
+
+Worked example: `crates/aqua-matrix-relay/examples/media_agent.rs`. Design notes:
+`docs/plans/2026-06-04-rich-media.md`. Full method/type reference: `docs/REFERENCE.md`.
+
 ## Environment Variables
 
 | Var | Purpose | Default |

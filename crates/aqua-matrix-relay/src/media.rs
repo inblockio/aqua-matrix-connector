@@ -122,3 +122,69 @@ pub(crate) fn from_file(c: &FileMessageEventContent) -> InboundMedia {
         waveform: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk::ruma::events::room::message::{
+        AudioInfo, UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock,
+    };
+    use matrix_sdk::ruma::events::room::ImageInfo;
+    use matrix_sdk::ruma::UInt;
+
+    // A throwaway unencrypted media source; the decoders only `.clone()` it into
+    // the handle, so the URI value itself is irrelevant to what we assert.
+    fn src() -> MediaSource {
+        MediaSource::Plain("mxc://example.org/abc123".into())
+    }
+
+    fn uint(n: u64) -> UInt {
+        UInt::new(n).expect("fits in UInt")
+    }
+
+    #[test]
+    fn image_carries_dimensions() {
+        let mut content = ImageMessageEventContent::new("pic.png".to_owned(), src());
+        let mut info = ImageInfo::new();
+        info.width = Some(uint(640));
+        info.height = Some(uint(480));
+        info.size = Some(uint(1234));
+        content.info = Some(Box::new(info));
+
+        let media = from_image(&content);
+        assert_eq!(media.kind, MediaKind::Image);
+        assert_eq!(media.width, Some(640));
+        assert_eq!(media.height, Some(480));
+        assert_eq!(media.size, Some(1234));
+        assert!(!media.is_voice);
+    }
+
+    #[test]
+    fn audio_with_voice_marker_is_voice() {
+        let mut content = AudioMessageEventContent::new("note.ogg".to_owned(), src());
+        content.audio = Some(UnstableAudioDetailsContentBlock::new(
+            Duration::from_millis(3_200),
+            Vec::new(),
+        ));
+        content.voice = Some(UnstableVoiceContentBlock::new());
+
+        let media = from_audio(&content);
+        assert_eq!(media.kind, MediaKind::Voice);
+        assert!(media.is_voice);
+        assert_eq!(media.duration_ms, Some(3_200));
+    }
+
+    #[test]
+    fn plain_audio_is_audio_not_voice() {
+        let mut content = AudioMessageEventContent::new("clip.mp3".to_owned(), src());
+        let mut info = AudioInfo::new();
+        info.duration = Some(Duration::from_millis(5_000));
+        content.info = Some(Box::new(info));
+
+        let media = from_audio(&content);
+        assert_eq!(media.kind, MediaKind::Audio);
+        assert!(!media.is_voice);
+        // Falls back to the AudioInfo duration when no MSC3245 audio block.
+        assert_eq!(media.duration_ms, Some(5_000));
+    }
+}

@@ -52,6 +52,26 @@ Each key file produces a unique DID and separate Matrix account. Convention on t
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the rationale (one daemon per surface, separate failure domains, no stateful mode-switching).
 
+### Rich media (files, images, voice, calls)
+
+Beyond text, the connector exposes rich media as **`AgentClient` methods** (async, `anyhow::Result`) for use from inside a `MessageHandler`. The one-shot CLI does not surface these yet — they are for agent backends. matrix-sdk auto-encrypts attachments on send and auto-decrypts on download, so all of this works inside E2E DMs.
+
+**Send** (`target` = peer MXID; `caption` shows as the message body):
+
+- `agent.send_image(target, path, caption).await?` — `m.image` (dimensions read from header bytes, no full decode)
+- `agent.send_file(target, path, caption).await?` — `m.file`
+- `agent.send_audio(target, path).await?` / `agent.send_video(target, path, caption).await?`
+- `agent.send_voice_message(target, path, duration_ms, waveform).await?` — `m.audio` with MSC3245 voice markers so Element X renders a waveform bubble. **You** supply `duration_ms` (known from encoding); `waveform: Option<Vec<f32>>` is synthesised if `None`. The connector does **not** decode audio — it computes neither duration nor waveform from the file.
+
+**Receive:** `InboundMessage` now carries `media: Option<InboundMedia>` (the seam the relay hands your handler). `InboundMedia` holds `kind` (`Image|Audio|Voice|Video|File`), `filename`, `mimetype`, `size`, `duration_ms`, `width`/`height`, `is_voice`, `waveform`, and a `handle`. For a captioned attachment, `msg.body` holds the caption. Fetch bytes on demand:
+
+- `agent.download_media(&media.handle).await?` → `Vec<u8>` (auto-decrypted)
+- `agent.download_media_to_temp(&media.handle, dir).await?` → `PathBuf`
+
+**Calls — signaling + detection ONLY, no live media.** `agent.ring_call(target).await?` sends an `m.call.notify` Ring (MSC4075) that makes a peer's Element X show an incoming call. Inbound call events arrive via a new default-no-op `MessageHandler::on_call(&self, agent, target, call: &InboundCall)`; the relay forwards `m.call.invite`/`m.call.notify`/`m.call.hangup` as an `InboundCall { signal: Invite|Ring|Hangup, call_id, sender_mxid, room_id }`. **The agent can ring a peer and detect invites/rings/hangups, but cannot place or carry an actual audio/video stream** — matrix-sdk 0.17 ships no WebRTC/LiveKit stack, so real call-media participation would need a separate WebRTC engine (e.g. webrtc-rs) + the Element Call SFU. Files / images / voice messages are fully functional.
+
+Worked example: [`crates/aqua-matrix-relay/examples/media_agent.rs`](crates/aqua-matrix-relay/examples/media_agent.rs). Design detail and the source-verified feasibility notes: [`docs/plans/2026-06-04-rich-media.md`](docs/plans/2026-06-04-rich-media.md).
+
 ### Build if binary is missing
 
 ```bash

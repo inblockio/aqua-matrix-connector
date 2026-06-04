@@ -12,6 +12,8 @@ This is now a Cargo workspace and a **reference implementation** for any agent b
 - **Library + CLI**: use `aqua_matrix_agent` as a crate in your own agent, or run the CLI directly
 - **Reference implementation**: a Cargo workspace where any backend can plug in via `MessageHandler` + `run_daemon` (see `aqua-matrix-relay`)
 - **Direct messaging**: send and read messages in DM rooms
+- **Rich media**: send/receive files, images, audio, video and MSC3245 voice messages over E2E DMs (auto-encrypted on send, auto-decrypted on download), exposed as `AgentClient` methods and surfaced to handlers via `InboundMessage.media`
+- **Call signaling**: ring a peer (`m.call.notify`) and detect inbound call invites/rings/hangups via `MessageHandler::on_call` — signaling + detection only, no WebRTC/live media
 - **Auto-join**: automatically accepts room invitations
 - **SQLite session store**: persists sync state across restarts
 
