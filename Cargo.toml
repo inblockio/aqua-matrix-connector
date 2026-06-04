@@ -45,3 +45,10 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
 schemars = "1"
+# Rich-media support (attachments/voice). `mime` matches matrix-sdk's re-exported
+# version (its `send_attachment` takes a `&mime::Mime`); `mime_guess` maps a
+# filename → content-type; `imagesize` reads image width/height from the header
+# bytes WITHOUT a full decode (so the connector stays light — no `image` crate).
+mime = "0.3"
+mime_guess = "2"
+imagesize = "0.13"

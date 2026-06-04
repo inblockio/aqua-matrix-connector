@@ -61,8 +61,14 @@ use matrix_sdk::{
 // Re-export everything a handler crate needs so it can depend on ONLY this
 // crate (plus tokio for its `main`). A new agent never imports matrix-sdk.
 // ReplyStream / TypingGuard let handlers stream answers and show "typing…".
-pub use aqua_matrix_agent::{load_dotenv, AgentClient, AgentConfig, ReplyStream, TypingGuard};
+// MediaHandle / MediaKind ride on [`InboundMedia`] so a handler can name an
+// attachment's kind and download it without touching matrix-sdk.
+pub use aqua_matrix_agent::{
+    load_dotenv, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream, TypingGuard,
+};
 pub use async_trait::async_trait;
+
+mod media;
 
 /// Rotate the client `REFRESH_GUARD_SECS` before the access token expires. 30 s
 /// gives the refresh-grant round trip + a fresh initial sync ample headroom
@@ -78,11 +84,77 @@ const MIN_CYCLE_SECS: u64 = 15;
 /// restarts.
 const MAX_CONNECT_FAILURES: u32 = 3;
 
-/// One inbound text message, decoded from Matrix for a [`MessageHandler`].
+/// An inbound attachment (image / audio / voice / video / file), decoded from a
+/// Matrix media event for a [`MessageHandler`].
 ///
-/// All borrowed fields point at the live sync event (or a local owned by
-/// [`dispatch`]) for the duration of the `handle_message` call; nothing here
-/// outlives it.
+/// The metadata is enough to decide *whether* to fetch the bytes; the actual
+/// (decrypted) bytes are pulled on demand via
+/// [`AgentClient::download_media`](aqua_matrix_agent::AgentClient::download_media)
+/// or [`download_media_to_temp`](aqua_matrix_agent::AgentClient::download_media_to_temp),
+/// passing [`handle`](Self::handle). All of this without the handler naming a
+/// Matrix type — the `MediaSource` is sealed inside the [`MediaHandle`].
+pub struct InboundMedia {
+    /// Which kind of attachment this is (an `m.audio` with the MSC3245 voice
+    /// marker reports [`MediaKind::Voice`], not [`MediaKind::Audio`]).
+    pub kind: MediaKind,
+    /// The attachment's filename (or the event body when no filename was set).
+    pub filename: String,
+    /// Declared content-type, when the sender provided one.
+    pub mimetype: Option<String>,
+    /// Declared size in bytes, when known.
+    pub size: Option<u64>,
+    /// Playback duration in milliseconds for audio/voice/video, when known.
+    pub duration_ms: Option<u64>,
+    /// Pixel width for images/video, when known.
+    pub width: Option<u64>,
+    /// Pixel height for images/video, when known.
+    pub height: Option<u64>,
+    /// True iff this is a voice message (carries the MSC3245 `voice` marker).
+    pub is_voice: bool,
+    /// Voice-message amplitude bars (`0..=1024` each), when present.
+    pub waveform: Option<Vec<u16>>,
+    /// Opaque handle to fetch the bytes; pass to `AgentClient::download_media`.
+    pub handle: MediaHandle,
+}
+
+/// The kind of call-signaling event observed in the DM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallSignal {
+    /// Legacy 1:1 VoIP invite (`m.call.invite`).
+    Invite,
+    /// MatrixRTC / Element Call ring (`m.call.notify`, MSC4075) — the signal
+    /// Element X emits to make a peer's client show an incoming call.
+    Ring,
+    /// A call ended (`m.call.hangup`).
+    Hangup,
+}
+
+/// An inbound call-signaling event, normalized for a [`MessageHandler`].
+///
+/// **Signaling only.** matrix-sdk carries no WebRTC media, so this tells a
+/// handler that a call was rung / invited / ended; it does NOT provide an
+/// audio/video stream. Use it to react to a call (notify a human, auto-decline,
+/// log, ring back via [`AgentClient::ring_call`](aqua_matrix_agent::AgentClient::ring_call)),
+/// not to join media.
+#[derive(Clone, Debug)]
+pub struct InboundCall {
+    /// Which signal this is.
+    pub signal: CallSignal,
+    /// The call/session id the signal carries.
+    pub call_id: String,
+    /// The MXID that sent the signal.
+    pub sender_mxid: String,
+    /// The room the signal arrived in.
+    pub room_id: String,
+}
+
+/// One inbound message, decoded from Matrix for a [`MessageHandler`].
+///
+/// Borrowed fields point at the live sync event (or a local owned by
+/// [`dispatch`]) for the duration of the `handle_message` call; nothing borrowed
+/// here outlives it. A media message (image/audio/voice/video/file) carries
+/// [`media`](Self::media) — and `body` then holds the caption text (possibly
+/// empty), while the filename and metadata live on the [`InboundMedia`].
 pub struct InboundMessage<'a> {
     pub sender_mxid: &'a str,
     // SEAM(aqua-security): user proxy key. `sender_did` is `None` this phase; it
@@ -96,8 +168,11 @@ pub struct InboundMessage<'a> {
     pub event_id: &'a str,
     pub room_id: &'a str,
     pub timestamp_ms: u64,
-    pub msgtype: &'a str, // "m.text", …
+    pub msgtype: &'a str, // "m.text", "m.image", "m.audio", …
     pub body: &'a str,
+    /// `Some` for an attachment message; carries the kind/metadata and a handle
+    /// to download the (decrypted) bytes. `None` for a plain text message.
+    pub media: Option<InboundMedia>,
 }
 
 /// A concrete agent backend. The relay owns the Matrix lifecycle; the handler
@@ -164,6 +239,18 @@ pub trait MessageHandler: Send + Sync + 'static {
         target: &str,
         msg: &InboundMessage<'_>,
     ) -> anyhow::Result<()>;
+
+    /// Handle an inbound call-signaling event (invite / Element-Call ring /
+    /// hangup) from `target`, already sender-authorized by the relay. The
+    /// default is a no-op, so existing handlers are unaffected.
+    ///
+    /// **Signaling only** — there is no media stream (see [`InboundCall`]). React
+    /// to the call (notify a human, auto-decline, log, ring back via
+    /// [`AgentClient::ring_call`](aqua_matrix_agent::AgentClient::ring_call)); you
+    /// cannot join audio/video from here. Unlike `handle_message`, a call event is
+    /// not deduplicated by the watermark, so a recent signal may re-fire after a
+    /// client rotation/restart — keep `on_call` idempotent.
+    async fn on_call(&self, _agent: &AgentClient, _target: &str, _call: &InboundCall) {}
 }
 
 /// Run the agent daemon forever: connect, serve, rotate, repeat. Only returns
@@ -397,6 +484,10 @@ async fn run_cycle<H: MessageHandler>(
     shutdown: &Notify,
 ) -> &'static str {
     register_handler(agent.clone(), target.clone(), handler.clone(), watermark);
+    // Surface inbound call signaling (invite / Element-Call ring / hangup) to the
+    // handler's `on_call`. Separate from `register_handler` because call events
+    // are distinct event types, not room messages.
+    register_call_handler(agent.clone(), target.clone(), handler.clone());
     // Auto-join invites as they arrive on the sync stream (not only at cycle
     // start), so an invite the peer sends mid-cycle — or just after connect,
     // before the startup join sees it — is still joined and recorded as the DM.
@@ -529,6 +620,114 @@ fn register_handler<H: MessageHandler>(
     });
 }
 
+/// Install sync handlers for the three call-signaling events we care about:
+/// legacy `m.call.invite`/`m.call.hangup` and the MatrixRTC `m.call.notify`
+/// (MSC4075) ring that Element Call emits. Each is authorized by sender and
+/// forwarded to [`MessageHandler::on_call`]. (Signaling only — no media.)
+// `m.call.notify` is deprecated in ruma in favour of `m.rtc.notification`, but
+// it is still what current Element clients emit, so we read it deliberately.
+#[allow(deprecated)]
+fn register_call_handler<H: MessageHandler>(
+    agent: AgentClient,
+    target: Arc<String>,
+    handler: Arc<H>,
+) {
+    use matrix_sdk::ruma::events::call::{
+        hangup::OriginalSyncCallHangupEvent, invite::OriginalSyncCallInviteEvent,
+        notify::OriginalSyncCallNotifyEvent,
+    };
+
+    let client = agent.client().clone();
+
+    client.add_event_handler({
+        let agent = agent.clone();
+        let target = target.clone();
+        let handler = handler.clone();
+        move |ev: OriginalSyncCallInviteEvent, room: Room| {
+            let agent = agent.clone();
+            let target = target.clone();
+            let handler = handler.clone();
+            async move {
+                dispatch_call(
+                    &agent,
+                    &target,
+                    &handler,
+                    CallSignal::Invite,
+                    ev.content.call_id.to_string(),
+                    ev.sender.as_str(),
+                    room.room_id().as_str(),
+                )
+                .await;
+            }
+        }
+    });
+
+    client.add_event_handler({
+        let agent = agent.clone();
+        let target = target.clone();
+        let handler = handler.clone();
+        move |ev: OriginalSyncCallNotifyEvent, room: Room| {
+            let agent = agent.clone();
+            let target = target.clone();
+            let handler = handler.clone();
+            async move {
+                dispatch_call(
+                    &agent,
+                    &target,
+                    &handler,
+                    CallSignal::Ring,
+                    ev.content.call_id.clone(),
+                    ev.sender.as_str(),
+                    room.room_id().as_str(),
+                )
+                .await;
+            }
+        }
+    });
+
+    client.add_event_handler({
+        move |ev: OriginalSyncCallHangupEvent, room: Room| {
+            let agent = agent.clone();
+            let target = target.clone();
+            let handler = handler.clone();
+            async move {
+                dispatch_call(
+                    &agent,
+                    &target,
+                    &handler,
+                    CallSignal::Hangup,
+                    ev.content.call_id.to_string(),
+                    ev.sender.as_str(),
+                    room.room_id().as_str(),
+                )
+                .await;
+            }
+        }
+    });
+}
+
+/// Authorize a call signal by sender and forward it to the handler's `on_call`.
+async fn dispatch_call<H: MessageHandler>(
+    agent: &AgentClient,
+    target: &str,
+    handler: &Arc<H>,
+    signal: CallSignal,
+    call_id: String,
+    sender: &str,
+    room_id: &str,
+) {
+    if !handler.authorize(sender, target) {
+        return;
+    }
+    let call = InboundCall {
+        signal,
+        call_id,
+        sender_mxid: sender.to_string(),
+        room_id: room_id.to_string(),
+    };
+    handler.on_call(agent, target, &call).await;
+}
+
 async fn dispatch<H: MessageHandler>(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -563,10 +762,29 @@ async fn dispatch<H: MessageHandler>(
         });
     }
 
-    let body = match &ev.content.msgtype {
-        MessageType::Text(t) => t.body.trim().to_string(),
-        // Non-text content carries nothing for a handler; ignore without
-        // advancing the watermark (the ts check still prevents reprocessing).
+    // Text → body only. Media (image/audio/voice/video/file) → an `InboundMedia`
+    // plus the caption as `body` (so a captioned image reads naturally). Other
+    // msgtypes (notice, emote, location, verification…) carry nothing actionable
+    // for a handler; ignore them without advancing the watermark (the ts check
+    // still prevents reprocessing).
+    let (body, media) = match &ev.content.msgtype {
+        MessageType::Text(t) => (t.body.trim().to_string(), None),
+        MessageType::Image(c) => (
+            c.caption().unwrap_or("").trim().to_string(),
+            Some(media::from_image(c)),
+        ),
+        MessageType::Audio(c) => (
+            c.caption().unwrap_or("").trim().to_string(),
+            Some(media::from_audio(c)),
+        ),
+        MessageType::Video(c) => (
+            c.caption().unwrap_or("").trim().to_string(),
+            Some(media::from_video(c)),
+        ),
+        MessageType::File(c) => (
+            c.caption().unwrap_or("").trim().to_string(),
+            Some(media::from_file(c)),
+        ),
         _ => return,
     };
 
@@ -582,7 +800,9 @@ async fn dispatch<H: MessageHandler>(
         })
         .ok();
 
-    if body.is_empty() {
+    // Drop only a truly empty message: an attachment with no caption still has
+    // `media`, so it must dispatch even though `body` is empty.
+    if body.is_empty() && media.is_none() {
         return;
     }
 
@@ -594,6 +814,7 @@ async fn dispatch<H: MessageHandler>(
         timestamp_ms: ts_ms,
         msgtype: ev.content.msgtype.msgtype(),
         body: &body,
+        media,
     };
 
     // The relay never unwinds on a handler error: log it at `warn` and keep

@@ -4,8 +4,12 @@
 // the bound is hit through this crate's public API so the limit stays here).
 #![recursion_limit = "256"]
 
+mod call;
+mod media;
 mod recovery;
 mod registry;
+
+pub use media::{MediaHandle, MediaKind};
 
 use anyhow::{anyhow, Context, Result};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -651,35 +655,10 @@ impl AgentClient {
         let target: &UserId = target
             .try_into()
             .map_err(|e| anyhow!("invalid target: {e}"))?;
-        let room = match self.find_dm_room(target).await {
-            Some(room) => room,
-            None => self
-                .client
-                .create_dm(target)
-                .await
-                .context("create_dm failed")?,
-        };
-        // Best-effort: mark the room as a direct chat (m.direct global account
-        // data) so it is resolvable server-side after a local store wipe. Only
-        // mark when the room isn't ALREADY recorded as the DM for this target:
-        // matrix-sdk's `mark_as_dm` appends to the m.direct list without
-        // deduping, so marking on every send would grow the list with duplicate
-        // room IDs unboundedly. `get_dm_room` reads the synced m.direct state.
-        // Never fail the send because marking failed.
-        let already_marked = self
-            .client
-            .get_dm_room(target)
-            .is_some_and(|r| r.room_id() == room.room_id());
-        if !already_marked {
-            if let Err(e) = self
-                .client
-                .account()
-                .mark_as_dm(room.room_id(), &[target.to_owned()])
-                .await
-            {
-                tracing::warn!("failed to mark room as DM (m.direct): {e:#}");
-            }
-        }
+        // Resolve (or create) the DM room and best-effort mark it as a direct
+        // chat. Shared with every media send via `ensure_dm_room` (see media.rs)
+        // so text and attachments always land in the same Megolm session.
+        let room = self.ensure_dm_room(target).await?;
         // Render the body as Markdown so Element (Web + X) display formatted
         // text. `text_markdown` attaches an `org.matrix.custom.html`
         // formatted_body (rendered HTML) and keeps the raw text as the plain
