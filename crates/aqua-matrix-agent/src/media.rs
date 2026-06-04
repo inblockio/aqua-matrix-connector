@@ -38,9 +38,11 @@ use matrix_sdk::attachment::{
     AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo,
 };
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
-use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
+use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::events::room::message::{MessageType, TextMessageEventContent};
 use matrix_sdk::ruma::events::room::MediaSource;
-use matrix_sdk::ruma::{UInt, UserId};
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent};
+use matrix_sdk::ruma::{RoomId, UInt, UserId};
 use mime::Mime;
 
 use crate::AgentClient;
@@ -350,6 +352,108 @@ impl AgentClient {
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
+    }
+
+    /// Scan the most recent `limit` timeline events of `room_id` and return every
+    /// media attachment found, newest first, as `(kind, handle)` pairs ready to
+    /// pass to [`download_media`](Self::download_media). Text/notice/state events
+    /// are skipped; undecryptable events are skipped silently. The same field
+    /// extraction the relay performs on a live event, applied to history — handy
+    /// for a backend that wants to enumerate attachments after a sync.
+    pub async fn recent_media(
+        &self,
+        room_id: &str,
+        limit: u16,
+    ) -> Result<Vec<(MediaKind, MediaHandle)>> {
+        let room_id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let room = self
+            .client()
+            .get_room(room_id)
+            .ok_or_else(|| anyhow!("room {room_id} not found"))?;
+
+        let mut opts = MessagesOptions::backward();
+        opts.limit = UInt::from(limit);
+        let resp = room
+            .messages(opts)
+            .await
+            .context("failed to fetch messages")?;
+
+        let mut out = Vec::new();
+        for event in resp.chunk {
+            // Skip undecryptable (UTD) and non-message events.
+            if event.kind.is_utd() {
+                continue;
+            }
+            let Ok(deserialized) = event.raw().deserialize() else {
+                continue;
+            };
+            let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                msg_event,
+            )) = deserialized
+            else {
+                continue;
+            };
+            let Some(original) = msg_event.as_original() else {
+                continue;
+            };
+            if let Some(pair) = media_pair(&original.content.msgtype) {
+                out.push(pair);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Map a `MessageType` to `(kind, handle)` for the four attachment msgtypes,
+/// pulling `source` / `filename` / `mimetype` / `size` exactly as the relay's
+/// decoders do. An `m.audio` carrying the MSC3245 voice marker reports
+/// [`MediaKind::Voice`]. Returns `None` for non-media msgtypes (text/etc.).
+fn media_pair(msgtype: &MessageType) -> Option<(MediaKind, MediaHandle)> {
+    match msgtype {
+        MessageType::Image(c) => {
+            let info = c.info.as_deref();
+            let mimetype = info.and_then(|i| i.mimetype.clone());
+            let size = info.and_then(|i| i.size).map(u64::from);
+            Some((
+                MediaKind::Image,
+                MediaHandle::new(c.source.clone(), c.filename().to_string(), mimetype, size),
+            ))
+        }
+        MessageType::Audio(c) => {
+            let info = c.info.as_deref();
+            let mimetype = info.and_then(|i| i.mimetype.clone());
+            let size = info.and_then(|i| i.size).map(u64::from);
+            let kind = if c.voice.is_some() {
+                MediaKind::Voice
+            } else {
+                MediaKind::Audio
+            };
+            Some((
+                kind,
+                MediaHandle::new(c.source.clone(), c.filename().to_string(), mimetype, size),
+            ))
+        }
+        MessageType::Video(c) => {
+            let info = c.info.as_deref();
+            let mimetype = info.and_then(|i| i.mimetype.clone());
+            let size = info.and_then(|i| i.size).map(u64::from);
+            Some((
+                MediaKind::Video,
+                MediaHandle::new(c.source.clone(), c.filename().to_string(), mimetype, size),
+            ))
+        }
+        MessageType::File(c) => {
+            let info = c.info.as_deref();
+            let mimetype = info.and_then(|i| i.mimetype.clone());
+            let size = info.and_then(|i| i.size).map(u64::from);
+            Some((
+                MediaKind::File,
+                MediaHandle::new(c.source.clone(), c.filename().to_string(), mimetype, size),
+            ))
+        }
+        _ => None,
     }
 }
 
