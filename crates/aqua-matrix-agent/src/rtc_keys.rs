@@ -395,21 +395,17 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
-        // Build the wire JSON by hand so `keys` is a SINGLE OBJECT (Element X's
-        // shape), which the typed struct's derived `Serialize` would otherwise
-        // render as an array. `membershipID` = "<user>:<device>" is exactly the
-        // LiveKit participant identity, matching Element X's m.call.member.
-        let membership_id = format!("{own_user}:{device_id}");
+        // Mirror Element X's verbatim `io.element.call.encryption_keys` wire shape
+        // (captured live from a real Element X client): `keys` is an ARRAY of
+        // `{index,key}`, and `member.claimed_device_id` carries the sending
+        // device — that, plus the to-device `sender`, is how the peer maps the key
+        // to our LiveKit identity `<user>:<device>`. (`member.id` is a per-session
+        // id on the Element X side; we send our user_id, which the receiver does
+        // not use for identity — `claimed_device_id` is the load-bearing field.)
         let content = serde_json::json!({
-            // Single object, NOT an array — matches Element X's ToDeviceKeyTransport.
-            "keys": { "index": key_index, "key": base64_encode(key) },
-            // Element-X-style device identification (top-level).
-            "device_id": device_id,
-            "membershipID": membership_id,
-            // Legacy member object kept for agent-to-agent attribution.
-            "member": { "id": own_user, "claimed_device_id": device_id },
-            // Room-scoped m.call session default.
-            "session": { "call_id": "", "application": "m.call", "scope": "m.room" },
+            "keys": [ { "index": key_index, "key": base64_encode(key) } ],
+            "member": { "claimed_device_id": device_id, "id": own_user },
+            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
             "room_id": room_id,
             "sent_ts": now_ms(),
         });
@@ -764,37 +760,35 @@ mod tests {
     /// plus Element-X-style device identification (`device_id` + `membershipID`).
     /// This mirrors the JSON `send_call_encryption_keys` builds.
     #[test]
-    fn send_side_emits_keys_as_single_object() {
+    fn send_side_emits_keys_as_array_matching_element_x() {
         let (key_bytes, key_b64) = sample_key();
         let own_user = "@agent:matrix.inblock.io";
         let device_id = "ABCDEFGHIJ";
-        let membership_id = format!("{own_user}:{device_id}");
 
-        // Exactly the JSON the send path constructs.
+        // Exactly the JSON the send path constructs — mirroring the verbatim
+        // Element X `io.element.call.encryption_keys` shape captured live.
         let content = json!({
-            "keys": { "index": 3, "key": base64_encode(&key_bytes) },
-            "device_id": device_id,
-            "membershipID": membership_id,
-            "member": { "id": own_user, "claimed_device_id": device_id },
-            "session": { "call_id": "", "application": "m.call", "scope": "m.room" },
+            "keys": [ { "index": 3, "key": base64_encode(&key_bytes) } ],
+            "member": { "claimed_device_id": device_id, "id": own_user },
+            "session": { "application": "m.call", "call_id": "", "scope": "m.room" },
             "room_id": "!room:matrix.inblock.io",
             "sent_ts": 1u64,
         });
 
-        // `keys` is an OBJECT, not an array.
-        assert!(content["keys"].is_object(), "send must emit keys as a single object");
-        assert!(!content["keys"].is_array());
-        assert_eq!(content["keys"]["index"], 3);
-        assert_eq!(content["keys"]["key"], key_b64);
-        // Element-X-style identity present at top level.
-        assert_eq!(content["device_id"], device_id);
-        assert_eq!(content["membershipID"], format!("{own_user}:{device_id}"));
+        // `keys` is an ARRAY (Element X's shape), and member.claimed_device_id
+        // carries the sending device.
+        assert!(content["keys"].is_array(), "send must emit keys as an array (Element X shape)");
+        assert_eq!(content["keys"][0]["index"], 3);
+        assert_eq!(content["keys"][0]["key"], key_b64);
+        assert_eq!(content["member"]["claimed_device_id"], device_id);
 
-        // And our own permissive receiver still parses it back to one CallKey.
+        // Our own permissive receiver still parses it back to one CallKey, and
+        // extracts the device from member.claimed_device_id.
         let parsed: CallEncryptionKeysEventContent =
             serde_json::from_value(content).expect("our receiver accepts our own send shape");
         assert_eq!(parsed.keys.len(), 1);
         assert_eq!(parsed.keys[0].index, 3);
+        assert_eq!(extract_sender_device_id(&parsed).as_deref(), Some(device_id));
     }
 
     /// Device-id extraction fallbacks: member.device_id, membershipID parsing
