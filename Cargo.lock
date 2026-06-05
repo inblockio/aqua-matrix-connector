@@ -156,6 +156,7 @@ dependencies = [
  "dotenvy",
  "imagesize",
  "matrix-sdk",
+ "matrix-sdk-base",
  "mime",
  "mime_guess",
  "reqwest 0.12.28",
