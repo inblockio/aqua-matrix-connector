@@ -8,8 +8,13 @@ mod call;
 mod media;
 mod recovery;
 mod registry;
+mod rtc_keys;
 
 pub use media::{MediaHandle, MediaKind};
+pub use rtc_keys::{
+    CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CallMember, CallSession,
+    CALL_ENCRYPTION_KEYS_TYPE,
+};
 
 use anyhow::{anyhow, Context, Result};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

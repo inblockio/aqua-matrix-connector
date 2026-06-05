@@ -28,7 +28,15 @@ aqua-matrix-gating = { path = "crates/aqua-matrix-gating" }
 aqua-matrix-orchestrator = { path = "crates/aqua-matrix-orchestrator" }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
-matrix-sdk = { version = "0.17", features = ["markdown"] }
+# `experimental-send-custom-to-device` gates `Encryption::encrypt_and_send_raw_to_device`,
+# which the call-media interop (`rtc_keys.rs`) uses to Olm-encrypt the custom
+# `io.element.call.encryption_keys` to-device event Element Call expects.
+matrix-sdk = { version = "0.17", features = ["markdown", "experimental-send-custom-to-device"] }
+# `CollectStrategy` (the share-strategy arg of `encrypt_and_send_raw_to_device`)
+# lives in matrix-sdk-base's crypto re-export and is NOT publicly re-exported by
+# matrix-sdk itself, so the call-media-key transport names it directly. Pinned to
+# the same 0.17 as matrix-sdk (they version in lockstep).
+matrix-sdk-base = { version = "0.17", features = ["e2e-encryption"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 anyhow = "1"

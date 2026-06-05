@@ -21,6 +21,9 @@ uuid = { workspace = true, optional = true }
 
 siwx-oidc-auth.workspace = true
 matrix-sdk.workspace = true
+# Only for `CollectStrategy`, which matrix-sdk takes but does not re-export
+# (see workspace Cargo.toml). Used by the call-media-key transport (rtc_keys.rs).
+matrix-sdk-base.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true

@@ -155,6 +155,218 @@ async fn e2ee_bidirectional_messaging() {
     println!("  Messages verified decryptable in both directions");
 }
 
+/// Minimal, dependency-free SHA-256 (FIPS 180-4). Used only by the room-mapping
+/// proof test to recompute lk-jwt-service's LiveKit room alias locally, so the
+/// test has no new crate deps and is reproducible offline.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bitlen = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Standard base64 (RFC 4648 alphabet, `+/`) WITHOUT padding — exactly what Go's
+/// `unpaddedBase64.EncodeToString` (matrix base64.RawStdEncoding) produces, which
+/// lk-jwt-service uses to encode the SHA-256 LiveKit room alias.
+fn unpadded_base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Recompute the LiveKit room alias EXACTLY as lk-jwt-service does for a given
+/// Matrix room id, mirroring its Go:
+///   slotId := "m.call#ROOM"
+///   raw    := json.Marshal([]string{req.Room, slotId})
+///   alias  := unpaddedBase64(sha256(raw))
+/// This lets the test assert the agent's minted `video.room` equals what Element
+/// Call's legacy `/sfu/get` request (which sends `room: <matrixRoomId>`) yields.
+fn expected_livekit_alias(matrix_room_id: &str) -> String {
+    // `json.Marshal([]string{a, b})` => `["a","b"]` with Go's default string
+    // escaping. For a Matrix room id (`!localpart:server`) and the fixed slot id
+    // there are no characters Go and serde_json escape differently, so
+    // serde_json reproduces the same bytes lk-jwt hashes.
+    let raw = serde_json::to_string(&[matrix_room_id, "m.call#ROOM"]).unwrap();
+    unpadded_base64(&sha256(raw.as_bytes()))
+}
+
+/// DECISIVE room-mapping proof: does the aqua agent's minted LiveKit `video.room`
+/// for a FIXED Matrix room id equal the alias Element Call's legacy `/sfu/get`
+/// would derive for the SAME room id?
+///
+/// lk-jwt-service derives `video.room = unpaddedBase64(sha256(json([room,
+/// "m.call#ROOM"])))` (NOT the raw `room`). Element Call's legacy request sends
+/// `room: <matrixRoomId>` (the raw Matrix room id; source comment: "uses only the
+/// matrix room id to calculate the livekit room alias"). The agent ALSO sends
+/// `room: <matrixRoomId>`. So if the agent passes the verbatim Matrix room id,
+/// its `video.room` MUST equal `expected_livekit_alias(room_id)` — which is the
+/// same value Element Call gets. This test proves that equality end-to-end
+/// against the live homeserver for the operator's room.
+#[tokio::test]
+async fn rtc_room_alias_matches_element_call() {
+    tracing_subscriber::fmt()
+        .with_env_filter("warn,aqua_matrix_agent=info")
+        .try_init()
+        .ok();
+
+    // The operator's real room, fixed so the alias is reproducible.
+    const ROOM_ID: &str = "!DkKJdSFKrQgAZACWKm:matrix.inblock.io";
+
+    clean_store("/tmp/aqua-e2e-roomalias");
+    let agent = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-roomalias"))
+        .await
+        .expect("agent failed to connect");
+    let device_id = agent.device_id().expect("agent has no device_id");
+    println!("agent {} device {device_id}", agent.user_id());
+
+    let openid_token = agent
+        .request_openid_token()
+        .await
+        .expect("request_openid_token failed");
+
+    // EXACT body the call agent's fetch_livekit_token sends, with the REAL room id.
+    let body = serde_json::json!({
+        "room": ROOM_ID,
+        "openid_token": openid_token,
+        "device_id": device_id,
+    });
+    let endpoint = "https://matrix.inblock.io/livekit/jwt/sfu/get";
+    let resp = reqwest::Client::new()
+        .post(endpoint)
+        .json(&body)
+        .send()
+        .await
+        .expect("POST to lk-jwt-service failed");
+    let status = resp.status();
+    let text = resp.text().await.expect("read body");
+    assert!(status.is_success(), "lk-jwt HTTP {status}: {text}");
+
+    let json: serde_json::Value = serde_json::from_str(&text).expect("response not JSON");
+    let jwt = json
+        .get("jwt")
+        .or_else(|| json.get("token"))
+        .and_then(|v| v.as_str())
+        .expect("no jwt in response");
+    let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+
+    let payload = b64url_decode(jwt.split('.').nth(1).expect("no payload segment"))
+        .and_then(|b| String::from_utf8(b).ok())
+        .expect("payload not utf8");
+    let claims: serde_json::Value = serde_json::from_str(&payload).expect("payload not JSON");
+    let actual_room = claims
+        .pointer("/video/room")
+        .and_then(|v| v.as_str())
+        .expect("no /video/room claim");
+    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
+
+    let expected = expected_livekit_alias(ROOM_ID);
+
+    println!("\n=== ROOM ALIAS MAPPING PROOF ===");
+    println!("matrix room id        : {ROOM_ID}");
+    println!("SFU url                : {url}");
+    println!("JWT sub (identity)     : {sub}");
+    println!("JWT video.room (actual): {actual_room}");
+    println!("locally-derived alias  : {expected}");
+    println!("Element Call would get : {expected}  (it sends room: <matrixRoomId> too)");
+    println!(
+        "MATCH                  : {}",
+        if actual_room == expected { "YES" } else { "NO" }
+    );
+
+    assert_eq!(
+        actual_room, expected,
+        "agent's minted video.room does NOT equal the lk-jwt alias for this room id — \
+         room derivation mismatch"
+    );
+    println!(
+        "\nVERDICT: agent and Element Call land in the SAME LiveKit room ({actual_room}) \
+         for {ROOM_ID}."
+    );
+}
+
 /// Decode a base64url (no padding) string — the encoding used by JWT segments.
 /// Returns `None` on any invalid byte so a malformed claim can't panic the test.
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
