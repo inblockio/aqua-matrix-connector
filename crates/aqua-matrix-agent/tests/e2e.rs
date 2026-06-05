@@ -615,9 +615,11 @@ async fn rtc_member_advertise() {
         let room = reader.client().get_room(rid)?;
         let user: OwnedUserId = member_user.try_into().unwrap();
         for underscore in [true, false] {
+            // member_id = `{device}_m.call`, matching what set_rtc_member writes
+            // (the format the deployed Element Call uses).
             let key = CallMemberStateKey::new(
                 user.clone(),
-                Some(member_device.to_owned()),
+                Some(format!("{member_device}_m.call")),
                 underscore,
             );
             // Typed read: proves the stored event deserializes to the strongly

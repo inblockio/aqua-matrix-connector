@@ -99,17 +99,18 @@ impl AgentClient {
             .ok_or_else(|| anyhow!("room {room_id} not found / not joined"))
     }
 
-    /// Build the MSC3401/MSC4143 call-member state key for THIS user+device.
+    /// Build the MSC3401 call-member state key for THIS user+device, matching
+    /// the format the deployed Element Call (`call.element.io`) actually writes.
     ///
-    /// Modern Element Call uses MSC3757 "owned" state events: the key is
-    /// `_{user_id}_{device_id}` — the **leading underscore** marks it as an
-    /// owned state event so the sending user is allowed to set a state key that
-    /// embeds an `@user` mxid under the room's default power levels. The
-    /// `member_id` portion is the bare device id (matrix-js-sdk
-    /// `MatrixRTCSession.makeMembershipStateKey` appends **no** `_m.call`
-    /// application suffix). The leading underscore is dropped only on servers
-    /// without MSC3757 owned-state-event support — see [`rtc_member_state_key`]'s
-    /// `underscore` argument and the e2e probe in `tests/e2e.rs`.
+    /// Ground truth from the live Element Call JS bundle (and matrix-js-sdk
+    /// `MatrixRTCSession.makeMembershipStateKey`, cross-checked against ruma's
+    /// own `CallMemberStateKey` doc example `_@test:user.org_DEVICE_m.call`):
+    /// the key is **`_{user_id}_{device_id}_m.call`** — i.e. the `member_id`
+    /// segment is `{device_id}_{application}` (`m.call`), NOT the bare device id.
+    /// The **leading underscore** is the MSC3757 "owned state event" marker that
+    /// lets the sender set a state key embedding its own `@user` mxid; servers
+    /// without MSC3757 reject it, so [`set_rtc_member`](Self::set_rtc_member)
+    /// falls back to the unprefixed `{user_id}_{device_id}_m.call`.
     fn rtc_member_state_key(&self, underscore: bool) -> Result<CallMemberStateKey> {
         let user_id: OwnedUserId = self
             .user_id()
@@ -118,7 +119,10 @@ impl AgentClient {
         let device_id = self
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot set RTC membership"))?;
-        Ok(CallMemberStateKey::new(user_id, Some(device_id), underscore))
+        // member_id = `{device_id}_m.call` (device + application), per the
+        // deployed Element Call. ruma renders the key as `_{user}_{member_id}`.
+        let member_id = format!("{device_id}_m.call");
+        Ok(CallMemberStateKey::new(user_id, Some(member_id), underscore))
     }
 
     /// Publish this agent's **MatrixRTC membership** (`org.matrix.msc3401.call.member`)
