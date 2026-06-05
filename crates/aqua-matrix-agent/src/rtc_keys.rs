@@ -23,15 +23,29 @@
 //! call backend feeds the received keys into its LiveKit `KeyProvider` and hands
 //! its own generated keys here to publish.
 //!
-//! ## Wire format (matrix-js-sdk `ToDeviceKeyTransport`, ground-truthed live)
+//! ## Wire format (TWO shapes, both accepted on receive)
 //!
-//! Event type: `io.element.call.encryption_keys`. Decrypted to-device content:
-//! ```json
-//! { "keys": [ { "index": <u8>, "key": "<base64 of 16 random bytes>" } ],
-//!   "member": { "id": "<sender user_id>", "claimed_device_id": "<sender device_id>" },
-//!   "session": { "call_id": "", "application": "m.call", "scope": "m.room" },
-//!   "room_id": "<room id>", "sent_ts": <ms> }
-//! ```
+//! Event type: `io.element.call.encryption_keys`. The decrypted to-device
+//! content's `keys` field is **NOT** the same shape on every transport:
+//!
+//! * matrix-js-sdk / agent-to-agent (legacy here) sends an **array**:
+//!   ```json
+//!   { "keys": [ { "index": <u8>, "key": "<base64>" } ], "member": {...}, ... }
+//!   ```
+//! * Element X's `ToDeviceKeyTransport` sends `keys` as a **single object**
+//!   (live failure: `invalid type: map, expected a sequence`):
+//!   ```json
+//!   { "keys": { "index": <u8>, "key": "<base64>" }, ... }
+//!   ```
+//!   and an index→key **map** (`{ "0": "<base64>" }`) is also tolerated.
+//!
+//! The lenient [`deserialize_keys`] below accepts all three and normalises to
+//! `Vec<CallKey>`. The exact verbatim Element X content shape (the `member` /
+//! `session` / any extra top-level fields) is **still unconfirmed** — it failed
+//! to deserialize before any logging ran. The receive handler now ALWAYS
+//! deserializes (member/session/extra are `serde_json::Value`) and logs the
+//! verbatim content as pretty JSON, so the next live operator call reveals the
+//! true shape from the `RX io.element.call.encryption_keys` banner.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,7 +57,7 @@ use matrix_sdk::{
     encryption::identities::Device,
     ruma::{events::macros::EventContent, events::AnyToDeviceEventContent, serde::Raw, RoomId},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::mpsc;
 
 use crate::AgentClient;
@@ -66,31 +80,63 @@ pub struct CallKey {
     pub key: String,
 }
 
-/// The sending participant's identity, as Element Call reports it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallMember {
-    /// The sender's Matrix user id.
-    pub id: String,
-    /// The sender's Matrix device id (the LiveKit identity is `<id>:<device>`).
-    pub claimed_device_id: String,
-}
+/// Lenient deserializer for the `keys` field, accepting EVERY shape seen on the
+/// wire and normalising to `Vec<CallKey>`. Without this, Element X's
+/// single-object `keys` makes the whole typed to-device event fail to
+/// deserialize (live: `invalid type: map, expected a sequence`), so the
+/// handler body never runs and no key is ever installed.
+///
+/// Accepts:
+/// * a JSON **array**            `[ {"index":N,"key":"b64"}, ... ]` (legacy / matrix-js-sdk)
+/// * a single **object**         `{"index":N,"key":"b64"}`          (Element X to-device)
+/// * an index→key **map**        `{"0":"b64","1":"b64"}`            (tolerated)
+///
+/// An empty/`null`/absent value yields an empty `Vec` (paired with
+/// `#[serde(default)]`).
+fn deserialize_keys<'de, D>(deserializer: D) -> std::result::Result<Vec<CallKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    use serde_json::Value;
 
-/// The MatrixRTC session descriptor. For a room-scoped `m.call` it is always
-/// `call_id=""`, `application="m.call"`, `scope="m.room"`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallSession {
-    pub call_id: String,
-    pub application: String,
-    pub scope: String,
-}
-
-impl Default for CallSession {
-    fn default() -> Self {
-        Self {
-            call_id: String::new(),
-            application: "m.call".to_owned(),
-            scope: "m.room".to_owned(),
+    // Decode to a generic Value first, then branch on its runtime shape — this
+    // is what lets one field accept three structurally different encodings.
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(Vec::new()),
+        // Already the canonical array of {index,key} objects.
+        Value::Array(items) => items
+            .into_iter()
+            .map(|v| serde_json::from_value::<CallKey>(v).map_err(D::Error::custom))
+            .collect(),
+        Value::Object(map) => {
+            // Disambiguate the two object shapes by looking for the `index`/`key`
+            // keys of a single CallKey. If present, it's ONE key object; else
+            // treat it as an index→base64-string map.
+            if map.contains_key("index") || map.contains_key("key") {
+                let single: CallKey =
+                    serde_json::from_value(Value::Object(map)).map_err(D::Error::custom)?;
+                Ok(vec![single])
+            } else {
+                let mut keys = Vec::with_capacity(map.len());
+                for (idx_str, key_val) in map {
+                    let index: u8 = idx_str.parse().map_err(|_| {
+                        D::Error::custom(format!("call key map index not a u8: {idx_str:?}"))
+                    })?;
+                    let key = key_val.as_str().map(str::to_owned).ok_or_else(|| {
+                        D::Error::custom(format!("call key map value not a string for index {index}"))
+                    })?;
+                    keys.push(CallKey { index, key });
+                }
+                // Stable order by index so callers see deterministic output.
+                keys.sort_by_key(|k| k.index);
+                Ok(keys)
+            }
         }
+        other => Err(D::Error::custom(format!(
+            "call encryption keys: expected array, object, or null, got {other}"
+        ))),
     }
 }
 
@@ -104,20 +150,39 @@ impl Default for CallSession {
 /// `CallEncryptionKeysEvent` type alias (`= ToDeviceEvent<…EventContent>`) — the
 /// `…EventContent` ident is chosen so that stripped-suffix alias does NOT collide
 /// with the public decoded [`CallEncryptionKeys`] struct below.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, EventContent)]
+///
+/// **Robustness over precision.** The verbatim Element X shape of `member` /
+/// `session` / any other top-level fields is still unconfirmed (it failed to
+/// deserialize before any logging), so those are kept as `serde_json::Value`
+/// (and `extra` captures everything else) — this guarantees the content ALWAYS
+/// deserializes and round-trips verbatim for the raw log in the handler.
+/// `Eq` is dropped because `serde_json::Value` is not `Eq`.
+#[derive(Clone, Debug, Serialize, Deserialize, EventContent)]
 #[ruma_event(type = "io.element.call.encryption_keys", kind = ToDevice)]
 pub struct CallEncryptionKeysEventContent {
-    /// The participant's media keys (usually one per ratchet generation).
+    /// The participant's media keys. Parsed leniently (array / single object /
+    /// index→key map) and normalised to a `Vec` (see [`deserialize_keys`]).
+    #[serde(default, deserialize_with = "deserialize_keys")]
     pub keys: Vec<CallKey>,
-    /// Who sent the keys (user + device).
-    pub member: CallMember,
-    /// The MatrixRTC session these keys belong to.
+    /// Who sent the keys — shape unknown, kept as raw JSON so it always parses
+    /// and the device id can be probed from whatever keys it carries.
     #[serde(default)]
-    pub session: CallSession,
+    pub member: serde_json::Value,
+    /// The MatrixRTC session descriptor — shape unknown, kept as raw JSON.
+    #[serde(default)]
+    pub session: serde_json::Value,
     /// The Matrix room the call is in.
+    #[serde(default)]
     pub room_id: String,
     /// Wall-clock send time in ms — used by Element Call to drop stale keys.
+    #[serde(default)]
     pub sent_ts: u64,
+    /// Any other top-level fields, captured verbatim so the raw log shows
+    /// EVERYTHING Element X sends. If `flatten` ever conflicts with the
+    /// `EventContent` derive this can be dropped (member/session already
+    /// capture most of the content).
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +196,12 @@ pub struct CallEncryptionKeysEventContent {
 pub struct CallEncryptionKeys {
     /// The to-device event sender's Matrix user id (decrypted-event `sender`).
     pub sender_user_id: String,
-    /// The sender's device id, from the content `member.claimed_device_id`.
+    /// The sender's device id. Extracted best-effort from the content: from
+    /// `member.claimed_device_id` / `member.device_id`, else parsed from
+    /// `membershipID` (`"<user>:<device>"`, take after the LAST `:`), else from
+    /// any `device_id`/`membershipID` in the extra top-level fields. The LiveKit
+    /// participant identity is `<sender_user_id>:<sender_device_id>`, so the
+    /// call backend installs this peer's key under that identity.
     pub sender_device_id: String,
     /// The room the call is in (content `room_id`).
     pub room_id: String,
@@ -224,6 +294,65 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Pull a string field out of a `serde_json::Value` object by key (None unless
+/// it's an object with that key holding a non-empty string).
+fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+}
+
+/// A `membershipID` is `"<user_id>:<device_id>"`; the device id is everything
+/// after the LAST `:` (user ids themselves contain a `:` before the homeserver,
+/// so we must split from the right). Returns None if there's no `:` or the tail
+/// is empty.
+fn device_from_membership_id(membership_id: &str) -> Option<String> {
+    membership_id
+        .rsplit_once(':')
+        .map(|(_, dev)| dev.to_owned())
+        .filter(|d| !d.is_empty())
+}
+
+/// Best-effort extraction of the sender's Matrix device id from the (unconfirmed)
+/// Element X content. Tried in order:
+///   1. `member.claimed_device_id`, then `member.device_id`
+///   2. `member.membershipID` parsed as `"<user>:<device>"`
+///   3. top-level (extra) `device_id`, then `membershipID`
+///
+/// The to-device event itself carries no device id (`ToDeviceEvent` exposes only
+/// `sender` + `content`), so there is no event-level fallback. Returns None if
+/// nothing matched (the caller logs a warning and uses an empty id).
+fn extract_sender_device_id(content: &CallEncryptionKeysEventContent) -> Option<String> {
+    // 1 + 2: probe the member object (whatever shape it turns out to be).
+    json_str(&content.member, "claimed_device_id")
+        .or_else(|| json_str(&content.member, "device_id"))
+        .or_else(|| {
+            content
+                .member
+                .get("membershipID")
+                .and_then(|v| v.as_str())
+                .and_then(device_from_membership_id)
+        })
+        // 3: top-level fields captured by `extra`.
+        .or_else(|| {
+            content
+                .extra
+                .get("device_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            content
+                .extra
+                .get("membershipID")
+                .and_then(|v| v.as_str())
+                .and_then(device_from_membership_id)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // AgentClient API: send + receive
 // ---------------------------------------------------------------------------
@@ -235,10 +364,16 @@ impl AgentClient {
     /// `key_index` is the key-ring slot (Element Call ratchets `(i+1) % 256`);
     /// `key` is the raw 16 AES key bytes (base64-encoded here for the wire).
     ///
-    /// The content's `member.id` / `member.claimed_device_id` are this agent's
-    /// own user id + device id (so peers attribute the key to the agent's
-    /// `<user>:<device>` LiveKit identity); `session` is the room-scoped
-    /// `m.call` default; `sent_ts` is now.
+    /// **Wire shape mirrors Element X.** `keys` is emitted as a SINGLE OBJECT
+    /// `{"index":N,"key":"b64"}` (not an array) to match Element X's
+    /// `ToDeviceKeyTransport`, whose receiver likely expects the same. Device
+    /// identification is provided the way Element X does it: the top-level
+    /// `device_id` and `membershipID` (`"<user>:<device>"`) are set so a peer can
+    /// map our key to our LiveKit identity `<user_id>:<device_id>`, in addition to
+    /// the legacy `member.id` / `member.claimed_device_id` (kept for
+    /// agent-to-agent). `session` is the room-scoped `m.call` default; `sent_ts`
+    /// is now. (Our own permissive receiver accepts both the array and
+    /// single-object shapes, so agent-to-agent is unaffected.)
     ///
     /// Recipients are collected as all devices of all joined room members
     /// *except this agent's own user id*. Sent with
@@ -260,19 +395,24 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot send call encryption keys"))?;
 
-        let content = CallEncryptionKeysEventContent {
-            keys: vec![CallKey {
-                index: key_index,
-                key: base64_encode(key),
-            }],
-            member: CallMember {
-                id: own_user.clone(),
-                claimed_device_id: device_id,
-            },
-            session: CallSession::default(),
-            room_id: room_id.to_owned(),
-            sent_ts: now_ms(),
-        };
+        // Build the wire JSON by hand so `keys` is a SINGLE OBJECT (Element X's
+        // shape), which the typed struct's derived `Serialize` would otherwise
+        // render as an array. `membershipID` = "<user>:<device>" is exactly the
+        // LiveKit participant identity, matching Element X's m.call.member.
+        let membership_id = format!("{own_user}:{device_id}");
+        let content = serde_json::json!({
+            // Single object, NOT an array — matches Element X's ToDeviceKeyTransport.
+            "keys": { "index": key_index, "key": base64_encode(key) },
+            // Element-X-style device identification (top-level).
+            "device_id": device_id,
+            "membershipID": membership_id,
+            // Legacy member object kept for agent-to-agent attribution.
+            "member": { "id": own_user, "claimed_device_id": device_id },
+            // Room-scoped m.call session default.
+            "session": { "call_id": "", "application": "m.call", "scope": "m.room" },
+            "room_id": room_id,
+            "sent_ts": now_ms(),
+        });
 
         // Collect every device of every OTHER joined room member. `Device`s come
         // from the crypto store (populated by sync); we own them in `devices`
@@ -402,6 +542,37 @@ impl AgentClient {
                     let sender_user_id = ev.sender.to_string();
                     let content = ev.content;
 
+                    // GROUND TRUTH: log the verbatim content as pretty JSON. The
+                    // Element X to-device shape is still unconfirmed (it failed to
+                    // deserialize before any logging ran); member/session/extra are
+                    // raw `Value`, so this round-trips EVERYTHING Element X sent.
+                    // This is the line the next live operator call will reveal the
+                    // true shape from.
+                    match serde_json::to_string_pretty(&content) {
+                        Ok(pretty) => tracing::info!(
+                            sender = %sender_user_id,
+                            "RX io.element.call.encryption_keys (verbatim content):\n{pretty}"
+                        ),
+                        Err(e) => tracing::info!(
+                            sender = %sender_user_id,
+                            "RX io.element.call.encryption_keys (content not re-serializable: {e:#})"
+                        ),
+                    }
+
+                    // Extract the sender device id best-effort. The LiveKit
+                    // participant identity is `<sender_user_id>:<sender_device_id>`,
+                    // so the backend must install this key under THAT identity.
+                    let sender_device_id =
+                        extract_sender_device_id(&content).unwrap_or_else(|| {
+                            tracing::warn!(
+                                sender = %sender_user_id,
+                                "could not determine sender device id for call \
+                                 encryption keys; key may install under wrong \
+                                 LiveKit identity"
+                            );
+                            String::new()
+                        });
+
                     // Decode each base64 key; skip (and log) any that don't decode
                     // rather than dropping the whole event.
                     let mut keys = Vec::with_capacity(content.keys.len());
@@ -416,10 +587,14 @@ impl AgentClient {
                         }
                     }
 
+                    // Prefer the content's own room_id; fall back is left to the
+                    // caller (the to-device event carries no room).
+                    let room_id = content.room_id.clone();
+
                     let decoded = CallEncryptionKeys {
                         sender_user_id,
-                        sender_device_id: content.member.claimed_device_id,
-                        room_id: content.room_id,
+                        sender_device_id,
+                        room_id,
                         keys,
                     };
 
@@ -463,18 +638,22 @@ mod tests {
         assert_eq!(base64_decode("Zm9vYg").unwrap(), b"foob");
     }
 
-    /// Round-trip the content struct through the EXACT JSON shape Element Call
-    /// emits (field names, the empty `call_id`, `application:"m.call"`,
-    /// `scope:"m.room"`, base64 key), proving serde matches the wire format both
-    /// directions.
-    #[test]
-    fn call_encryption_keys_content_json_roundtrip() {
-        // 16 random-looking bytes -> the base64 a real payload carries.
+    /// 16 random-looking bytes -> the base64 a real payload carries.
+    fn sample_key() -> (Vec<u8>, String) {
         let key_bytes: Vec<u8> = vec![
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
         let key_b64 = base64_encode(&key_bytes);
+        (key_bytes, key_b64)
+    }
+
+    /// Deserialize the legacy / matrix-js-sdk wire shape (`keys` as an ARRAY)
+    /// into the typed content, proving the array path still works and member /
+    /// session round-trip verbatim as raw JSON.
+    #[test]
+    fn keys_array_shape_deserializes() {
+        let (key_bytes, key_b64) = sample_key();
 
         let wire = json!({
             "keys": [ { "index": 1, "key": key_b64 } ],
@@ -491,41 +670,163 @@ mod tests {
             "sent_ts": 1_733_000_000_000u64
         });
 
-        // Deserialize the wire JSON into the typed content.
         let content: CallEncryptionKeysEventContent =
-            serde_json::from_value(wire.clone()).expect("wire JSON should deserialize");
+            serde_json::from_value(wire).expect("array wire JSON should deserialize");
 
         assert_eq!(content.keys.len(), 1);
         assert_eq!(content.keys[0].index, 1);
         assert_eq!(content.keys[0].key, key_b64);
         assert_eq!(base64_decode(&content.keys[0].key).unwrap(), key_bytes);
-        assert_eq!(content.member.id, "@agent:matrix.inblock.io");
-        assert_eq!(content.member.claimed_device_id, "ABCDEFGHIJ");
-        assert_eq!(content.session.call_id, "");
-        assert_eq!(content.session.application, "m.call");
-        assert_eq!(content.session.scope, "m.room");
+        // member/session round-trip as raw JSON.
+        assert_eq!(content.member["claimed_device_id"], "ABCDEFGHIJ");
+        assert_eq!(content.session["application"], "m.call");
         assert_eq!(content.room_id, "!room:matrix.inblock.io");
         assert_eq!(content.sent_ts, 1_733_000_000_000u64);
-
-        // Re-serialize and confirm it matches the original wire JSON exactly.
-        let reserialized = serde_json::to_value(&content).expect("content should serialize");
-        assert_eq!(reserialized, wire);
+        // Device extraction from member.claimed_device_id.
+        assert_eq!(extract_sender_device_id(&content).as_deref(), Some("ABCDEFGHIJ"));
     }
 
-    /// The `session` field defaults to the room-scoped `m.call` descriptor when
-    /// omitted (matrix-js-sdk always sends it, but be lenient on receive).
+    /// THE BUG FIX: Element X's to-device transport sends `keys` as a SINGLE
+    /// OBJECT (a JSON map), which previously failed to deserialize (`invalid
+    /// type: map, expected a sequence`). It must now deserialize to the SAME
+    /// single-element `Vec<CallKey>` as the array shape.
     #[test]
-    fn session_defaults_when_absent() {
+    fn keys_single_object_shape_deserializes() {
+        let (key_bytes, key_b64) = sample_key();
+
         let wire = json!({
-            "keys": [],
-            "member": { "id": "@a:b", "claimed_device_id": "DEV" },
-            "room_id": "!r:b",
+            // Element X: keys is ONE object, not an array.
+            "keys": { "index": 1, "key": key_b64 },
+            "member": { "id": "@x:matrix.inblock.io" },
+            "room_id": "!room:matrix.inblock.io",
             "sent_ts": 1u64
         });
-        let content: CallEncryptionKeysEventContent = serde_json::from_value(wire).unwrap();
-        assert_eq!(content.session, CallSession::default());
-        assert_eq!(content.session.application, "m.call");
-        assert_eq!(content.session.scope, "m.room");
+
+        let content: CallEncryptionKeysEventContent =
+            serde_json::from_value(wire).expect("single-object wire JSON should deserialize");
+
+        assert_eq!(content.keys.len(), 1, "single object → one CallKey");
+        assert_eq!(content.keys[0].index, 1);
+        assert_eq!(base64_decode(&content.keys[0].key).unwrap(), key_bytes);
+    }
+
+    /// Both wire shapes normalise to the identical `Vec<CallKey>`.
+    #[test]
+    fn array_and_single_object_yield_same_keys() {
+        let (_bytes, key_b64) = sample_key();
+
+        let from_array: CallEncryptionKeysEventContent = serde_json::from_value(json!({
+            "keys": [ { "index": 7, "key": key_b64 } ],
+        }))
+        .unwrap();
+        let from_object: CallEncryptionKeysEventContent = serde_json::from_value(json!({
+            "keys": { "index": 7, "key": key_b64 },
+        }))
+        .unwrap();
+
+        assert_eq!(from_array.keys, from_object.keys);
+        assert_eq!(from_array.keys.len(), 1);
+        assert_eq!(from_array.keys[0].index, 7);
+    }
+
+    /// The index→key MAP shape (`{"0":"b64","1":"b64"}`) is also tolerated,
+    /// normalised to `Vec<CallKey>` ordered by index.
+    #[test]
+    fn keys_index_map_shape_deserializes() {
+        let (_bytes, key_b64) = sample_key();
+        let other_b64 = base64_encode(b"sixteen-byte-key");
+
+        let content: CallEncryptionKeysEventContent = serde_json::from_value(json!({
+            "keys": { "1": other_b64, "0": key_b64 },
+        }))
+        .unwrap();
+
+        assert_eq!(content.keys.len(), 2);
+        // Sorted by index.
+        assert_eq!(content.keys[0].index, 0);
+        assert_eq!(content.keys[0].key, key_b64);
+        assert_eq!(content.keys[1].index, 1);
+        assert_eq!(content.keys[1].key, other_b64);
+    }
+
+    /// Absent / null / empty `keys` yields an empty Vec (the handler still runs
+    /// and logs, rather than failing the whole event).
+    #[test]
+    fn keys_absent_or_empty_yields_empty_vec() {
+        for wire in [json!({}), json!({ "keys": null }), json!({ "keys": [] })] {
+            let content: CallEncryptionKeysEventContent =
+                serde_json::from_value(wire).expect("lenient keys should accept empty");
+            assert!(content.keys.is_empty());
+        }
+    }
+
+    /// The send side must emit `keys` as a SINGLE OBJECT (Element X's shape),
+    /// plus Element-X-style device identification (`device_id` + `membershipID`).
+    /// This mirrors the JSON `send_call_encryption_keys` builds.
+    #[test]
+    fn send_side_emits_keys_as_single_object() {
+        let (key_bytes, key_b64) = sample_key();
+        let own_user = "@agent:matrix.inblock.io";
+        let device_id = "ABCDEFGHIJ";
+        let membership_id = format!("{own_user}:{device_id}");
+
+        // Exactly the JSON the send path constructs.
+        let content = json!({
+            "keys": { "index": 3, "key": base64_encode(&key_bytes) },
+            "device_id": device_id,
+            "membershipID": membership_id,
+            "member": { "id": own_user, "claimed_device_id": device_id },
+            "session": { "call_id": "", "application": "m.call", "scope": "m.room" },
+            "room_id": "!room:matrix.inblock.io",
+            "sent_ts": 1u64,
+        });
+
+        // `keys` is an OBJECT, not an array.
+        assert!(content["keys"].is_object(), "send must emit keys as a single object");
+        assert!(!content["keys"].is_array());
+        assert_eq!(content["keys"]["index"], 3);
+        assert_eq!(content["keys"]["key"], key_b64);
+        // Element-X-style identity present at top level.
+        assert_eq!(content["device_id"], device_id);
+        assert_eq!(content["membershipID"], format!("{own_user}:{device_id}"));
+
+        // And our own permissive receiver still parses it back to one CallKey.
+        let parsed: CallEncryptionKeysEventContent =
+            serde_json::from_value(content).expect("our receiver accepts our own send shape");
+        assert_eq!(parsed.keys.len(), 1);
+        assert_eq!(parsed.keys[0].index, 3);
+    }
+
+    /// Device-id extraction fallbacks: member.device_id, membershipID parsing
+    /// (split on the LAST colon, since user ids contain a colon), and the
+    /// top-level (extra) `device_id` / `membershipID`.
+    #[test]
+    fn device_id_extraction_fallbacks() {
+        // member.device_id (not claimed_device_id)
+        let c: CallEncryptionKeysEventContent =
+            serde_json::from_value(json!({ "member": { "device_id": "DEV1" } })).unwrap();
+        assert_eq!(extract_sender_device_id(&c).as_deref(), Some("DEV1"));
+
+        // member.membershipID "<user>:<device>" — device is after the LAST ':'.
+        let c: CallEncryptionKeysEventContent = serde_json::from_value(json!({
+            "member": { "membershipID": "@did-pkh-eip155:1:0xABC:6zqlNZdevicekey" }
+        }))
+        .unwrap();
+        assert_eq!(extract_sender_device_id(&c).as_deref(), Some("6zqlNZdevicekey"));
+
+        // top-level device_id (captured by `extra`)
+        let c: CallEncryptionKeysEventContent =
+            serde_json::from_value(json!({ "device_id": "TOPLEVELDEV" })).unwrap();
+        assert_eq!(extract_sender_device_id(&c).as_deref(), Some("TOPLEVELDEV"));
+
+        // top-level membershipID (captured by `extra`)
+        let c: CallEncryptionKeysEventContent =
+            serde_json::from_value(json!({ "membershipID": "@u:hs.tld:TOPDEV" })).unwrap();
+        assert_eq!(extract_sender_device_id(&c).as_deref(), Some("TOPDEV"));
+
+        // nothing → None (handler logs a warning and uses empty id)
+        let c: CallEncryptionKeysEventContent = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(extract_sender_device_id(&c), None);
     }
 
     /// The derive must wire the unstable event type through `StaticEventContent`

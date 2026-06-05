@@ -12,8 +12,7 @@ mod rtc_keys;
 
 pub use media::{MediaHandle, MediaKind};
 pub use rtc_keys::{
-    CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CallMember, CallSession,
-    CALL_ENCRYPTION_KEYS_TYPE,
+    CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };
 
 use anyhow::{anyhow, Context, Result};
