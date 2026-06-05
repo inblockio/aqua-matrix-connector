@@ -533,3 +533,235 @@ async fn recv_media(
     }
     panic!("{label}: receiver never received a decryptable {want:?} attachment after 8 sync rounds");
 }
+
+/// Verify LIVE that an aqua agent can advertise a **MatrixRTC membership**
+/// (`org.matrix.msc3401.call.member`) so Element X / Element Call discovers it as
+/// a call participant — the Matrix-signaling half of the LiveKit media join.
+///
+/// Proves four things against the real homeserver:
+///  1. Agent A's `set_rtc_member` is ACCEPTED by the server (returns Ok / an
+///     event id). Whether the MSC3757 owned (leading-underscore) state key is
+///     allowed is reported by `set_rtc_member`'s own logging; this test asserts
+///     the *effective* stored state regardless of which key form won.
+///  2. A reads its own membership back and it deserializes to SessionContent with
+///     the LiveKit focus + correct device_id.
+///  3. B — a DIFFERENT user in the same room — reads the SAME state event,
+///     proving other Matrix clients DISCOVER the agent's membership.
+///  4. `clear_rtc_member` returns the membership to the Empty ("left") state.
+///
+/// The raw stored JSON is printed (from both A and B) so the wire shape can be
+/// eyeballed against the Element Call schema.
+#[tokio::test]
+async fn rtc_member_advertise() {
+    use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
+    use matrix_sdk::ruma::events::call::member::{
+        CallMemberEventContent, CallMemberStateKey,
+    };
+    use matrix_sdk::ruma::events::StateEventType;
+    use matrix_sdk::ruma::{OwnedUserId, RoomId};
+
+    tracing_subscriber::fmt()
+        .with_env_filter("warn,aqua_matrix_agent=info")
+        .try_init()
+        .ok();
+
+    clean_store("/tmp/aqua-e2e-rtcmem-a");
+    clean_store("/tmp/aqua-e2e-rtcmem-b");
+
+    let agent_a = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-rtcmem-a"))
+        .await
+        .expect("Agent A failed to connect");
+    let agent_b = AgentClient::connect(agent_config("agent-b.pem", "/tmp/aqua-e2e-rtcmem-b"))
+        .await
+        .expect("Agent B failed to connect");
+    println!("A = {} ({:?})", agent_a.user_id(), agent_a.device_id());
+    println!("B = {} ({:?})", agent_b.user_id(), agent_b.device_id());
+
+    // --- Establish the shared DM room (the existing e2e pattern) -----------
+    agent_a
+        .send_dm(agent_b.user_id(), "e2e-rtcmem-room-setup")
+        .await
+        .expect("A failed to create DM room");
+    sync_n(&agent_b, 2).await;
+    agent_b.join_invited_rooms().await.expect("B join failed");
+    sync_n(&agent_b, 2).await;
+    sync_n(&agent_a, 2).await;
+
+    let room_id = agent_a
+        .dm_room_id(agent_b.user_id())
+        .await
+        .expect("dm_room_id failed")
+        .expect("no DM room between A and B");
+    println!("shared room: {room_id}");
+
+    // --- A advertises its MatrixRTC membership (alias = room_id) -----------
+    let focus_url = "https://matrix.inblock.io/livekit/jwt";
+    agent_a
+        .set_rtc_member(&room_id, &room_id, focus_url)
+        .await
+        .expect("set_rtc_member was REJECTED by the homeserver");
+    println!("A set_rtc_member ACCEPTED by homeserver");
+
+    // Helper: read the call.member state for A's (user, device) from a given
+    // reader's view, trying the owned (underscore) key then the plain key, and
+    // returning (state_key_used, deserialized_content, raw_json).
+    async fn read_member(
+        reader: &AgentClient,
+        room_id: &str,
+        member_user: &str,
+        member_device: &str,
+    ) -> Option<(String, CallMemberEventContent, serde_json::Value)> {
+        let rid: &RoomId = room_id.try_into().unwrap();
+        let room = reader.client().get_room(rid)?;
+        let user: OwnedUserId = member_user.try_into().unwrap();
+        for underscore in [true, false] {
+            let key = CallMemberStateKey::new(
+                user.clone(),
+                Some(member_device.to_owned()),
+                underscore,
+            );
+            // Typed read: proves the stored event deserializes to the strongly
+            // typed CallMemberEventContent via matrix-sdk's static path.
+            let typed = room
+                .get_state_event_static_for_key::<CallMemberEventContent, _>(&key)
+                .await
+                .ok()
+                .flatten();
+            // Raw read (for JSON eyeballing) by the same key string. The store
+            // returns either a Sync or Stripped wrapper; both hold a `Raw` whose
+            // `.json()` is the verbatim stored event. We pull the `content`
+            // sub-object out so the printed JSON is exactly the membership shape.
+            let raw = room
+                .get_state_event(StateEventType::CallMember, key.as_ref())
+                .await
+                .ok()
+                .flatten();
+            let full_json = raw.as_ref().map(|r| {
+                let rjv = match r {
+                    RawAnySyncOrStrippedState::Sync(ev) => ev.json(),
+                    RawAnySyncOrStrippedState::Stripped(ev) => ev.json(),
+                };
+                serde_json::from_str::<serde_json::Value>(rjv.get()).unwrap()
+            });
+            // Only treat the slot as present when BOTH the typed read succeeds
+            // (so we return a real CallMemberEventContent) and we have raw JSON.
+            if let (Some(full), Some(typed)) = (full_json, &typed) {
+                // Deserialize the Raw wrapper into the event enum, then pull the
+                // typed content out.
+                if let Some(content) = typed
+                    .deserialize()
+                    .ok()
+                    .and_then(|ev| ev.original_content().cloned())
+                {
+                    // Prefer the `content` sub-object for printing; fall back to
+                    // the whole event if the shape is unexpected.
+                    let content_json =
+                        full.get("content").cloned().unwrap_or_else(|| full.clone());
+                    return Some((key.as_ref().to_owned(), content, content_json));
+                }
+            }
+        }
+        None
+    }
+
+    let a_user = agent_a.user_id().to_owned();
+    let a_device = agent_a.device_id().expect("A has no device_id");
+
+    // --- (2) A reads its own membership back -------------------------------
+    sync_n(&agent_a, 2).await;
+    let (key_a, content_a, raw_a) = read_member(&agent_a, &room_id, &a_user, &a_device)
+        .await
+        .expect("A could not read back its own RTC membership");
+    println!("\n=== A read-back: state_key = {key_a} ===");
+    println!("{}", serde_json::to_string_pretty(&raw_a).unwrap());
+    assert_session_focus(&content_a, &a_device, &room_id, focus_url, "A self read-back");
+
+    // --- (3) B (different user) discovers A's membership -------------------
+    sync_n(&agent_b, 3).await;
+    let (key_b, content_b, raw_b) = read_member(&agent_b, &room_id, &a_user, &a_device)
+        .await
+        .expect("B could not DISCOVER A's RTC membership (cross-user read failed)");
+    println!("\n=== B cross-user read of A's membership: state_key = {key_b} ===");
+    println!("{}", serde_json::to_string_pretty(&raw_b).unwrap());
+    assert_eq!(key_a, key_b, "A and B disagree on the membership state key");
+    assert_session_focus(&content_b, &a_device, &room_id, focus_url, "B cross-user read");
+    println!("\nCROSS-USER DISCOVERY PROVEN: B sees A's MatrixRTC membership.");
+
+    // --- (4) A clears membership; read-back is Empty ----------------------
+    agent_a
+        .clear_rtc_member(&room_id)
+        .await
+        .expect("clear_rtc_member failed");
+    sync_n(&agent_a, 2).await;
+    let after = read_member(&agent_a, &room_id, &a_user, &a_device).await;
+    match after {
+        Some((_, CallMemberEventContent::Empty(_), raw)) => {
+            println!("\n=== after clear: Empty membership (left call) ===");
+            println!("{}", serde_json::to_string_pretty(&raw).unwrap());
+        }
+        Some((_, other, raw)) => panic!(
+            "after clear_rtc_member the membership was NOT Empty: {other:?}\nraw: {raw}"
+        ),
+        None => panic!("after clear_rtc_member the state event vanished entirely (expected Empty)"),
+    }
+    println!("\nrtc_member_advertise: ALL CHECKS PASSED");
+}
+
+/// Assert a read-back membership is a SessionContent carrying the LiveKit focus,
+/// the expected device_id, and the room-scoped call shape Element Call expects.
+fn assert_session_focus(
+    content: &matrix_sdk::ruma::events::call::member::CallMemberEventContent,
+    expect_device: &str,
+    expect_alias: &str,
+    expect_focus_url: &str,
+    label: &str,
+) {
+    use matrix_sdk::ruma::events::call::member::{
+        ActiveFocus, CallMemberEventContent, Focus,
+    };
+    let session = match content {
+        CallMemberEventContent::SessionContent(s) => s,
+        other => panic!("{label}: expected SessionContent, got {other:?}"),
+    };
+    assert_eq!(
+        session.device_id.as_str(),
+        expect_device,
+        "{label}: device_id mismatch"
+    );
+    assert!(
+        matches!(session.focus_active, ActiveFocus::Livekit(_)),
+        "{label}: focus_active is not livekit"
+    );
+    let lk = session
+        .foci_preferred
+        .iter()
+        .find_map(|f| match f {
+            Focus::Livekit(l) => Some(l),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{label}: no livekit focus in foci_preferred"));
+    assert_eq!(lk.alias, expect_alias, "{label}: livekit_alias mismatch");
+    assert_eq!(
+        lk.service_url, expect_focus_url,
+        "{label}: livekit_service_url mismatch"
+    );
+    // application=m.call, scope=m.room
+    assert!(
+        session.application.application_session_is_room_call(),
+        "{label}: not a room-scoped m.call"
+    );
+}
+
+/// Local extension so the assertion above stays readable.
+trait RoomCallCheck {
+    fn application_session_is_room_call(&self) -> bool;
+}
+impl RoomCallCheck for matrix_sdk::ruma::events::call::member::Application {
+    fn application_session_is_room_call(&self) -> bool {
+        use matrix_sdk::ruma::events::call::member::{Application, CallScope};
+        match self {
+            Application::Call(c) => c.scope == CallScope::Room && c.call_id.is_empty(),
+            _ => false,
+        }
+    }
+}
