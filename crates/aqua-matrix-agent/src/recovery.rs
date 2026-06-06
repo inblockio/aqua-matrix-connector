@@ -13,16 +13,20 @@
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+use matrix_sdk::encryption::recovery::RecoveryState;
 use matrix_sdk::Client;
 
 const KEY_FILE: &str = "recovery.key";
 
-/// Cold-start restore. If a persisted recovery key exists AND cross-signing is
-/// NOT currently complete, use the key to restore cross-signing + secrets from
-/// server-side SSSS. No-op (with a log) otherwise. Always best-effort.
+/// Cold-start restore. If a persisted recovery key exists AND either cross-signing
+/// is NOT complete OR secret storage reports `Incomplete` (we're missing some
+/// secrets — e.g. the megolm backup decryption key, which leaves historical room
+/// keys undecryptable even when cross-signing looks fine), use the key to restore
+/// secrets from server-side SSSS. No-op (with a log) otherwise. Always best-effort.
 ///
 /// Call this BEFORE the cross-signing bootstrap decision so restored keys make
-/// the status complete and bootstrap is skipped.
+/// the status complete and bootstrap is skipped. The `Incomplete` trigger (R9)
+/// also repopulates the backup key so undecryptable history can be re-fetched.
 pub(crate) async fn restore_if_needed(client: &Client, store_dir: &Path) {
     let key_path = store_dir.join(KEY_FILE);
     if !key_path.exists() {
@@ -35,7 +39,12 @@ pub(crate) async fn restore_if_needed(client: &Client, store_dir: &Path) {
         Some(status) => status.is_complete(),
         None => false,
     };
-    if complete {
+    let recovery_state = client.encryption().recovery().state();
+    // Restore when cross-signing is missing OR secret storage is set up but we are
+    // missing some secrets (the megolm backup key in particular). The latter is the
+    // R9 case: cross-signing complete but historical room keys stay undecryptable.
+    let needs_restore = !complete || matches!(recovery_state, RecoveryState::Incomplete);
+    if !needs_restore {
         // Keys already present locally; no restore needed.
         return;
     }
