@@ -1,7 +1,7 @@
 #![cfg(feature = "e2e")]
 
 use aqua_matrix_agent::{AgentClient, AgentConfig, MediaKind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -23,21 +23,40 @@ static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// and messages arrive as "[unable to decrypt]". A real Matrix client never
 /// wipes its store; neither do we. Deriving the path from the identity means a
 /// key file can only ever map to one store.
+/// Resolves the identity key file, allowing an env override so the suite can run
+/// against fresh, un-poisoned accounts: `SIWX_E2E_KEY_A` / `SIWX_E2E_KEY_B`. The
+/// device_id is deterministic per DID, so once an account's server-side device
+/// keys are poisoned (e.g. by the old wipe-on-every-run behaviour) the only way
+/// to escape is to switch to a different identity. Defaults to the committed
+/// `agent.pem` / `agent-b.pem`.
+fn resolve_key_file(default: &str) -> String {
+    let var = match default {
+        "agent.pem" => "SIWX_E2E_KEY_A",
+        "agent-b.pem" => "SIWX_E2E_KEY_B",
+        _ => return default.to_string(),
+    };
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
 fn persistent_store(key_file: &str) -> PathBuf {
-    let stem = key_file.strip_suffix(".pem").unwrap_or(key_file);
+    let stem = Path::new(key_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("agent");
     let dir = repo_root().join(".e2e-store").join(stem);
     std::fs::create_dir_all(&dir).expect("create persistent e2e store dir");
     dir
 }
 
 fn agent_config(key_file: &str) -> AgentConfig {
+    let key_file = resolve_key_file(key_file);
     AgentConfig {
-        key_file: repo_root().join(key_file),
+        key_file: repo_root().join(&key_file),
         siwx_url: "https://siwx-oidc.inblock.io".into(),
         matrix_url: "https://matrix.inblock.io".into(),
         client_id: None,
         redirect_uri: None,
-        store_dir: persistent_store(key_file),
+        store_dir: persistent_store(&key_file),
         // None → connect() derives a stable device_id from the DID.
         device_id: None,
     }
