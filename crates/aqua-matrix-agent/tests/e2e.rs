@@ -7,14 +7,39 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn agent_config(key_file: &str, store_dir: &str) -> AgentConfig {
+/// Serializes the e2e tests. They all share the two persistent identities
+/// (`agent.pem`, `agent-b.pem`) and therefore their per-identity crypto stores,
+/// so two must never run at once (SQLite store lock + device-key races). Every
+/// test acquires this at the top: `let _serial = E2E_LOCK.lock().await;`.
+static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Stable, per-identity crypto store that PERSISTS across runs (never wiped).
+///
+/// The device_id is deterministic per DID, so each identity must keep ONE
+/// durable store. Wiping it between runs (or giving the same key file a
+/// different dir per test) makes `connect()` upload fresh identity keys under
+/// the *same* device_id. That recycles the device: the peer's cached device
+/// keys and Olm sessions go stale, Megolm room keys can no longer be shared,
+/// and messages arrive as "[unable to decrypt]". A real Matrix client never
+/// wipes its store; neither do we. Deriving the path from the identity means a
+/// key file can only ever map to one store.
+fn persistent_store(key_file: &str) -> PathBuf {
+    let stem = key_file.strip_suffix(".pem").unwrap_or(key_file);
+    let dir = repo_root().join(".e2e-store").join(stem);
+    std::fs::create_dir_all(&dir).expect("create persistent e2e store dir");
+    dir
+}
+
+fn agent_config(key_file: &str) -> AgentConfig {
     AgentConfig {
         key_file: repo_root().join(key_file),
         siwx_url: "https://siwx-oidc.inblock.io".into(),
         matrix_url: "https://matrix.inblock.io".into(),
         client_id: None,
         redirect_uri: None,
-        store_dir: PathBuf::from(store_dir),
+        store_dir: persistent_store(key_file),
+        // None → connect() derives a stable device_id from the DID.
+        device_id: None,
     }
 }
 
@@ -22,10 +47,6 @@ async fn sync_n(agent: &AgentClient, n: usize) {
     for _ in 0..n {
         agent.sync_once().await.expect("sync failed");
     }
-}
-
-fn clean_store(path: &str) {
-    let _ = std::fs::remove_dir_all(path);
 }
 
 fn now_unix() -> u64 {
@@ -42,19 +63,16 @@ async fn e2ee_bidirectional_messaging() {
         .try_init()
         .ok();
 
-    // Wipe stores to avoid stale crypto keys from prior runs or CLI usage.
-    // The device_id is deterministic per DID, so any other crypto store that
-    // used the same key file will have uploaded conflicting identity keys.
-    clean_store("/tmp/aqua-e2e-agent-a");
-    clean_store("/tmp/aqua-e2e-agent-b");
+    let _serial = E2E_LOCK.lock().await;
 
-    // Connect both agents via CAIP-122 auth
-    let agent_a = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-agent-a"))
+    // Connect both agents via CAIP-122 auth. Persistent per-identity stores keep
+    // each device's keys stable across runs (see persistent_store).
+    let agent_a = AgentClient::connect(agent_config("agent.pem"))
         .await
         .expect("Agent A failed to connect");
     println!("Agent A connected: {} ({})", agent_a.user_id(), agent_a.did());
 
-    let agent_b = AgentClient::connect(agent_config("agent-b.pem", "/tmp/aqua-e2e-agent-b"))
+    let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
         .await
         .expect("Agent B failed to connect");
     println!("Agent B connected: {} ({})", agent_b.user_id(), agent_b.did());
@@ -292,11 +310,12 @@ async fn rtc_room_alias_matches_element_call() {
         .try_init()
         .ok();
 
+    let _serial = E2E_LOCK.lock().await;
+
     // The operator's real room, fixed so the alias is reproducible.
     const ROOM_ID: &str = "!DkKJdSFKrQgAZACWKm:matrix.inblock.io";
 
-    clean_store("/tmp/aqua-e2e-roomalias");
-    let agent = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-roomalias"))
+    let agent = AgentClient::connect(agent_config("agent.pem"))
         .await
         .expect("agent failed to connect");
     let device_id = agent.device_id().expect("agent has no device_id");
@@ -408,10 +427,10 @@ async fn rtc_jwt_handshake() {
         .try_init()
         .ok();
 
-    clean_store("/tmp/aqua-e2e-rtc");
+    let _serial = E2E_LOCK.lock().await;
 
     // 1. Connect agent A.
-    let agent = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-rtc"))
+    let agent = AgentClient::connect(agent_config("agent.pem"))
         .await
         .expect("Agent A failed to connect");
     println!("Agent connected: {} ({})", agent.user_id(), agent.did());
@@ -590,10 +609,9 @@ async fn e2ee_media_exchange() {
         .try_init()
         .ok();
 
-    clean_store("/tmp/aqua-e2e-media-a");
-    clean_store("/tmp/aqua-e2e-media-b");
+    let _serial = E2E_LOCK.lock().await;
 
-    let agent_a = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-media-a"))
+    let agent_a = AgentClient::connect(agent_config("agent.pem"))
         .await
         .expect("Agent A failed to connect");
     println!(
@@ -603,7 +621,7 @@ async fn e2ee_media_exchange() {
         agent_a.expires_at_unix().saturating_sub(now_unix())
     );
 
-    let agent_b = AgentClient::connect(agent_config("agent-b.pem", "/tmp/aqua-e2e-media-b"))
+    let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
         .await
         .expect("Agent B failed to connect");
     println!("Agent B connected: {} ({})", agent_b.user_id(), agent_b.did());
@@ -777,13 +795,12 @@ async fn rtc_member_advertise() {
         .try_init()
         .ok();
 
-    clean_store("/tmp/aqua-e2e-rtcmem-a");
-    clean_store("/tmp/aqua-e2e-rtcmem-b");
+    let _serial = E2E_LOCK.lock().await;
 
-    let agent_a = AgentClient::connect(agent_config("agent.pem", "/tmp/aqua-e2e-rtcmem-a"))
+    let agent_a = AgentClient::connect(agent_config("agent.pem"))
         .await
         .expect("Agent A failed to connect");
-    let agent_b = AgentClient::connect(agent_config("agent-b.pem", "/tmp/aqua-e2e-rtcmem-b"))
+    let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
         .await
         .expect("Agent B failed to connect");
     println!("A = {} ({:?})", agent_a.user_id(), agent_a.device_id());

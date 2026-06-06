@@ -1,4 +1,6 @@
 target/
+# Persistent per-identity crypto stores for the e2e tests (device keys; machine-local).
+.e2e-store/
 *.pem
 *.db
 *.db-wal
