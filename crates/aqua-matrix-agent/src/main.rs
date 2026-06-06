@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     // to their own binaries (aqua-matrix-heartbeat, aqua-matrix-claude-p) over
     // the aqua-matrix-relay lifecycle — this binary is now purely the
     // send/read/print-did tool documented in CLAUDE.md.
-    let agent = AgentClient::connect(config).await?;
+    let mut agent = AgentClient::connect(config).await?;
 
     let joined = agent.join_invited_rooms().await?;
     if !joined.is_empty() {
@@ -109,7 +109,13 @@ async fn main() -> Result<()> {
             .context("no target set — pass --target or set AGENT_TARGET (see .env.example)")?;
 
         if let Some(ref msg) = args.message {
-            let event_id = agent.send_dm(target, msg).await?;
+            // Self-healing send: siwx-oidc access tokens live only ~300s and the
+            // restored matrix-sdk client can't refresh them itself, so a slow
+            // connect() could leave us sending on an expired token (the live
+            // M_UNKNOWN_TOKEN failure). send_dm_self_healing proactively rotates
+            // a near-expiry token and re-auths-and-retries on a dead one, all
+            // non-interactively from the persisted refresh token / the did:key.
+            let event_id = agent.send_dm_self_healing(target, msg).await?;
             println!("sent to {target}: {msg} (event: {event_id})");
         }
 
