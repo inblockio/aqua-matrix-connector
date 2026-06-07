@@ -1110,6 +1110,28 @@ impl AgentClient {
         retry_finalize("send-dm", || self.send_dm(target, message)).await
     }
 
+    /// Send a Markdown message into an **arbitrary already-joined room** (by room
+    /// id), NOT a DM. The agent must already be a member of `room_id` (it is — it
+    /// joined the owner's room to transcribe the call). Unlike [`send_dm`], this
+    /// does not resolve/create a `m.direct` room: it targets a specific room, so
+    /// it is the path for announcing recording state and acking participant
+    /// opt-out/in **in the call room** where everyone (not just the owner) sees
+    /// it. Returns the persisted event id.
+    pub async fn send_to_room(&self, room_id: &str, message: &str) -> Result<String> {
+        let room_id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let room = self
+            .client
+            .get_room(room_id)
+            .ok_or_else(|| anyhow!("room {room_id} not found (agent not joined?)"))?;
+        let resp = room
+            .send(RoomMessageEventContent::text_markdown(message))
+            .await
+            .context("failed to send room message")?;
+        Ok(resp.response.event_id.to_string())
+    }
+
     /// [`send_dm`] bounded by [`SEND_ATTEMPT_TIMEOUT`] so a server-5xx that
     /// matrix-sdk would otherwise retry internally for minutes can't silently
     /// consume the access token's whole lifetime. A timeout is surfaced as a
