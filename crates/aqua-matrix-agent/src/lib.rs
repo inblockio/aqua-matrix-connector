@@ -22,10 +22,12 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::{
         events::{
+            direct::{DirectEventContent, OwnedDirectUserIdentifier},
+            room::member::MembershipState,
             room::message::{MessageType, ReplacementMetadata, RoomMessageEventContent},
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         },
-        OwnedDeviceId, OwnedEventId, OwnedUserId, RoomId, UInt, UserId,
+        OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
     },
     Client, SessionMeta, SessionTokens,
 };
@@ -172,6 +174,14 @@ pub struct AgentClient {
     /// public API to swap tokens in place) ~30 s before the server starts
     /// returning M_UNKNOWN_TOKEN.
     expires_at_unix: u64,
+    /// The config this client was built from. Retained so a one-shot send can
+    /// self-heal: when the access token is near/at expiry (or the server
+    /// returns M_UNKNOWN_TOKEN mid-operation) we re-mint a session from the
+    /// persisted refresh token / the did:key and rebuild the inner client in
+    /// place. matrix-sdk 0.17 cannot refresh siwx-oidc tokens itself (its
+    /// MatrixSession refresh hits Synapse's native endpoint, not siwx-oidc's
+    /// `/token`), so the rotation has to happen at this layer.
+    config: AgentConfig,
 }
 
 impl AgentClient {
@@ -313,19 +323,328 @@ async fn resolve_identity(matrix_url: &str, access_token: &str) -> Result<WhoAmI
     resp.json().await.context("whoami JSON parse failed")
 }
 
-impl AgentClient {
-    async fn find_dm_room(&self, target: &UserId) -> Option<matrix_sdk::Room> {
-        if let Some(room) = self.client.get_dm_room(target) {
-            return Some(room);
+/// Resolve the OIDC `(client_id, redirect_uri)` to use, in this order:
+///   1. Provided in `config` (CLI flags or env vars)
+///   2. Cached in the on-disk config file
+///   3. Auto-register a fresh client with the siwx-oidc server
+///
+/// May mutate `config_file` (and persist it) when it auto-registers. Pulled out
+/// of `connect()` so the self-healing re-auth path resolves the same way.
+async fn resolve_oidc_client(
+    config: &AgentConfig,
+    config_file: &mut ConfigFile,
+    config_path: &Path,
+) -> Result<(String, String)> {
+    match (config.client_id.clone(), config.redirect_uri.clone()) {
+        (Some(cid), Some(ruri)) => Ok((cid, ruri)),
+        (Some(cid), None) => {
+            let ruri = config_file
+                .oidc
+                .redirect_uri
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
+            Ok((cid, ruri))
         }
-        for room in self.client.joined_rooms() {
-            if room.joined_members_count() == 2 {
-                if room.get_member(target).await.ok().flatten().is_some() {
-                    return Some(room);
-                }
+        (None, Some(ruri)) => {
+            let cid = config_file.oidc.client_id.clone().ok_or_else(|| {
+                anyhow!("--redirect-uri provided without --client-id, and no cached client_id found")
+            })?;
+            Ok((cid, ruri))
+        }
+        (None, None) => {
+            if let Some(cid) = config_file.oidc.client_id.clone() {
+                let ruri = config_file
+                    .oidc
+                    .redirect_uri
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
+                tracing::info!("using cached OIDC credentials from {}", config_path.display());
+                Ok((cid, ruri))
+            } else {
+                let (cid, ruri) = register_oidc_client(&config.siwx_url).await?;
+                config_file.oidc.client_id = Some(cid.clone());
+                config_file.oidc.redirect_uri = Some(ruri.clone());
+                config_file.save(config_path)?;
+                tracing::info!("saved OIDC credentials to {}", config_path.display());
+                Ok((cid, ruri))
             }
         }
+    }
+}
+
+/// Acquire a usable Matrix session, persisting it to `config.toml`. Preference:
+///   1. Cached access token still within its TTL  → use it (no network).
+///   2. Cached refresh token → exchange for a new access token via
+///      `siwx_oidc_auth::refresh()` (preserves device_id → crypto store stays valid).
+///   3. Fresh `did:key` authentication → mints a new device_id.
+///
+/// Returns `(access_token, user_id, device_id, expires_at_unix)`. This is the
+/// single source of truth for "give me a live token", shared by the initial
+/// `connect()` and the on-401 / near-expiry self-heal in `reauth_inner()`.
+/// `force_new` skips the still-valid-cache shortcut so a session that is
+/// near-expiry (but not yet rejected) is rotated rather than reused.
+async fn acquire_session(
+    config: &AgentConfig,
+    key: &SiwxKey,
+    client_id: &str,
+    redirect_uri: &str,
+    config_file: &mut ConfigFile,
+    config_path: &Path,
+    force_new: bool,
+) -> Result<(String, String, String, u64)> {
+    let now_unix = unix_now();
+    let cached_clone = config_file.session.clone();
+
+    let session_data: Option<(String, String, String, u64)> = if let Some(sess) = cached_clone {
+        if !force_new && sess.expires_at_unix > now_unix + 30 {
+            tracing::info!(
+                "cached access token still valid ({}s left, device_id: {})",
+                sess.expires_at_unix.saturating_sub(now_unix),
+                sess.device_id
+            );
+            match resolve_identity(&config.matrix_url, &sess.access_token).await {
+                Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
+                    tracing::info!("cached session validated; skipping auth");
+                    Some((sess.access_token, sess.user_id, sess.device_id, sess.expires_at_unix))
+                }
+                Ok(_) => {
+                    tracing::warn!("cached session whoami returned different identity; falling through");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("cached session whoami failed: {e:#}; falling through");
+                    None
+                }
+            }
+        } else if let (Some(rt), Some(saved_did)) = (sess.refresh_token.as_ref(), sess.did.as_ref()) {
+            tracing::info!(
+                "{}; attempting refresh grant (device_id: {})",
+                if force_new { "forcing token rotation" } else { "access token expired" },
+                sess.device_id
+            );
+            match siwx_oidc_auth::refresh(&config.siwx_url, client_id, rt, saved_did).await {
+                Ok(new_tokens) => {
+                    let expires_in = new_tokens.expires_in.unwrap_or(300);
+                    tracing::info!(
+                        "refresh grant succeeded (new access token expires in {}s, device_id preserved)",
+                        expires_in
+                    );
+                    let refreshed = SessionCache {
+                        access_token: new_tokens.access_token.clone(),
+                        user_id: sess.user_id.clone(),
+                        device_id: sess.device_id.clone(),
+                        expires_at_unix: unix_now().saturating_add(expires_in),
+                        // If the server rotated the refresh token, persist the new one;
+                        // otherwise keep the old one (siwx-oidc may or may not rotate).
+                        refresh_token: new_tokens.refresh_token.or_else(|| Some(rt.clone())),
+                        did: Some(saved_did.clone()),
+                    };
+                    config_file.session = Some(refreshed.clone());
+                    if let Err(e) = config_file.save(config_path) {
+                        tracing::warn!("failed to persist refreshed session: {e:#}");
+                    }
+                    Some((refreshed.access_token, refreshed.user_id, refreshed.device_id, refreshed.expires_at_unix))
+                }
+                Err(e) => {
+                    tracing::warn!("refresh grant failed: {e:#}; falling through to fresh auth");
+                    None
+                }
+            }
+        } else {
+            tracing::info!("cached access token expired and no refresh_token; re-authenticating");
+            None
+        }
+    } else {
         None
+    };
+
+    if let Some(quad) = session_data {
+        return Ok(quad);
+    }
+
+    tracing::info!("authenticating against {}", config.siwx_url);
+    let tokens = siwx_oidc_auth::authenticate(&config.siwx_url, client_id, redirect_uri, key)
+        .await
+        .context("siwx-oidc authentication failed")?;
+    let expires_in = tokens.expires_in.unwrap_or(300);
+    tracing::info!(
+        "access token acquired (expires in {}s, refresh_token: {})",
+        expires_in,
+        if tokens.refresh_token.is_some() { "yes" } else { "no" }
+    );
+
+    let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
+    tracing::info!("matrix user: {}, device: {}", identity.user_id, identity.device_id);
+
+    let expires_at_unix = unix_now().saturating_add(expires_in);
+    config_file.session = Some(SessionCache {
+        access_token: tokens.access_token.clone(),
+        user_id: identity.user_id.clone(),
+        device_id: identity.device_id.clone(),
+        expires_at_unix,
+        refresh_token: tokens.refresh_token,
+        did: Some(tokens.did.clone()),
+    });
+    if let Err(e) = config_file.save(config_path) {
+        tracing::warn!("failed to persist session cache: {e:#} (continuing anyway)");
+    }
+    Ok((tokens.access_token, identity.user_id, identity.device_id, expires_at_unix))
+}
+
+/// True if `err`'s chain carries a Matrix `M_UNKNOWN_TOKEN` (the access token
+/// was rejected — expired or revoked). String-matched because `send_dm` wraps
+/// the typed matrix-sdk error in `anyhow` (same approach as `is_store_mismatch`).
+fn is_unknown_token(err: &anyhow::Error) -> bool {
+    let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
+    chain.contains("M_UNKNOWN_TOKEN")
+        || chain.contains("UnknownToken")
+        || chain.contains("Token is not active")
+}
+
+/// True if `err` is a homeserver-side `5xx` / `M_UNKNOWN Internal server error`.
+/// Such a failure is NOT something a client retry or a token rotation can fix —
+/// the send path is broken server-side (observed live: Synapse 1.153.0 returning
+/// 500 on every `m.room.message`/`m.room.encrypted` PUT while reads, room
+/// creation, ephemeral and *state* writes all succeed). We bail fast on this so
+/// a notify call returns in seconds instead of burning ~5 min of token life per
+/// attempt inside matrix-sdk's internal 5xx retry loop.
+fn is_server_internal_error(err: &anyhow::Error) -> bool {
+    let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
+    // `M_UNKNOWN` is Matrix's generic errcode for a 5xx, but `M_UNKNOWN_TOKEN` (an
+    // access-token rejection, recovered by `is_unknown_token` + the reactive re-auth in
+    // `send_dm_self_healing`) ALSO contains the substring "M_UNKNOWN". Exclude it, else a
+    // dead/rotated token is misclassified as an unrecoverable server fault and the re-auth
+    // arm becomes dead code (the matched arm order checks server-error first).
+    (chain.contains("M_UNKNOWN") && !chain.contains("M_UNKNOWN_TOKEN"))
+        || chain.contains("status_code: 500")
+        || chain.contains("Internal server error")
+}
+
+/// Hard cap on a single `room.send`. matrix-sdk retries a 5xx internally with
+/// backoff for several minutes — long enough to outlive a 300s access token (the
+/// mechanism that turned a server 500 into the observed `M_UNKNOWN_TOKEN`). This
+/// timeout makes a wedged send return promptly so the self-heal logic, not the
+/// token clock, decides what happens next.
+const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Pure classification used by [`AgentClient::reconcile_owner_dms`]: given the
+/// owner's recorded DM rooms (in `m.direct` order, possibly with duplicates) and a
+/// predicate reporting whether a room is positively STALE (the owner has Left /
+/// been banned), return `(kept, dropped)` — both deduped, first-seen order
+/// preserved. Conservative by design: only positively-stale rooms are dropped, so
+/// a transient sync gap ("member unknown") never evicts a live DM.
+fn partition_dm_rooms(
+    original: &[OwnedRoomId],
+    is_stale: &dyn Fn(&OwnedRoomId) -> bool,
+) -> (Vec<OwnedRoomId>, Vec<OwnedRoomId>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for r in original {
+        if !seen.insert(r.clone()) {
+            continue; // duplicate
+        }
+        if is_stale(r) {
+            dropped.push(r.clone());
+        } else {
+            kept.push(r.clone());
+        }
+    }
+    (kept, dropped)
+}
+
+/// Best-effort: after a store-wipe re-bootstrap minted a NEW device_id, delete the
+/// agent's OTHER server-side devices, so peers stop encrypting to dead devices
+/// whose Megolm keys this device can never read. Under MSC3861/OIDC delegated auth
+/// the Client-Server device-deletion endpoint may be disabled (device lifecycle
+/// belongs to the OIDC provider) — in that case we log and move on; the stale
+/// devices age out on the server. Never fatal.
+async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
+    let devices = match client.devices().await {
+        Ok(r) => r.devices,
+        Err(e) => {
+            tracing::warn!("device prune: could not list devices: {e:#}");
+            return;
+        }
+    };
+    let stale: Vec<OwnedDeviceId> = devices
+        .into_iter()
+        .map(|d| d.device_id)
+        .filter(|id| id.as_str() != keep_device_id)
+        .collect();
+    if stale.is_empty() {
+        tracing::info!(keep = keep_device_id, "device prune: no stale devices to remove");
+        return;
+    }
+    tracing::info!(
+        keep = keep_device_id,
+        stale = stale.len(),
+        "device prune: deleting stale server-side devices after store-wipe re-bootstrap"
+    );
+    match client.delete_devices(&stale, None).await {
+        Ok(_) => tracing::info!(deleted = stale.len(), "device prune: stale devices deleted"),
+        Err(e) => tracing::warn!(
+            "device prune: delete_devices failed (OIDC/MSC3861 may disable C-S device deletion; \
+             stale devices will age out server-side or need OIDC-provider cleanup): {e:#}"
+        ),
+    }
+}
+
+impl AgentClient {
+    /// Resolve THE 1:1 direct room for `target`, deterministically and liveness-checked.
+    ///
+    /// A DM is only usable if the OTHER party is still present: a room the target
+    /// LEFT (or was banned/kicked from) can no longer exchange Megolm keys, so its
+    /// events become permanently undecryptable. matrix-sdk's `get_dm_room()` returns
+    /// the first `m.direct` match in *undefined order* and never checks the peer's
+    /// membership — so a stale/duplicate `m.direct` entry silently bound `#shell` +
+    /// delivery to a dead room in the 2026-06-06 transcript-agent incident.
+    ///
+    /// Instead we scan joined rooms, keep only small (≤2 joined) rooms where the
+    /// target's membership is `Join` (or `Invite` — a freshly created DM the peer
+    /// hasn't accepted yet), and pick deterministically: prefer `Join` over
+    /// `Invite`, then the most-recently-active room, then a stable room-id order.
+    async fn find_dm_room(&self, target: &UserId) -> Option<matrix_sdk::Room> {
+        // (room, rank): rank 2 = target Join, 1 = target Invite. Leave/Ban/Knock excluded.
+        let mut candidates: Vec<(matrix_sdk::Room, u8)> = Vec::new();
+        for room in self.client.joined_rooms() {
+            if room.joined_members_count() > 2 {
+                continue; // group room, not a 1:1 DM
+            }
+            let Some(member) = room.get_member(target).await.ok().flatten() else {
+                continue;
+            };
+            let rank = match member.membership() {
+                MembershipState::Join => 2u8,
+                MembershipState::Invite => 1u8,
+                _ => continue, // Leave / Ban / Knock → stale, never select
+            };
+            candidates.push((room, rank));
+        }
+        match candidates.len() {
+            0 => None,
+            1 => candidates.into_iter().next().map(|(r, _)| r),
+            _ => {
+                // Genuine multiple live DMs (rare): break ties by newest activity.
+                // Cheap (limit=1) and only on the multi-candidate path.
+                let mut scored: Vec<(matrix_sdk::Room, u8, u64)> = Vec::with_capacity(candidates.len());
+                for (room, rank) in candidates {
+                    let ts = self
+                        .messages(room.room_id().as_str(), 1)
+                        .await
+                        .ok()
+                        .and_then(|m| m.iter().map(|x| x.timestamp_ms).max())
+                        .unwrap_or(0);
+                    scored.push((room, rank, ts));
+                }
+                scored.sort_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        .then(b.2.cmp(&a.2))
+                        .then(a.0.room_id().cmp(b.0.room_id()))
+                });
+                scored.into_iter().next().map(|(r, _, _)| r)
+            }
+        }
     }
 
     pub async fn connect(config: AgentConfig) -> Result<Self> {
@@ -341,166 +660,26 @@ impl AgentClient {
         let did = key.did();
         tracing::info!("agent DID: {did}");
 
-        // Resolve client_id and redirect_uri:
-        //   1. Provided in config (CLI flags or env vars)
-        //   2. Cached in config file
-        //   3. Auto-register with siwx-oidc server
+        // Resolve OIDC client + a usable Matrix session (cached token → refresh
+        // grant → fresh did:key auth). Both steps live in standalone helpers so
+        // the on-401 / near-expiry self-heal (`reauth_inner`) re-mints exactly
+        // the same way. See docs/ARCHITECTURE.md "Identity and device-id persistence".
         let config_path = config.store_dir.join("config.toml");
         let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
 
-        let (client_id, redirect_uri) = match (config.client_id, config.redirect_uri) {
-            (Some(cid), Some(ruri)) => (cid, ruri),
-            (Some(cid), None) => {
-                let ruri = config_file
-                    .oidc
-                    .redirect_uri
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
-                (cid, ruri)
-            }
-            (None, Some(ruri)) => {
-                let cid = config_file.oidc.client_id.clone().ok_or_else(|| {
-                    anyhow!("--redirect-uri provided without --client-id, and no cached client_id found")
-                })?;
-                (cid, ruri)
-            }
-            (None, None) => {
-                // Try config file first
-                if let Some(cid) = config_file.oidc.client_id.clone() {
-                    let ruri = config_file
-                        .oidc
-                        .redirect_uri
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
-                    tracing::info!("using cached OIDC credentials from {}", config_path.display());
-                    (cid, ruri)
-                } else {
-                    // Auto-register
-                    let (cid, ruri) = register_oidc_client(&config.siwx_url).await?;
-                    config_file.oidc.client_id = Some(cid.clone());
-                    config_file.oidc.redirect_uri = Some(ruri.clone());
-                    config_file.save(&config_path)?;
-                    tracing::info!("saved OIDC credentials to {}", config_path.display());
-                    (cid, ruri)
-                }
-            }
-        };
+        let (client_id, redirect_uri) =
+            resolve_oidc_client(&config, &mut config_file, &config_path).await?;
 
-        // Resolve a usable Matrix session in this order of preference:
-        //   1. Cached access token still within its TTL  → use it (no network).
-        //   2. Cached refresh token            → exchange for a new access token via
-        //                                       siwx_oidc_auth::refresh() (preserves
-        //                                       device_id → crypto store stays valid).
-        //   3. Fresh authentication            → mints a new device_id; the
-        //                                       store-mismatch retry below wipes
-        //                                       and rebuilds the crypto store.
-        // See docs/ARCHITECTURE.md "Identity and device-id persistence".
-        let now_unix = unix_now();
-        let cached_clone = config_file.session.clone();
-
-        let session_data: Option<(String, String, String, u64)> = if let Some(sess) = cached_clone {
-            if sess.expires_at_unix > now_unix + 30 {
-                tracing::info!(
-                    "cached access token still valid ({}s left, device_id: {})",
-                    sess.expires_at_unix.saturating_sub(now_unix),
-                    sess.device_id
-                );
-                match resolve_identity(&config.matrix_url, &sess.access_token).await {
-                    Ok(id) if id.user_id == sess.user_id && id.device_id == sess.device_id => {
-                        tracing::info!("cached session validated; skipping auth");
-                        Some((sess.access_token, sess.user_id, sess.device_id, sess.expires_at_unix))
-                    }
-                    Ok(_) => {
-                        tracing::warn!("cached session whoami returned different identity; falling through");
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!("cached session whoami failed: {e:#}; falling through");
-                        None
-                    }
-                }
-            } else if let (Some(rt), Some(saved_did)) = (sess.refresh_token.as_ref(), sess.did.as_ref()) {
-                tracing::info!(
-                    "access token expired; attempting refresh grant (device_id: {})",
-                    sess.device_id
-                );
-                match siwx_oidc_auth::refresh(&config.siwx_url, &client_id, rt, saved_did).await {
-                    Ok(new_tokens) => {
-                        let expires_in = new_tokens.expires_in.unwrap_or(300);
-                        tracing::info!(
-                            "refresh grant succeeded (new access token expires in {}s, device_id preserved)",
-                            expires_in
-                        );
-                        let refreshed = SessionCache {
-                            access_token: new_tokens.access_token.clone(),
-                            user_id: sess.user_id.clone(),
-                            device_id: sess.device_id.clone(),
-                            expires_at_unix: unix_now().saturating_add(expires_in),
-                            // If the server rotated the refresh token, persist the new one;
-                            // otherwise keep the old one (siwx-oidc may or may not rotate).
-                            refresh_token: new_tokens.refresh_token.or_else(|| Some(rt.clone())),
-                            did: Some(saved_did.clone()),
-                        };
-                        config_file.session = Some(refreshed.clone());
-                        if let Err(e) = config_file.save(&config_path) {
-                            tracing::warn!("failed to persist refreshed session: {e:#}");
-                        }
-                        Some((refreshed.access_token, refreshed.user_id, refreshed.device_id, refreshed.expires_at_unix))
-                    }
-                    Err(e) => {
-                        tracing::warn!("refresh grant failed: {e:#}; falling through to fresh auth");
-                        None
-                    }
-                }
-            } else {
-                tracing::info!("cached access token expired and no refresh_token; re-authenticating");
-                None
-            }
-        } else {
-            None
-        };
-
-        let (access_token, user_id_str, device_id_str, expires_at_unix) = match session_data {
-            Some(quad) => quad,
-            None => {
-                tracing::info!("authenticating against {}", config.siwx_url);
-                let tokens = siwx_oidc_auth::authenticate(
-                    &config.siwx_url,
-                    &client_id,
-                    &redirect_uri,
-                    &key,
-                )
-                .await
-                .context("siwx-oidc authentication failed")?;
-                let expires_in = tokens.expires_in.unwrap_or(300);
-                tracing::info!(
-                    "access token acquired (expires in {}s, refresh_token: {})",
-                    expires_in,
-                    if tokens.refresh_token.is_some() { "yes" } else { "no" }
-                );
-
-                let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
-                tracing::info!(
-                    "matrix user: {}, device: {}",
-                    identity.user_id,
-                    identity.device_id
-                );
-
-                let expires_at_unix = unix_now().saturating_add(expires_in);
-                config_file.session = Some(SessionCache {
-                    access_token: tokens.access_token.clone(),
-                    user_id: identity.user_id.clone(),
-                    device_id: identity.device_id.clone(),
-                    expires_at_unix,
-                    refresh_token: tokens.refresh_token,
-                    did: Some(tokens.did.clone()),
-                });
-                if let Err(e) = config_file.save(&config_path) {
-                    tracing::warn!("failed to persist session cache: {e:#} (continuing anyway)");
-                }
-                (tokens.access_token, identity.user_id, identity.device_id, expires_at_unix)
-            }
-        };
+        let (access_token, user_id_str, device_id_str, expires_at_unix) = acquire_session(
+            &config,
+            &key,
+            &client_id,
+            &redirect_uri,
+            &mut config_file,
+            &config_path,
+            false,
+        )
+        .await?;
 
         let user_id: OwnedUserId = user_id_str
             .try_into()
@@ -514,6 +693,7 @@ impl AgentClient {
         // store binds to the device_id it was created with. When they diverge we
         // wipe matrix-sdk-*.sqlite3* (NOT config.toml) and let cross-signing
         // re-bootstrap on the new device.
+        let mut wiped = false;
         let client = match build_and_restore(
             &config.matrix_url,
             &config.store_dir,
@@ -529,6 +709,7 @@ impl AgentClient {
                     "crypto store device_id mismatch; wiping store and retrying once: {e:#}"
                 );
                 wipe_crypto_store(&config.store_dir);
+                wiped = true;
                 build_and_restore(
                     &config.matrix_url,
                     &config.store_dir,
@@ -547,7 +728,10 @@ impl AgentClient {
             .sync_once(SyncSettings::default())
             .await
             .context("initial sync failed")?;
-        tracing::info!("connected");
+        // Log device_id on every connect so device CHURN (a fresh did:key auth
+        // minting a new device, leaving orphaned server-side devices the peer may
+        // still encrypt to) is visible in the journal. See `prune_stale_devices`.
+        tracing::info!(device_id = %device_id, store_wiped = wiped, "connected");
 
         // Cold-start recovery: if a recovery key was persisted and cross-signing
         // is NOT yet complete (e.g. after a store wipe), restore cross-signing +
@@ -590,12 +774,128 @@ impl AgentClient {
         // it isn't there yet. Best-effort: never fails connect().
         recovery::enable_and_persist_if_absent(&client, &config.store_dir).await;
 
+        // If we just re-bootstrapped onto a NEW device_id (store wipe), the peer's
+        // client may still be encrypting to our previous, now-dead devices (whose
+        // keys this device can't read → undecryptable messages). Best-effort prune
+        // of the stale server-side devices. Only on the wipe path (rare).
+        if wiped {
+            prune_stale_devices(&client, device_id.as_str()).await;
+        }
+
         Ok(Self {
             client,
             did,
             user_id,
             expires_at_unix,
+            config,
         })
+    }
+
+    /// Re-mint the Matrix session non-interactively and rebuild the inner
+    /// matrix-sdk client in place. Used by the send path to self-heal when the
+    /// cached access token has expired or been rejected (`M_UNKNOWN_TOKEN`).
+    ///
+    /// It reloads the `did:key`, resolves the OIDC client, then calls
+    /// [`acquire_session`] with `force_new = true` (so a near-expiry token is
+    /// rotated, not reused) — which exchanges the persisted refresh token for a
+    /// fresh access token, or, if that fails, re-authenticates from the key.
+    /// The device_id is preserved across a refresh grant, so the existing
+    /// SQLite crypto store stays valid and no re-bootstrap is needed; a store
+    /// mismatch (only possible if a *fresh* auth minted a new device_id) is
+    /// handled by the same wipe-and-retry as `connect()`.
+    /// Rotate the session. `sync_after = true` runs a fresh `sync_once` so an
+    /// immediately-following SEND can resolve the DM room + Megolm session.
+    /// `sync_after = false` skips that sync — for a client that ONLY does REST
+    /// reads (`messages`) or reads state from the shared store kept fresh by a
+    /// DIFFERENT syncing client. Skipping the sync avoids a SECOND concurrent
+    /// sync on the same device, which would race to-device (Megolm key) delivery
+    /// against the other client and silently drop room keys (H9 single-sync).
+    async fn reauth_inner(&mut self, sync_after: bool) -> Result<()> {
+        let key = SiwxKey::from_pem_file(&self.config.key_file)
+            .context("reauth: failed to load key")?;
+        let config_path = self.config.store_dir.join("config.toml");
+        let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
+        let (client_id, redirect_uri) =
+            resolve_oidc_client(&self.config, &mut config_file, &config_path).await?;
+
+        let (access_token, user_id_str, device_id_str, expires_at_unix) = acquire_session(
+            &self.config,
+            &key,
+            &client_id,
+            &redirect_uri,
+            &mut config_file,
+            &config_path,
+            true,
+        )
+        .await
+        .context("reauth: could not acquire a fresh session")?;
+
+        let user_id: OwnedUserId = user_id_str
+            .try_into()
+            .map_err(|e| anyhow!("reauth: invalid user_id: {e}"))?;
+        let device_id: OwnedDeviceId = device_id_str.into();
+
+        let client = match build_and_restore(
+            &self.config.matrix_url,
+            &self.config.store_dir,
+            &user_id,
+            &device_id,
+            &access_token,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) if is_store_mismatch(&e) => {
+                tracing::warn!("reauth: crypto store device_id mismatch; wiping and retrying once: {e:#}");
+                wipe_crypto_store(&self.config.store_dir);
+                build_and_restore(
+                    &self.config.matrix_url,
+                    &self.config.store_dir,
+                    &user_id,
+                    &device_id,
+                    &access_token,
+                )
+                .await
+                .context("reauth: restore_session failed even after store wipe")?
+            }
+            Err(e) => return Err(e),
+        };
+
+        // A fresh sync primes the new client's room/membership state so the
+        // immediately-following send resolves the DM room and Megolm session.
+        // Skipped for token-only refreshes (see `sync_after` doc) to avoid a
+        // second concurrent sync racing to-device key delivery.
+        if sync_after {
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .context("reauth: post-reauth sync failed")?;
+        }
+
+        self.client = client;
+        self.user_id = user_id;
+        self.expires_at_unix = expires_at_unix;
+        tracing::info!(
+            sync_after,
+            "reauth: session rotated; new token valid for {}s",
+            expires_at_unix.saturating_sub(unix_now())
+        );
+        Ok(())
+    }
+
+    /// Rotate the access token IN PLACE without a fresh `sync_once`. Use from a
+    /// client that only does REST reads (`messages`) or reads state from a store
+    /// kept fresh by another syncing client — e.g. the in-call control/presence
+    /// poller, which must NOT run a second sync alongside the E2EE media driver on
+    /// the same device (that race silently drops Megolm room keys → undecryptable
+    /// audio → empty transcripts). See `reauth_inner`'s `sync_after` rationale.
+    pub async fn reauth_token_only(&mut self) -> Result<()> {
+        self.reauth_inner(false).await
+    }
+
+    /// Seconds of life left on the current access token (0 if already expired).
+    fn token_seconds_left(&self) -> u64 {
+        self.expires_at_unix.saturating_sub(unix_now())
     }
 
     pub fn did(&self) -> &str {
@@ -647,17 +947,141 @@ impl AgentClient {
     /// of `create_dm` spawning a duplicate room (which splits the two sides into
     /// separate rooms and breaks Megolm key exchange). Best-effort by the caller.
     pub async fn mark_dm(&self, room_id: &str, target: &str) -> Result<()> {
-        let room_id: &RoomId = room_id
+        let room_id: OwnedRoomId = room_id
             .try_into()
             .map_err(|e| anyhow!("invalid room_id: {e}"))?;
         let target: &UserId = target
             .try_into()
             .map_err(|e| anyhow!("invalid target: {e}"))?;
+        // Dedup-aware: matrix-sdk's `mark_as_dm` appends unconditionally, so over
+        // repeated joins/marks it accumulates duplicate `m.direct` entries (which,
+        // with the order-undefined `get_dm_room`, bound `#shell`/delivery to a dead
+        // room in the 2026-06-06 incident). Only write if not already recorded.
+        let raw = self
+            .client
+            .account()
+            .fetch_account_data_static::<DirectEventContent>()
+            .await
+            .context("fetch m.direct failed")?;
+        let mut content = raw
+            .map(|r| r.deserialize())
+            .transpose()
+            .context("deserialize m.direct failed")?
+            .unwrap_or_default();
+        let key: OwnedDirectUserIdentifier = target.into();
+        let list = content.entry(key).or_default();
+        if list.iter().any(|r| r == &room_id) {
+            return Ok(()); // already marked — no redundant server write
+        }
+        list.push(room_id);
         self.client
             .account()
-            .mark_as_dm(room_id, &[target.to_owned()])
+            .set_account_data(content)
             .await
-            .context("mark_as_dm failed")?;
+            .context("set m.direct failed")?;
+        Ok(())
+    }
+
+    /// Reconcile `m.direct` for `owner` to the LIVE 1:1 DM(s) only, and leave+forget
+    /// any DM rooms the owner has abandoned.
+    ///
+    /// `mark_as_dm` appends, so repeated joins accumulate duplicate + stale entries;
+    /// combined with the order-undefined `get_dm_room`, a stale entry silently bound
+    /// `#shell`/delivery to a dead (undecryptable) room in the 2026-06-06 incident.
+    /// Run once at startup. Best-effort — a hiccup must never be fatal to the caller.
+    ///
+    /// "Live" = the agent is currently joined AND the owner's membership is `Join`
+    /// or `Invite`. Rooms where the owner has Left/been-banned are dropped from
+    /// `m.direct` and (if the agent is still joined) left+forgotten so they stop
+    /// generating undecryptable-event churn on every poll.
+    pub async fn reconcile_owner_dms(&self, owner: &str) -> Result<()> {
+        let owner: &UserId = owner
+            .try_into()
+            .map_err(|e| anyhow!("invalid owner: {e}"))?;
+
+        let raw = self
+            .client
+            .account()
+            .fetch_account_data_static::<DirectEventContent>()
+            .await
+            .context("fetch m.direct failed")?;
+        let mut content = match raw {
+            Some(r) => r.deserialize().context("deserialize m.direct failed")?,
+            None => return Ok(()), // no DMs recorded yet
+        };
+
+        let key: OwnedDirectUserIdentifier = owner.into();
+        let Some(original) = content.get(&key).cloned() else {
+            return Ok(());
+        };
+
+        // Set of rooms the agent is currently joined to.
+        let joined: std::collections::HashSet<OwnedRoomId> = self
+            .client
+            .joined_rooms()
+            .iter()
+            .map(|r| r.room_id().to_owned())
+            .collect();
+
+        // Determine, per unique room, whether the owner is POSITIVELY gone
+        // (membership Leave/Ban). Unknown membership / unknown room → NOT stale, so
+        // a transient sync gap can never evict the live DM. Then classify via a
+        // pure fn (deduped, order-preserving).
+        let mut stale_map: std::collections::HashMap<OwnedRoomId, bool> =
+            std::collections::HashMap::new();
+        for room_id in &original {
+            if stale_map.contains_key(room_id) {
+                continue;
+            }
+            let positively_stale = match self.client.get_room(room_id) {
+                Some(room) => matches!(
+                    room.get_member(owner)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|m| m.membership().clone()),
+                    Some(MembershipState::Leave) | Some(MembershipState::Ban)
+                ),
+                None => false, // unknown room → keep (don't drop on uncertainty)
+            };
+            stale_map.insert(room_id.clone(), positively_stale);
+        }
+        let (kept, dropped) =
+            partition_dm_rooms(&original, &|r| *stale_map.get(r).unwrap_or(&false));
+
+        // Leave + forget rooms the owner abandoned but the agent is still in, so
+        // they stop generating undecryptable-event churn on every poll.
+        for room_id in &dropped {
+            if !joined.contains(room_id) {
+                continue;
+            }
+            if let Some(room) = self.client.get_room(room_id) {
+                if let Err(e) = room.leave().await {
+                    tracing::warn!(%room_id, "reconcile: leave stale DM failed: {e:#}");
+                    continue;
+                }
+                if let Err(e) = room.forget().await {
+                    tracing::warn!(%room_id, "reconcile: forget stale DM failed: {e:#}");
+                }
+                tracing::info!(%room_id, "reconcile: left+forgot stale DM (owner had left)");
+            }
+        }
+
+        if kept == original {
+            return Ok(()); // already clean (no dups, no positively-stale entries)
+        }
+        content.insert(key, kept.clone());
+        self.client
+            .account()
+            .set_account_data(content)
+            .await
+            .context("rewrite m.direct failed")?;
+        tracing::info!(
+            owner = %owner,
+            kept = kept.len(),
+            dropped = dropped.len(),
+            "reconcile: m.direct rewritten (duplicates + owner-left rooms removed)"
+        );
         Ok(())
     }
 
@@ -689,6 +1113,105 @@ impl AgentClient {
     /// on persistence), so retrying cannot duplicate a delivered message.
     pub async fn send_dm_reliable(&self, target: &str, message: &str) -> Result<String> {
         retry_finalize("send-dm", || self.send_dm(target, message)).await
+    }
+
+    /// Send a Markdown message into an **arbitrary already-joined room** (by room
+    /// id), NOT a DM. The agent must already be a member of `room_id` (it is — it
+    /// joined the owner's room to transcribe the call). Unlike [`send_dm`], this
+    /// does not resolve/create a `m.direct` room: it targets a specific room, so
+    /// it is the path for announcing recording state and acking participant
+    /// opt-out/in **in the call room** where everyone (not just the owner) sees
+    /// it. Returns the persisted event id.
+    pub async fn send_to_room(&self, room_id: &str, message: &str) -> Result<String> {
+        let room_id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id: {e}"))?;
+        let room = self
+            .client
+            .get_room(room_id)
+            .ok_or_else(|| anyhow!("room {room_id} not found (agent not joined?)"))?;
+        let resp = room
+            .send(RoomMessageEventContent::text_markdown(message))
+            .await
+            .context("failed to send room message")?;
+        Ok(resp.response.event_id.to_string())
+    }
+
+    /// [`send_dm`] bounded by [`SEND_ATTEMPT_TIMEOUT`] so a server-5xx that
+    /// matrix-sdk would otherwise retry internally for minutes can't silently
+    /// consume the access token's whole lifetime. A timeout is surfaced as a
+    /// normal error so the caller's self-heal logic runs.
+    async fn send_dm_bounded(&self, target: &str, message: &str) -> Result<String> {
+        match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, self.send_dm(target, message)).await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!(
+                "send timed out after {}s (homeserver not acknowledging the event)",
+                SEND_ATTEMPT_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// Token-resilient DM send for the one-shot CLI. siwx-oidc access tokens
+    /// live only ~300s and the matrix-sdk client is restored with
+    /// `refresh_token: None`, so it cannot self-refresh — a `connect()` whose
+    /// startup (sync + cross-signing + recovery) ate most of the token's life
+    /// would then `send` with a near-dead or already-expired token and get
+    /// `401 M_UNKNOWN_TOKEN`. This was the surface symptom in
+    /// `~/.aqua-matrix-notify/notify.log`.
+    ///
+    /// Self-healing, all non-interactive (driven by the persisted refresh token
+    /// / the `did:key` at `key_file`):
+    ///   1. **Proactive:** if the access token has under [`TOKEN_REFRESH_MARGIN`]
+    ///      of life left, rotate it via `reauth_inner()` *before* sending.
+    ///   2. **Reactive token heal:** if a send fails with `M_UNKNOWN_TOKEN`
+    ///      (token revoked, or it died in the request window), re-auth and retry.
+    ///   3. **Fail fast on server faults:** a `5xx` / `M_UNKNOWN Internal server
+    ///      error` is a homeserver bug, not a token problem — retrying or
+    ///      re-authing cannot fix it and would only burn tokens, so we surface it
+    ///      immediately with an actionable message. Each attempt is also bounded
+    ///      by [`SEND_ATTEMPT_TIMEOUT`] so a wedged send returns in seconds.
+    pub async fn send_dm_self_healing(&mut self, target: &str, message: &str) -> Result<String> {
+        // 1. Proactive refresh: never send on a token that is about to expire.
+        if self.token_seconds_left() < TOKEN_REFRESH_MARGIN {
+            tracing::info!(
+                "access token has {}s left (< {}s margin); rotating before send",
+                self.token_seconds_left(),
+                TOKEN_REFRESH_MARGIN
+            );
+            if let Err(e) = self.reauth_inner(true).await {
+                // Don't hard-fail yet — the current token may still have a few
+                // seconds; let the send attempt (and the reactive path) decide.
+                tracing::warn!("proactive reauth failed: {e:#}; attempting send with current token");
+            }
+        }
+
+        // 2. First send attempt (bounded).
+        match self.send_dm_bounded(target, message).await {
+            Ok(id) => return Ok(id),
+            Err(e) if is_server_internal_error(&e) => {
+                return Err(e).context(
+                    "homeserver rejected the send with a 5xx/Internal server error — \
+                     this is a server-side fault (reads/auth work, message persistence does not), \
+                     not a token or client problem; retrying will not help",
+                );
+            }
+            Err(e) if is_unknown_token(&e) => {
+                tracing::warn!("send rejected with M_UNKNOWN_TOKEN; re-authenticating and retrying once");
+                self.reauth_inner(true)
+                    .await
+                    .context("re-auth after M_UNKNOWN_TOKEN failed")?;
+            }
+            Err(e) => return Err(e),
+        }
+
+        // 3. Post-reauth retry (only reached on a token rejection above).
+        match self.send_dm_bounded(target, message).await {
+            Ok(id) => Ok(id),
+            Err(e) if is_server_internal_error(&e) => Err(e).context(
+                "homeserver still returns a 5xx after re-authentication — server-side send fault",
+            ),
+            Err(e) => Err(e).context("send still failed after re-authentication"),
+        }
     }
 
     /// Upsert this agent's fleet-registry entry in global account data under
@@ -866,6 +1389,13 @@ const STREAM_MAX_BYTES: usize = 16_000;
 const FINALIZE_MAX_ATTEMPTS: usize = 5;
 /// Linear backoff base between finalize attempts (attempt N waits N×base).
 const FINALIZE_RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Proactively rotate the access token before a one-shot send when it has less
+/// than this much life left. siwx-oidc tokens live ~300s and a `connect()`'s
+/// own startup (sync + cross-signing + recovery) can consume much of that, so a
+/// generous margin guarantees the send runs on a token that won't expire
+/// mid-request. See [`AgentClient::send_dm_self_healing`].
+const TOKEN_REFRESH_MARGIN: u64 = 60;
 
 /// Retry `op` until it returns `Ok` (the send was acknowledged by the server)
 /// or [`FINALIZE_MAX_ATTEMPTS`] is exhausted, with linear backoff. `op`'s `Ok`
@@ -1072,6 +1602,56 @@ mod tests {
         assert!(contents.contains("client_id = \"test-id-123\""));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partition_dm_rooms_dedups_and_drops_stale() {
+        // Mirrors the 2026-06-06 incident: m.direct[owner] = [bND, bND, Ejp];
+        // owner left Ejp (positively stale). Expect bND once kept, Ejp dropped.
+        let bnd = RoomId::parse("!bNDjtSpZzYnJQTBWvo:matrix.inblock.io").unwrap();
+        let ejp = RoomId::parse("!EjpPLRYTPVsWdqrtGc:matrix.inblock.io").unwrap();
+        let original = vec![bnd.clone(), bnd.clone(), ejp.clone()];
+        let stale_set: std::collections::HashSet<OwnedRoomId> =
+            [ejp.clone()].into_iter().collect();
+        let (kept, dropped) = partition_dm_rooms(&original, &|r| stale_set.contains(r));
+        assert_eq!(kept, vec![bnd], "kept holds the single live DM, deduped");
+        assert_eq!(dropped, vec![ejp], "dropped holds the room the owner left");
+    }
+
+    #[test]
+    fn partition_dm_rooms_no_stale_preserves_order_deduped() {
+        // Conservative path: nothing positively stale → keep all (deduped), drop none.
+        let a = RoomId::parse("!aaa:matrix.inblock.io").unwrap();
+        let b = RoomId::parse("!bbb:matrix.inblock.io").unwrap();
+        let original = vec![a.clone(), b.clone(), a.clone()];
+        let (kept, dropped) = partition_dm_rooms(&original, &|_| false);
+        assert_eq!(kept, vec![a, b], "first-seen order preserved, duplicate dropped");
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn unknown_token_not_classified_as_server_error() {
+        // Regression: "M_UNKNOWN_TOKEN" contains the substring "M_UNKNOWN", so a naive
+        // is_server_internal_error swallowed a dead-token error and the server-error arm
+        // (checked before is_unknown_token in send_dm_self_healing) skipped the reactive
+        // re-auth. A token rejection must classify as unknown-token ONLY; a bare
+        // M_UNKNOWN / 500 must classify as server-error ONLY.
+        let token_err = anyhow::anyhow!(
+            "the homeserver returned an error: M_UNKNOWN_TOKEN: Token is not active"
+        );
+        assert!(is_unknown_token(&token_err), "token rejection should be unknown-token");
+        assert!(
+            !is_server_internal_error(&token_err),
+            "token rejection must NOT be classified as a server internal error"
+        );
+
+        let server_err =
+            anyhow::anyhow!("the homeserver returned an error: M_UNKNOWN (status_code: 500)");
+        assert!(
+            is_server_internal_error(&server_err),
+            "bare M_UNKNOWN/500 is a server internal error"
+        );
+        assert!(!is_unknown_token(&server_err), "a server fault is not a token rejection");
     }
 
     #[test]

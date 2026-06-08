@@ -218,14 +218,15 @@ pub trait MessageHandler: Send + Sync + 'static {
     async fn on_tick(&self, _agent: &AgentClient, _target: &str) {}
 
     /// DID/MXID allow-deny SEAM. Default == today's exact behavior (single
-    /// target, case-insensitive). [`dispatch`] and `register_invite_autojoin`
-    /// call THIS instead of the inline equality check. SEAM(aqua-security):
-    /// this is the white/blacklist hook keyed on DIDs — a future signature will
-    /// take `sender_did: Option<&str>` plus a per-template allow/deny policy
-    /// object (BOTH an allow-list AND a deny-list); the bool default stays
-    /// `{target}` this phase so behavior is unchanged.
+    /// target, ASCII-case-insensitive — see [`mxid_authorized`] for why that is
+    /// both correct and safe against impersonation). [`dispatch`] and
+    /// `register_invite_autojoin` call THIS instead of the inline equality check.
+    /// SEAM(aqua-security): this is the white/blacklist hook keyed on DIDs — a
+    /// future signature will take `sender_did: Option<&str>` plus a per-template
+    /// allow/deny policy object (BOTH an allow-list AND a deny-list); the bool
+    /// default stays `{target}` this phase so behavior is unchanged.
     fn authorize(&self, sender_mxid: &str, target: &str) -> bool {
-        sender_mxid.eq_ignore_ascii_case(target)
+        mxid_authorized(sender_mxid, target)
     }
 
     /// Handle one inbound text message from `target`. The relay has already
@@ -253,6 +254,117 @@ pub trait MessageHandler: Send + Sync + 'static {
     async fn on_call(&self, _agent: &AgentClient, _target: &str, _call: &InboundCall) {}
 }
 
+/// Canonical peer-authorization check: does `sender_mxid` denote the SAME Matrix
+/// user as the configured `target`?
+///
+/// This is the relay's whole firewall: a consultant only auto-joins rooms its
+/// bound peer invites it to, and only replies to that peer. Getting the equality
+/// wrong in either direction is a security/correctness bug — too strict silently
+/// drops the real peer; too loose lets an impostor in.
+///
+/// **Why ASCII-case-insensitive is CORRECT.** Our peers' MXID localparts encode
+/// `did:key` / `did:pkh` identifiers whose base58/hex payload is case-significant
+/// at the DID layer, so a configured `target` derived from a mixed-case DID can
+/// carry uppercase letters (e.g. `@did-key-zDnaef1WiYi9AX…`). But Synapse
+/// **canonicalises every MXID localpart to lowercase**: it is what lands in the
+/// `sender` / `state_key` of every event the relay sees (verified against the
+/// live agents' state stores — every `sender` field is lowercase, including each
+/// agent's own `whoami`-resolved `user_id`). So an exact compare of a lowercased
+/// `ev.sender` against a mixed-case `target` would reject EVERY message from such
+/// a peer. Folding ASCII case closes that gap.
+///
+/// **Why it does NOT weaken the firewall.** The folding is safe precisely
+/// *because* Synapse lowercases localparts: two MXIDs that differ only in ASCII
+/// case can never be two DISTINCT accounts — they canonicalise to the same user,
+/// so there is no separate "impostor differing only in case" for the fold to
+/// admit. The relay never receives an `ev.sender` that still carries uppercase;
+/// the only uppercase in play is on the *configured* side (`target`), under the
+/// operator's control. We fold **ASCII only** (`eq_ignore_ascii_case`), matching
+/// the ASCII-only Matrix localpart grammar and Synapse's ASCII lowercasing — a
+/// Unicode case fold could conflate codepoints Synapse keeps distinct, so we
+/// deliberately avoid it. Net: the set of accepted senders is exactly `{target}`
+/// canonicalised — never broader.
+pub fn mxid_authorized(sender_mxid: &str, target: &str) -> bool {
+    sender_mxid.eq_ignore_ascii_case(target)
+}
+
+/// True for a "near miss": `sender` is NOT authorized under the exact
+/// (case-sensitive) compare yet WOULD match `target` case-insensitively. Today
+/// this should never fire on a real `ev.sender` (Synapse already lowercased it),
+/// so logging it at authorize time turns a previously-silent casing surprise
+/// into a visible WARN — the canary that the "Synapse lowercases" assumption
+/// (or a `target` typo) has broken.
+fn is_case_only_mismatch(sender_mxid: &str, target: &str) -> bool {
+    sender_mxid != target && sender_mxid.eq_ignore_ascii_case(target)
+}
+
+/// Emit a WARN when an inbound `kind` ("message" / "invite" / "call") is dropped
+/// from a sender that is a case-only near-miss of `target`. With the default
+/// `authorize` (which folds case) this branch is unreachable — a near-miss IS
+/// authorized — so the only way to reach it is a handler that OVERRODE
+/// `authorize` to compare case-sensitively. Logging it makes such a silent
+/// casing-mismatch drop visible instead of invisible, satisfying the "never
+/// silent again" requirement regardless of the handler's policy.
+///
+/// Takes `role` (not the handler) so the call sites can pass `handler.role()`
+/// without wrestling the `Arc<H>` they hold into a `&H`.
+fn warn_on_case_only_drop(sender_mxid: &str, target: &str, role: &str, kind: &str) {
+    if is_case_only_mismatch(sender_mxid, target) {
+        tracing::warn!(
+            "{role}: dropped {kind} from {sender_mxid:?}: it matches target {target:?} only \
+             up to ASCII case, but this handler's authorize() rejected it. A peer whose \
+             MXID differs from the configured target only in case is being IGNORED — \
+             check the target casing."
+        );
+    }
+}
+
+/// Validate the configured `target` at startup and log loudly on anything that
+/// would make the firewall silently misbehave. Non-fatal by design: a consultant
+/// with a slightly-off target should still come up (and stay observable) rather
+/// than crash-loop, but the operator gets an unmistakable WARN.
+///
+/// Checks, in order:
+///  1. Structural: a Matrix user ID is `@localpart:server`. A `target` missing
+///     the leading `@` or the `:server` is malformed and will match nothing.
+///  2. Canonical casing: Synapse delivers `ev.sender` lowercased, so a `target`
+///     whose localpart carries uppercase can ONLY ever match via the
+///     case-insensitive fold. That still works, but it means the configured form
+///     differs from what the server delivers — worth surfacing so a genuine typo
+///     isn't mistaken for the expected DID mixed-casing.
+///
+/// Returns `true` iff the target is well-formed (callers may log/proceed
+/// regardless; the bool is for tests and future fail-closed policies).
+pub fn validate_target(target: &str, role: &str) -> bool {
+    let well_formed = match target.split_once(':') {
+        Some((user, server)) => {
+            target.starts_with('@') && user.len() > 1 && !server.is_empty()
+        }
+        None => false,
+    };
+    if !well_formed {
+        tracing::warn!(
+            "{role}: configured target {target:?} is not a well-formed Matrix user ID \
+             (@localpart:server); the relay will authorize NO sender against it and the \
+             consultant will silently reply to no one — check AGENT_TARGET / .target"
+        );
+        return false;
+    }
+    // Localpart is everything between '@' and the first ':'.
+    let localpart = &target[1..target.find(':').unwrap_or(target.len())];
+    if localpart.chars().any(|c| c.is_ascii_uppercase()) {
+        tracing::warn!(
+            "{role}: configured target {target:?} has an UPPERCASE localpart, but Synapse \
+             canonicalises MXIDs to lowercase, so inbound events arrive lowercased. \
+             Authorization still works (it folds ASCII case), but the configured form \
+             differs from the delivered form — confirm this is the intended DID casing \
+             and not a typo. Canonical (delivered) form: {:?}",
+            target.to_ascii_lowercase()
+        );
+    }
+    true
+}
+
 /// Run the agent daemon forever: connect, serve, rotate, repeat. Only returns
 /// by `std::process::exit` after [`MAX_CONNECT_FAILURES`] consecutive connect
 /// failures (so systemd restarts a clean process).
@@ -266,6 +378,11 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         target,
         REFRESH_GUARD_SECS,
     );
+
+    // Validate the configured peer at startup so a malformed or non-canonical
+    // target is surfaced LOUDLY once, rather than manifesting as a consultant
+    // that silently replies to no one. Non-fatal: we log and continue.
+    validate_target(&target, handler.role());
 
     // The inbound-message dedupe watermark lives ACROSS cycles, created once
     // here at "now": the FIRST cycle therefore ignores pre-startup backlog
@@ -583,6 +700,7 @@ fn register_invite_autojoin<H: MessageHandler>(
                 // case-insensitive single-peer check. Safe under the strict
                 // single-peer DM design; messaging/dispatch behavior unchanged.
                 if !handler.authorize(ev.sender.as_str(), &target) {
+                    warn_on_case_only_drop(ev.sender.as_str(), &target, handler.role(), "invite");
                     return;
                 }
                 match room.join().await {
@@ -717,6 +835,7 @@ async fn dispatch_call<H: MessageHandler>(
     room_id: &str,
 ) {
     if !handler.authorize(sender, target) {
+        warn_on_case_only_drop(sender, target, handler.role(), "call");
         return;
     }
     let call = InboundCall {
@@ -743,6 +862,7 @@ async fn dispatch<H: MessageHandler>(
     // `did:key` is not — an exact compare would silently drop every inbound
     // message from such a peer.
     if !handler.authorize(ev.sender.as_str(), target) {
+        warn_on_case_only_drop(ev.sender.as_str(), target, handler.role(), "message");
         return;
     }
     let ts_ms = u64::from(ev.origin_server_ts.0);
@@ -836,4 +956,91 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::{is_case_only_mismatch, mxid_authorized, validate_target};
+
+    // The real fleet's two contrasting peers: one all-lowercase localpart, one
+    // mixed-case `did:key`. Synapse delivers `ev.sender` lowercased in both
+    // cases (verified against the live state stores), so authorization must
+    // accept the lowercased sender against EITHER configured form.
+    const TARGET_LOWER: &str =
+        "@did-key-zdnaezp2zvct2tp3zvjkqxynzyzbxnuuz3zw5mhf6cysgyfio:matrix.inblock.io";
+    const TARGET_MIXED: &str =
+        "@did-key-zDnaef1WiYi9AXZgz55kptPRnTUkt3iZ7U6bqkjmoDMkpvdSL:matrix.inblock.io";
+
+    #[test]
+    fn lowercase_sender_matches_lowercase_target() {
+        // Trivial exact match: the all-lowercase peer.
+        assert!(mxid_authorized(TARGET_LOWER, TARGET_LOWER));
+    }
+
+    #[test]
+    fn synapse_lowercased_sender_matches_mixed_case_target() {
+        // The crux of the bug report: Synapse delivers the mixed-case did:key
+        // peer's MXID lowercased. A case-SENSITIVE compare would drop it; the
+        // canonical compare must accept it.
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        assert_ne!(delivered, TARGET_MIXED, "fixture must actually differ in case");
+        assert!(
+            mxid_authorized(&delivered, TARGET_MIXED),
+            "lowercased sender must authorize against a mixed-case did:key target"
+        );
+    }
+
+    #[test]
+    fn distinct_peer_is_rejected() {
+        // The core security property: a different peer must NOT be authorized.
+        assert!(!mxid_authorized(TARGET_LOWER, TARGET_MIXED));
+        assert!(!mxid_authorized(
+            "@did-key-zeviltwin:matrix.inblock.io",
+            TARGET_MIXED
+        ));
+        // Same localpart, different homeserver — a distinct MXID, must reject.
+        assert!(!mxid_authorized(
+            "@did-key-zdnaef1wiyi9axzgz55kptprntukt3iz7u6bqkjmodmkpvdsl:evil.example.com",
+            TARGET_MIXED
+        ));
+    }
+
+    #[test]
+    fn fold_is_ascii_only_no_unicode_conflation() {
+        // We must fold ASCII case ONLY. A non-ASCII codepoint that a Unicode
+        // fold might equate to an ASCII letter must NOT match — Synapse keeps
+        // such codepoints distinct, so widening here would be a real hole.
+        // 'İ' (U+0130) Unicode-lowercases toward 'i'; ASCII fold leaves it alone.
+        assert!(!mxid_authorized("@\u{0130}:matrix.inblock.io", "@i:matrix.inblock.io"));
+    }
+
+    #[test]
+    fn near_miss_is_flagged() {
+        // A case-only near-miss: same up to ASCII case but not byte-identical.
+        // This is exactly the situation that used to be a SILENT drop under a
+        // case-sensitive compare; `is_case_only_mismatch` is what lets the relay
+        // surface it as a WARN.
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        assert!(is_case_only_mismatch(&delivered, TARGET_MIXED));
+        // An exact match is NOT a near-miss (nothing to warn about).
+        assert!(!is_case_only_mismatch(TARGET_LOWER, TARGET_LOWER));
+        // A genuinely different sender is NOT a near-miss either.
+        assert!(!is_case_only_mismatch(TARGET_LOWER, TARGET_MIXED));
+    }
+
+    #[test]
+    fn validate_target_accepts_well_formed() {
+        assert!(validate_target(TARGET_LOWER, "test"));
+        // Mixed-case is still "well-formed" (it only logs an advisory WARN).
+        assert!(validate_target(TARGET_MIXED, "test"));
+    }
+
+    #[test]
+    fn validate_target_rejects_malformed() {
+        assert!(!validate_target("not-an-mxid", "test"));
+        assert!(!validate_target("@no-server-part", "test"));
+        assert!(!validate_target("missing-at:matrix.inblock.io", "test"));
+        assert!(!validate_target("@:matrix.inblock.io", "test")); // empty localpart
+        assert!(!validate_target("@user:", "test")); // empty server
+    }
 }
