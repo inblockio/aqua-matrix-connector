@@ -510,7 +510,12 @@ fn is_unknown_token(err: &anyhow::Error) -> bool {
 /// attempt inside matrix-sdk's internal 5xx retry loop.
 fn is_server_internal_error(err: &anyhow::Error) -> bool {
     let chain: String = err.chain().map(|e| e.to_string()).collect::<Vec<_>>().join(" | ");
-    chain.contains("M_UNKNOWN")
+    // `M_UNKNOWN` is Matrix's generic errcode for a 5xx, but `M_UNKNOWN_TOKEN` (an
+    // access-token rejection, recovered by `is_unknown_token` + the reactive re-auth in
+    // `send_dm_self_healing`) ALSO contains the substring "M_UNKNOWN". Exclude it, else a
+    // dead/rotated token is misclassified as an unrecoverable server fault and the re-auth
+    // arm becomes dead code (the matched arm order checks server-error first).
+    (chain.contains("M_UNKNOWN") && !chain.contains("M_UNKNOWN_TOKEN"))
         || chain.contains("status_code: 500")
         || chain.contains("Internal server error")
 }
@@ -1622,6 +1627,31 @@ mod tests {
         let (kept, dropped) = partition_dm_rooms(&original, &|_| false);
         assert_eq!(kept, vec![a, b], "first-seen order preserved, duplicate dropped");
         assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn unknown_token_not_classified_as_server_error() {
+        // Regression: "M_UNKNOWN_TOKEN" contains the substring "M_UNKNOWN", so a naive
+        // is_server_internal_error swallowed a dead-token error and the server-error arm
+        // (checked before is_unknown_token in send_dm_self_healing) skipped the reactive
+        // re-auth. A token rejection must classify as unknown-token ONLY; a bare
+        // M_UNKNOWN / 500 must classify as server-error ONLY.
+        let token_err = anyhow::anyhow!(
+            "the homeserver returned an error: M_UNKNOWN_TOKEN: Token is not active"
+        );
+        assert!(is_unknown_token(&token_err), "token rejection should be unknown-token");
+        assert!(
+            !is_server_internal_error(&token_err),
+            "token rejection must NOT be classified as a server internal error"
+        );
+
+        let server_err =
+            anyhow::anyhow!("the homeserver returned an error: M_UNKNOWN (status_code: 500)");
+        assert!(
+            is_server_internal_error(&server_err),
+            "bare M_UNKNOWN/500 is a server internal error"
+        );
+        assert!(!is_unknown_token(&server_err), "a server fault is not a token rejection");
     }
 
     #[test]
