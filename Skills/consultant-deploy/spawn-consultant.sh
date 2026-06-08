@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+#
+# spawn-consultant.sh — generic, parameterized launcher for a DEDICATED, single-target
+# Aqua consultant. This REPLACES the hand-cloned recreate-<label>-consultant.sh scripts:
+# one script, three required parameters (--label / --target / --display). It renders the
+# per-instance config from ~/.aqua-matrix-test/consultant-config.template.json, launches
+# the container with the SAME hardened podman flags as the original scripts (verbatim —
+# the security posture must not drift), wires the systemd activity-watcher, DMs Tim
+# "channel up", and (with --onboard) DMs Tim a ready-to-forward onboarding message that
+# carries the agent's self-minted MXID for the peer to DM.
+#
+# The relay firewall (crates/aqua-matrix-relay) gates BOTH message dispatch AND invite
+# auto-join on authorize(sender==target), so each instance only joins rooms the named
+# peer invites and only replies to that one peer.
+#
+# Identity model (same as the originals): a FRESH persist volume → the agent self-mints
+# a brand-new DID on first connect. A `--replace` (rm -f + re-run) reuses the existing
+# persist volume, so the DID + memory are PRESERVED — this is the image-roll path.
+# `--fresh` forces a brand-new identity by wiping the persist dir first.
+#
+# Examples:
+#   # new consultant (fresh identity), and DM Tim an onboarding message to forward:
+#   bash ~/spawn-consultant.sh --label gawain \
+#        --target '@did-key-…:matrix.inblock.io' \
+#        --display 'Aqua Consultant (Gawain)' --onboard --name Gawain
+#
+#   # relabel / re-point an EXISTING consultant (DID + memory + bespoke config preserved —
+#   # the render MERGES onto the existing config, overriding only target/display):
+#   bash ~/spawn-consultant.sh --replace --label zdnaez \
+#        --target '@did-key-…:matrix.inblock.io' --display 'Aqua Consultant (Aubert)'
+#
+#   # image roll (config used VERBATIM, nothing re-rendered) — used by roll-consultant-fleet.sh:
+#   bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------- defaults / args
+LABEL=""
+TARGET=""
+DISPLAY_NAME=""
+ID=""                 # defaults to <label>-aqua-consultant-1
+HUMAN_NAME=""         # friendly name for the onboarding message (defaults to display)
+REPLACE=0             # rm -f an existing container first (image roll; DID preserved)
+FRESH=0               # wipe persist dir first (force a brand-new identity)
+ONBOARD=0             # after connect, DM Tim a forward-ready onboarding message
+KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never clobber customizations)
+TEMPLATE="${CONSULTANT_TEMPLATE:-/home/waldknoten-01/.aqua-matrix-test/consultant-config.template.json}"
+IMAGE="${CONSULTANT_IMAGE:-localhost/aqua-matrix-agent:poc}"
+
+usage() { sed -n '2,40p' "$0"; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --label)   LABEL="$2"; shift 2 ;;
+    --target)  TARGET="$2"; shift 2 ;;
+    --display) DISPLAY_NAME="$2"; shift 2 ;;
+    --id)      ID="$2"; shift 2 ;;
+    --name)    HUMAN_NAME="$2"; shift 2 ;;
+    --template) TEMPLATE="$2"; shift 2 ;;
+    --image)   IMAGE="$2"; shift 2 ;;
+    --replace) REPLACE=1; shift ;;
+    --fresh)   FRESH=1; shift ;;
+    --onboard) ONBOARD=1; shift ;;
+    --keep-config) KEEP_CONFIG=1; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "!! unknown arg: $1" >&2; usage 1 ;;
+  esac
+done
+
+# Contradictory combo: --fresh wipes the DID + memory that --keep-config means to preserve.
+if [ "$FRESH" -eq 1 ] && [ "$KEEP_CONFIG" -eq 1 ]; then
+  echo "!! --fresh and --keep-config are contradictory (--fresh wipes the identity/memory --keep-config preserves)." >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------- validate label + paths
+[ -n "$LABEL" ] || { echo "!! --label is required (e.g. gawain)" >&2; exit 2; }
+# label must be a safe slug (used in container name + paths + systemd unit)
+case "$LABEL" in
+  *[!a-z0-9-]*|"") echo "!! --label must be lowercase [a-z0-9-]: '$LABEL'" >&2; exit 2 ;;
+esac
+
+NAME="aqua-agent-${LABEL}-aqua-consultant-1"
+CFG="/home/waldknoten-01/.aqua-matrix-test/${LABEL}-aqua-consultant-config.json"
+PERSIST="/home/waldknoten-01/.aqua-matrix-test/${LABEL}-aqua-consultant-persist"
+STORE="$PERSIST/store"
+MEM="$PERSIST/memory"
+
+# ---------------------------------------------------------------- resolve id/target/display
+if [ "$KEEP_CONFIG" -eq 1 ]; then
+  # Image-roll path: the EXISTING config is authoritative. Derive id/target/display from it
+  # so we never clobber a hand-customized config (e.g. carlotta's hello, gary's homeserver).
+  [ -f "$CFG" ] || { echo "!! --keep-config but no existing config at $CFG" >&2; exit 2; }
+  eval "$(python3 - "$CFG" <<'PY'
+import json, sys, shlex
+c = json.load(open(sys.argv[1]))
+print("CFG_ID=" + shlex.quote(c.get("id", "")))
+print("CFG_TARGET=" + shlex.quote(c.get("target", "")))
+print("CFG_DISPLAY=" + shlex.quote(c.get("display_name", "")))
+PY
+)"
+  # The config wins, but a mismatch against an explicitly-passed value is worth a shout.
+  [ -n "$TARGET" ] && [ "$TARGET" != "$CFG_TARGET" ] && echo "!! warn: --target '$TARGET' != config '$CFG_TARGET' — using config" >&2
+  [ -n "$DISPLAY_NAME" ] && [ "$DISPLAY_NAME" != "$CFG_DISPLAY" ] && echo "!! warn: --display '$DISPLAY_NAME' != config '$CFG_DISPLAY' — using config" >&2
+  ID="$CFG_ID"; TARGET="$CFG_TARGET"; DISPLAY_NAME="$CFG_DISPLAY"
+else
+  [ -n "$TARGET" ] || { echo "!! --target is required (peer MXID)" >&2; exit 2; }
+  [ -n "$DISPLAY_NAME" ] || { echo "!! --display is required (e.g. 'Aqua Consultant (Gawain)')" >&2; exit 2; }
+  [ -f "$TEMPLATE" ] || { echo "!! missing config template $TEMPLATE" >&2; exit 2; }
+fi
+: "${ID:=${LABEL}-aqua-consultant-1}"
+: "${HUMAN_NAME:=$DISPLAY_NAME}"
+
+# GUARD: refuse a misbound instance. Anchored to the template sentinel (not an uppercase
+# substring blocklist) so legit human localparts are never false-rejected.
+case "$TARGET" in
+  *__TARGET__*|'')
+    echo "!! TARGET is still the unfilled template placeholder ($TARGET)." >&2; exit 1 ;;
+esac
+case "$TARGET" in
+  @*:*) : ;;  # looks like @localpart:homeserver
+  *) echo "!! TARGET '$TARGET' does not look like a Matrix MXID (@local:server)" >&2; exit 1 ;;
+esac
+# DISPLAY_NAME is interpolated into the systemd unit (Description + --display-label); a quote or
+# newline would mis-tokenize ExecStart / inject unit directives. Reject them (no legit name needs them).
+case "$DISPLAY_NAME" in
+  *'"'*|*$'\n'*)
+    echo "!! --display must not contain a double-quote or newline (would break the systemd unit)." >&2; exit 2 ;;
+esac
+
+# ---------------------------------------------------------------- token (by reference)
+TOKEN_FILE="${AQUA_CLAUDE_TOKEN_FILE:-/home/waldknoten-01/.aqua-matrix-heartbeat/claude-oauth-token}"
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -s "$TOKEN_FILE" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+: "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN, or populate $TOKEN_FILE via:  claude setup-token}"
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+# ---------------------------------------------------------------- notify (best effort)
+# DM Tim from the host CLI identity (independent of any container), never fatal.
+NOTIFY=/home/waldknoten-01/.aqua-matrix-notify/notify-tim.sh
+notify() {
+  [ -x "$NOTIFY" ] || { echo "notify: $NOTIFY missing/not executable; skipping DM" >&2; return 0; }
+  "$NOTIFY" "$@" || echo "notify: DM failed (non-fatal) — see notify.log" >&2
+}
+
+# ---------------------------------------------------------------- activity watcher
+# Host-level systemd user service: tails this instance's inbound.jsonl and DMs Tim on
+# the peer's FIRST message + every 10th. Idempotent; never fatal.
+ensure_activity_watch() {
+  command -v systemctl >/dev/null 2>&1 || { echo "watch: systemctl absent; skipping watcher" >&2; return 0; }
+  local activity_log="$MEM/activity/inbound.jsonl"
+  local unit="aqua-activity-watch-${LABEL}.service"
+  local unit_path="$HOME/.config/systemd/user/$unit"
+  mkdir -p "$HOME/.config/systemd/user"
+  cat > "$unit_path" <<EOF
+[Unit]
+Description=Aqua activity watcher — ${DISPLAY_NAME} (DMs Tim on first message + every 10th)
+Documentation=https://github.com/inblockio/aqua-matrix-agent
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.aqua-matrix-notify
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/aqua-matrix-agent/target/debug/aqua-activity-watch \\
+  --activity-log ${activity_log} \\
+  --label ${LABEL} \\
+  --display-label "${DISPLAY_NAME}" \\
+  --milestone 10
+Restart=always
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable "$unit" 2>/dev/null || true
+  if systemctl --user restart "$unit" 2>/dev/null; then
+    echo ">> activity watcher up: $unit (tailing $activity_log)"
+  else
+    echo "watch: failed to enable/start $unit (non-fatal)" >&2
+  fi
+}
+
+# ---------------------------------------------------------------- derive agent MXID
+# The agent's Matrix localpart is `did-key-<multibase>` lowercased (Synapse lowercases
+# localparts). We read the self-minted DID from the container logs and derive the MXID
+# the peer must DM. Verified against zdnaez: did:key:z6MkswJK… → @did-key-z6mkswjk…
+agent_mxid_from_logs() {
+  local did
+  did="$(podman logs "$NAME" 2>&1 | grep -oE 'agent DID: did:key:[1-9A-HJ-NP-Za-km-z]+' | tail -n1 | sed 's/^agent DID: did:key://')"
+  [ -n "$did" ] || return 1
+  printf '@did-key-%s:matrix.inblock.io' "$(printf '%s' "$did" | tr '[:upper:]' '[:lower:]')"
+}
+
+# ---------------------------------------------------------------- render config
+mkdir -p "$STORE" "$MEM"
+if [ "$KEEP_CONFIG" -eq 1 ]; then
+  echo ">> --keep-config: using existing $CFG verbatim (id=$ID, display=$DISPLAY_NAME)"
+else
+  # Base = the EXISTING per-instance config when one is already present (so a re-run / relabel
+  # preserves hand-customizations like a bespoke hello), otherwise the generic template. Only
+  # id/target/display_name are overridden. To force a clean template render, delete $CFG first.
+  BASE="$TEMPLATE"; [ -f "$CFG" ] && BASE="$CFG"
+  python3 - "$BASE" "$CFG" "$ID" "$TARGET" "$DISPLAY_NAME" <<'PY'
+import json, sys
+base, out, _id, target, display = sys.argv[1:6]
+cfg = json.load(open(base))
+cfg['id'] = _id
+cfg['target'] = target
+cfg['display_name'] = display
+with open(out, 'w') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=True)
+    f.write('\n')
+print(f">> rendered config {out} from base {base}  (id={_id}, display={display!r})")
+PY
+fi
+
+# ---------------------------------------------------------------- container lifecycle
+if podman container exists "$NAME"; then
+  if [ "$REPLACE" -eq 1 ]; then
+    echo ">> --replace: removing existing $NAME (DID preserved via persist volume)"
+    podman rm -f "$NAME" >/dev/null
+  else
+    echo "!! $NAME already exists. Use --replace to roll it (DID preserved)," >&2
+    echo "   or 'podman start $NAME' to resume. Refusing to clobber." >&2
+    exit 1
+  fi
+fi
+
+if [ "$FRESH" -eq 1 ]; then
+  # PERSIST is LABEL-derived and LABEL is slug-validated, but assert the expected prefix before
+  # any rm -rf so a future refactor can never point this at a stray path.
+  case "$PERSIST" in
+    /home/waldknoten-01/.aqua-matrix-test/*-aqua-consultant-persist) : ;;
+    *) echo "!! refusing --fresh: unexpected persist path '$PERSIST'" >&2; exit 2 ;;
+  esac
+  echo ">> --fresh: wiping persist dir for a brand-new identity ($PERSIST)"
+  rm -rf -- "$STORE" "$MEM"
+  mkdir -p "$STORE" "$MEM"
+fi
+
+if [ -s "$STORE/agent.pem" ]; then
+  IDENTITY_NOTE="identity PRESERVED (existing DID in persist volume)"
+else
+  IDENTITY_NOTE="identity FRESH (self-minted DID on first connect)"
+fi
+echo ">> persist volume ready — $IDENTITY_NOTE"
+
+echo ">> launching $NAME bound single-target to $TARGET"
+set +e
+CID="$(podman run -d \
+  --name "$NAME" \
+  --restart on-failure \
+  --memory 2048m --cpus 2 --pids-limit 512 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp \
+  -e AGENT_TARGET="$TARGET" \
+  -e AGENT_CONFIG_FILE=/agent/config.json \
+  -e CLAUDE_CODE_OAUTH_TOKEN \
+  -v "$CFG:/agent/config.json:ro" \
+  -v "$STORE:/agent/store:U" \
+  -v "$MEM:/agent/memory:U" \
+  -v /home/waldknoten-01/aqua-rs-sdk:/refs/aqua-rs-sdk:ro \
+  -v /home/waldknoten-01/aqua-spec:/refs/aqua-spec:ro \
+  "$IMAGE" 2>&1)"
+run_rc=$?
+set -e
+
+if [ "$run_rc" -ne 0 ]; then
+  echo "!! podman run failed (rc=$run_rc):" >&2
+  printf '%s\n' "$CID" >&2
+  notify -s CRITICAL -t "spawn FAILED: $NAME" \
+    "podman run rc=$run_rc launching '$NAME' (peer $TARGET) on $(hostname): $(printf '%s' "$CID" | tail -n1)"
+  exit "$run_rc"
+fi
+
+CID_SHORT="$(printf '%s' "$CID" | tail -n1 | cut -c1-12)"
+notify -s INFO -t "channel up: $NAME" \
+  "agent '$NAME' launched — single-target peer $TARGET, $IDENTITY_NOTE, container $CID_SHORT, on $(hostname)."
+
+ensure_activity_watch || true
+
+# ---------------------------------------------------------------- onboarding DM
+if [ "$ONBOARD" -eq 1 ]; then
+  echo ">> --onboard: waiting for agent to self-mint its DID (for the forward-ready MXID)…"
+  MXID=""
+  for _ in $(seq 1 60); do
+    if MXID="$(agent_mxid_from_logs)" && [ -n "$MXID" ]; then break; fi
+    MXID=""
+    sleep 2
+  done
+  if [ -n "$MXID" ]; then
+    echo ">> agent MXID: $MXID"
+    ONBOARD_MSG="$(cat <<EOF
+📋 Onboarding for ${HUMAN_NAME} — forward the block below to them.
+
+———
+Hi ${HUMAN_NAME}! You now have your own dedicated Aqua Consultant on Matrix.
+
+To start, send a direct message to:
+  ${MXID}
+
+It's a read-only assistant that answers questions about the Aqua protocol, spec, and Rust SDK, grounded in the latest local Aqua sources. On first contact it'll greet you and ask a couple of quick questions (your name, background, what brings you to Aqua, and how deep you want to go), then tailor everything to you. It only explains and cites — it never modifies anything.
+———
+EOF
+)"
+    notify -s INFO -t "onboarding: ${HUMAN_NAME} (${NAME})" "$ONBOARD_MSG"
+    echo ">> onboarding message DM'd to Tim (forward-ready, carries $MXID)"
+  else
+    echo "!! could not read agent MXID from logs within timeout — onboarding DM skipped." >&2
+    notify -s WARN -t "onboarding pending: ${NAME}" \
+      "Spawned '${NAME}' for ${HUMAN_NAME} but could not read its self-minted MXID from logs yet. Re-derive with: podman logs ${NAME} | grep 'agent DID'"
+  fi
+fi
+
+echo
+echo ">> container started: $CID_SHORT"
+echo ">> done. verify with:"
+echo "   podman logs -f $NAME    # watch it connect + self-mint its DID + set display name"
+echo "   # then have the peer DM the agent's @did-key-…:matrix.inblock.io MXID (shown above / in the logs)"
