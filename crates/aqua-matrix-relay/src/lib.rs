@@ -600,15 +600,35 @@ async fn run_cycle<H: MessageHandler>(
     watermark: Arc<AtomicU64>,
     shutdown: &Notify,
 ) -> &'static str {
-    register_handler(agent.clone(), target.clone(), handler.clone(), watermark);
+    // Collect every per-cycle event-handler handle so we can REMOVE them at cycle
+    // end (see teardown below). matrix-sdk stores each handler closure inside the
+    // Client, and each closure captures an `agent.clone()` — an Arc clone of that
+    // same Client. That is a strong reference cycle: without removal the old Client
+    // never drops on reconnect, leaking its four SQLite connection pools every
+    // cycle until the fd count trips EMFILE and the connect-failure circuit breaker.
+    let mut handles: Vec<matrix_sdk::event_handler::EventHandlerHandle> = Vec::new();
+    handles.push(register_handler(
+        agent.clone(),
+        target.clone(),
+        handler.clone(),
+        watermark,
+    ));
     // Surface inbound call signaling (invite / Element-Call ring / hangup) to the
     // handler's `on_call`. Separate from `register_handler` because call events
     // are distinct event types, not room messages.
-    register_call_handler(agent.clone(), target.clone(), handler.clone());
+    handles.extend(register_call_handler(
+        agent.clone(),
+        target.clone(),
+        handler.clone(),
+    ));
     // Auto-join invites as they arrive on the sync stream (not only at cycle
     // start), so an invite the peer sends mid-cycle — or just after connect,
     // before the startup join sees it — is still joined and recorded as the DM.
-    register_invite_autojoin(agent.clone(), target.clone(), handler.clone());
+    handles.push(register_invite_autojoin(
+        agent.clone(),
+        target.clone(),
+        handler.clone(),
+    ));
 
     let sync_client = agent.client().clone();
     let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
@@ -658,6 +678,15 @@ async fn run_cycle<H: MessageHandler>(
         sync_task.abort();
         let _ = sync_task.await;
     }
+
+    // Break the Client<->handler reference cycle: removing each handler drops the
+    // stored closure (and the Arc clone of the Client it captured), so once this
+    // cycle's `agent` clones fall out of scope the underlying Client — and its
+    // open SQLite file handles — are finally freed instead of leaking into the
+    // next cycle. (matrix-sdk has no "remove all"; we remove the handles we kept.)
+    for handle in handles {
+        agent.client().remove_event_handler(handle);
+    }
     exit
 }
 
@@ -677,7 +706,7 @@ fn register_invite_autojoin<H: MessageHandler>(
     agent: AgentClient,
     target: Arc<String>,
     handler: Arc<H>,
-) {
+) -> matrix_sdk::event_handler::EventHandlerHandle {
     let own = agent.user_id().to_string();
     let role = handler.role().to_string();
     agent.client().add_event_handler({
@@ -715,7 +744,7 @@ fn register_invite_autojoin<H: MessageHandler>(
                 }
             }
         }
-    });
+    })
 }
 
 fn register_handler<H: MessageHandler>(
@@ -723,7 +752,7 @@ fn register_handler<H: MessageHandler>(
     target: Arc<String>,
     handler: Arc<H>,
     watermark: Arc<AtomicU64>,
-) {
+) -> matrix_sdk::event_handler::EventHandlerHandle {
     agent.client().add_event_handler({
         let agent = agent.clone();
         move |ev: OriginalSyncRoomMessageEvent, room: Room| {
@@ -735,7 +764,7 @@ fn register_handler<H: MessageHandler>(
                 dispatch(ev, room, &agent, &target, &handler, &watermark).await;
             }
         }
-    });
+    })
 }
 
 /// Install sync handlers for the three call-signaling events we care about:
@@ -749,7 +778,7 @@ fn register_call_handler<H: MessageHandler>(
     agent: AgentClient,
     target: Arc<String>,
     handler: Arc<H>,
-) {
+) -> Vec<matrix_sdk::event_handler::EventHandlerHandle> {
     use matrix_sdk::ruma::events::call::{
         hangup::OriginalSyncCallHangupEvent, invite::OriginalSyncCallInviteEvent,
         notify::OriginalSyncCallNotifyEvent,
@@ -757,7 +786,7 @@ fn register_call_handler<H: MessageHandler>(
 
     let client = agent.client().clone();
 
-    client.add_event_handler({
+    let h_invite = client.add_event_handler({
         let agent = agent.clone();
         let target = target.clone();
         let handler = handler.clone();
@@ -780,7 +809,7 @@ fn register_call_handler<H: MessageHandler>(
         }
     });
 
-    client.add_event_handler({
+    let h_notify = client.add_event_handler({
         let agent = agent.clone();
         let target = target.clone();
         let handler = handler.clone();
@@ -803,7 +832,7 @@ fn register_call_handler<H: MessageHandler>(
         }
     });
 
-    client.add_event_handler({
+    let h_hangup = client.add_event_handler({
         move |ev: OriginalSyncCallHangupEvent, room: Room| {
             let agent = agent.clone();
             let target = target.clone();
@@ -822,6 +851,8 @@ fn register_call_handler<H: MessageHandler>(
             }
         }
     });
+
+    vec![h_invite, h_notify, h_hangup]
 }
 
 /// Authorize a call signal by sender and forward it to the handler's `on_call`.
