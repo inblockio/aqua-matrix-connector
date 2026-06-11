@@ -23,6 +23,7 @@ runs it via symlinks so there is a single source of truth (no drift):
 |---|---|---|
 | `Skills/consultant-deploy/spawn-consultant.sh` | `~/spawn-consultant.sh` | generic launcher |
 | `Skills/consultant-deploy/roll-consultant-fleet.sh` | `~/roll-consultant-fleet.sh` | fleet image-roller |
+| `Skills/consultant-deploy/restore-agent-fleet.sh` | `~/restore-agent-fleet.sh` | boot-time fleet restore (see below) |
 | `Skills/consultant-deploy/consultant-config.template.json` | `~/.aqua-matrix-test/consultant-config.template.json` | config template |
 | `Skills/consultant-deploy/consultants.registry.example` | *(host state — not symlinked)* | format reference |
 
@@ -119,6 +120,26 @@ bash ~/roll-consultant-fleet.sh --build        # rebuild image, then roll all
 - **Guards**: placeholder/non-MXID target rejected; `--display` rejects quote/newline (systemd-unit
   injection); registry parser skips indented comments and rejects non-slug labels; `--fresh` asserts
   the persist-path prefix before any `rm -rf`.
+
+## Boot-time restore (reboot survival)
+
+Podman restart policies don't survive a WSL/VM reboot, and the fleet's `--restart on-failure`
+never fires on the clean SIGTERM exit a shutdown produces — without help, **every** container
+(consultants AND the Tim-bound pair) sits in `exited` after a reboot until someone starts it
+(this silenced the whole fleet for 9h on 2026-06-10). Two pieces close that hole:
+
+- **`aqua-agent-fleet-restore.service`** (systemd user oneshot, enabled, runs at boot; unit
+  canonical at [`systemd/aqua-agent-fleet-restore.service`](../../systemd/aqua-agent-fleet-restore.service)) runs
+  `~/restore-agent-fleet.sh`, which `podman start`s every exited `aqua-agent-*` container.
+  Identity/memory live in the persist volumes, so agents come back `store_wiped=false`.
+  Caveat: it restarts intentionally-stopped containers too — `podman rm` (or rename away from
+  the `aqua-agent-` prefix) anything that must stay down across reboots.
+- **`crashloop-watch.sh`** (host-canonical at `~/.aqua-matrix-notify/`) now re-alerts every
+  hour while a container stays down (`--realert 3600`) and only counts an alert as sent when
+  the DM actually delivered (failed sends retry every 15s poll). The watcher unit is ordered
+  `After=aqua-agent-fleet-restore.service` so a normal reboot stays quiet.
+
+Recovery matrix: [`docs/RECOVERY.md`](../../docs/RECOVERY.md).
 
 ## Verify a deployment
 

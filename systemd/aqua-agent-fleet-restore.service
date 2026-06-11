@@ -1,0 +1,34 @@
+# Boot-time restore of the aqua-agent-* podman container fleet.
+#
+# Podman restart policies do not survive a WSL/VM reboot (and the fleet's
+# --restart on-failure never fires on a clean shutdown SIGTERM), so without
+# this unit every agent container stays 'exited' after a reboot until a human
+# starts it. This oneshot runs at boot and `podman start`s them all; identity
+# and crypto state live in the persist volumes, so the agents come back with
+# their DIDs intact.
+#
+# Install (user unit; linger must be enabled, which it is on this host):
+#   cp aqua-agent-fleet-restore.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable aqua-agent-fleet-restore
+#
+# The script is canonical at Skills/consultant-deploy/restore-agent-fleet.sh
+# in the aqua-matrix-agent repo; ~/restore-agent-fleet.sh is a symlink to it.
+
+[Unit]
+Description=Aqua agent fleet boot-restore (podman start all exited aqua-agent-* containers)
+Documentation=https://github.com/inblockio/aqua-matrix-agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Keep "active" after exit so status is inspectable and the crash-loop
+# watcher's After= ordering holds for the whole boot.
+RemainAfterExit=yes
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/restore-agent-fleet.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
