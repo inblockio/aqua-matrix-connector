@@ -7,14 +7,15 @@
 #     label <TAB> target-MXID <TAB> display(doc-only)
 # - label   : lowercase [a-z0-9-]; selects the container/config/persist/watcher names.
 #             Rows whose first column isn't a valid slug are skipped with a warning.
+#             `generic` is RESERVED: it selects the UN-LABELED operator-bound consultant
+#             (aqua-agent-aqua-consultant-1) and rolls via --generic instead of --label.
 # - target  : the peer MXID this consultant answers (doc-only here; the roll uses
 #             --keep-config and reads the authoritative target from the on-disk config).
 # - display : human label, documentation only.
 # Lines that are blank or whose first non-whitespace char is '#' are ignored.
 #
-# DO NOT list the two Tim-bound containers here (they are rolled separately):
+# DO NOT list this Tim-bound container here (different backend, rolled separately):
 #   - aqua-agent-tim-channel          (SEED=0 bash ~/recreate-tim-channel.sh)
-#   - aqua-agent-aqua-consultant-1    (generic, NO script; manual podman run)
 #
 # Snapshot of the live fleet at 2026-06-08 (illustrative):
 carlottas	@did-pkh-eip155-1-0x...:matrix.inblock.io	Carlotta's Aqua Consultant
@@ -22,3 +23,4 @@ garys	@quartermonk:matrix.jembawan.com	Gary's Aqua Consultant
 zdnaef	@did-key-zDnaef...:matrix.inblock.io	Aqua Consultant (zDnaef…)
 zdnaez	@did-key-zdnaezp...:matrix.inblock.io	Aqua Consultant (Aubert)
 gawain	@did-key-zdnaenq...:matrix.inblock.io	Aqua Consultant (Gawain)
+generic	@did-pkh-eip155-1-0x...:matrix.inblock.io	Aqua Consultant (operator's own, un-labeled)

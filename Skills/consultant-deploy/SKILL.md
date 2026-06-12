@@ -95,7 +95,11 @@ and `podman restart <container>` (the daemon re-applies it idempotently on recon
 
 After rebuilding the image, roll every registry consultant onto it. DIDs + memory preserved (persist
 reused); configs used **verbatim** (`--keep-config`, never re-rendered) so custom hello/homeserver
-survive. The two Tim-bound containers are intentionally excluded.
+survive. The reserved registry label `generic` covers the **un-labeled operator-bound consultant**
+(`aqua-agent-aqua-consultant-1`, config `aqua-consultant-config.json`, persist
+`aqua-consultant-persist` — no `<label>-` prefix): the roller translates it to
+`spawn-consultant.sh --generic`, so one roll covers the whole consultant fleet. Only
+`aqua-agent-tim-channel` stays excluded (different backend; `SEED=0 bash ~/recreate-tim-channel.sh`).
 
 ```bash
 bash ~/roll-consultant-fleet.sh --dry-run     # preview
@@ -136,6 +140,7 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 | Flag | Effect |
 |---|---|
 | *(none)* | New container; refuses if one already exists. Fresh DID self-minted on first connect. |
+| `--generic` | Select the **un-labeled** operator-bound consultant instead of a `--label` one (container `aqua-agent-aqua-consultant-1`, config/persist without the `<label>-` prefix). Identical behaviour except no activity watcher is wired (the peer IS the operator). Mutually exclusive with `--label`; the registry label `generic` is reserved to map here. |
 | `--replace` | `podman rm -f` + re-run, **reusing persist** → DID + memory PRESERVED (the image-roll path). |
 | `--keep-config` | Use the existing config verbatim (no re-render); derives id/target/display from it. |
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) |
@@ -194,10 +199,12 @@ Recovery matrix: [`docs/RECOVERY.md`](../../docs/RECOVERY.md).
 ```bash
 podman ps --filter name=aqua-agent-<label>            # Up, restarts 0
 podman logs aqua-agent-<label>-aqua-consultant-1 | grep -E 'agent DID|connected|display name set|daemon starting'
-systemctl --user is-active aqua-activity-watch-<label>.service
+systemctl --user is-active aqua-activity-watch-<label>.service   # n/a for --generic (no watcher by design)
 podman inspect aqua-agent-<label>-aqua-consultant-1 \
   --format '{{range .Mounts}}{{.Destination}} {{end}}'   # expect all four /refs/* + config + store + memory
 ```
+
+For the generic consultant the container name is plain `aqua-agent-aqua-consultant-1` (no label).
 
 Healthy = `daemon starting (target: <the one peer>)`, `connected store_wiped=false` (for `--replace`),
 and `display name set to "<your display>"`. Then the peer DMs the agent's `@did-key-…:matrix.inblock.io`
