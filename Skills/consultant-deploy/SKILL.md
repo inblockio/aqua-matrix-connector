@@ -102,6 +102,15 @@ bash ~/roll-consultant-fleet.sh --dry-run     # preview
 bash ~/roll-consultant-fleet.sh --build        # rebuild image, then roll all
 ```
 
+After a **template prompt change** (a new grounding repo, a new behavioural rule), plain
+`--keep-config` would leave existing consultants on the old prompt. Add `--refresh-prompt`
+so each kept config adopts the template's current `system_prompt`/`description`/`ref_mounts`
+while everything else (hello, homeserver, DID, memory) is preserved:
+
+```bash
+bash ~/roll-consultant-fleet.sh --refresh-prompt
+```
+
 ## Refs grounding and freshness (automatic)
 
 The agent's knowledge is the live host checkouts, bind-mounted read-only; a host-side
@@ -132,6 +141,7 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) |
 | `--onboard` | After connect, derive the agent MXID from logs and DM the operator a forward-ready onboarding message. |
 | `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
+| `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
 
 ## Invariants the tooling enforces (verified by adversarial audit, 2026-06-08)
 

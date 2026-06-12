@@ -25,6 +25,11 @@
 # a loud warning and is mounted as-is (never destructive). Skip the freshness pass
 # (presence stays fatal) with --no-refresh-refs.
 #
+# A template prompt change reaches EXISTING consultants via --refresh-prompt: it adopts
+# the template's system_prompt/description/ref_mounts into the kept config, preserving
+# hello/homeserver customizations and identity. Fleet-wide:
+#   roll-consultant-fleet.sh --refresh-prompt
+#
 # Examples:
 #   # new consultant (fresh identity), and DM Tim an onboarding message to forward:
 #   bash ~/spawn-consultant.sh --label gawain \
@@ -52,6 +57,7 @@ FRESH=0               # wipe persist dir first (force a brand-new identity)
 ONBOARD=0             # after connect, DM Tim a forward-ready onboarding message
 KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never clobber customizations)
 REFRESH_REFS=1        # fast-forward the /refs repos before launch (--no-refresh-refs to skip)
+REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mounts into the config
 TEMPLATE="${CONSULTANT_TEMPLATE:-/home/waldknoten-01/.aqua-matrix-test/consultant-config.template.json}"
 IMAGE="${CONSULTANT_IMAGE:-localhost/aqua-matrix-agent:poc}"
 REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
@@ -60,7 +66,7 @@ REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
 # Keep it in sync with ref_mounts in consultant-config.template.json.
 REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem)
 
-usage() { sed -n '2,41p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,46p' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -76,6 +82,7 @@ while [ $# -gt 0 ]; do
     --onboard) ONBOARD=1; shift ;;
     --keep-config) KEEP_CONFIG=1; shift ;;
     --no-refresh-refs) REFRESH_REFS=0; shift ;;
+    --refresh-prompt) REFRESH_PROMPT=1; shift ;;
     -h|--help) usage 0 ;;
     *) echo "!! unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -289,6 +296,27 @@ with open(out, 'w') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=True)
     f.write('\n')
 print(f">> rendered config {out} from base {base}  (id={_id}, display={display!r})")
+PY
+fi
+
+# --refresh-prompt: adopt the template's prompt surface into the (kept or re-rendered)
+# config, so a template prompt update can reach existing consultants without clobbering
+# their customizations (hello, homeserver, ...). Identity fields are untouched.
+if [ "$REFRESH_PROMPT" -eq 1 ]; then
+  [ -f "$TEMPLATE" ] || { echo "!! --refresh-prompt: missing template $TEMPLATE" >&2; exit 2; }
+  python3 - "$TEMPLATE" "$CFG" <<'PY'
+import json, sys
+tpl_path, cfg_path = sys.argv[1:3]
+tpl = json.load(open(tpl_path))
+cfg = json.load(open(cfg_path))
+fields = ("system_prompt", "description", "ref_mounts")
+changed = [k for k in fields if cfg.get(k) != tpl[k]]
+for k in fields:
+    cfg[k] = tpl[k]
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=True)
+    f.write("\n")
+print(">> --refresh-prompt: adopted template " + (", ".join(changed) if changed else "fields (already current)") + f" into {cfg_path}")
 PY
 fi
 
