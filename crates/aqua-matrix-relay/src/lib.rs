@@ -3,7 +3,8 @@
 //! This crate owns the *transport lifecycle* — authenticate via siwx-oidc,
 //! connect to Matrix, stream-sync, rotate the client ahead of token expiry,
 //! deduplicate inbound messages by a timestamp watermark that persists across
-//! rotations (so a DM arriving in the rotation gap isn't lost), shut down
+//! rotations AND process restarts (so a DM arriving in the rotation gap, or
+//! while the daemon was down, isn't lost), shut down
 //! cleanly on SIGTERM/SIGINT, and exit cleanly after repeated connect failures
 //! so systemd can self-heal. It knows nothing about *what an agent does* with a
 //! message.
@@ -37,6 +38,7 @@
 //! swap an access token in place; rotating the whole client ~30 s before expiry
 //! is what avoids the `M_UNKNOWN_TOKEN` sync wedge.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -384,21 +386,24 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // that silently replies to no one. Non-fatal: we log and continue.
     validate_target(&target, handler.role());
 
-    // The inbound-message dedupe watermark lives ACROSS cycles, created once
-    // here at "now": the FIRST cycle therefore ignores pre-startup backlog
-    // (preserving prior behavior), while LATER cycles carry it forward. That
-    // carry-forward is what stops the rotation gap from losing a message: when
-    // the client rotates (~30 s before token expiry) the new cycle's initial
-    // sync re-delivers recent timeline; with a per-cycle "now" watermark a DM
-    // that landed during the gap (its ts is just older than the new cycle's
-    // start) would look like backlog and be dropped. Carrying the watermark
-    // means a gap message (ts > carried watermark) is dispatched exactly once,
-    // while already-seen messages (ts <= watermark) stay skipped.
+    // The inbound-message dedupe watermark lives ACROSS cycles AND restarts:
+    // loaded from `<store>/inbound-watermark` here (seeded to "now" only when
+    // the file is absent or unparsable) and persisted by [`dispatch`] on every
+    // advance. The cross-cycle carry-forward is what stops the rotation gap
+    // from losing a message: when the client rotates (~30 s before token
+    // expiry) the new cycle's initial sync re-delivers recent timeline; with a
+    // per-cycle "now" watermark a DM that landed during the gap (its ts is
+    // just older than the new cycle's start) would look like backlog and be
+    // dropped. Carrying the watermark means a gap message (ts > watermark) is
+    // dispatched exactly once, while already-seen messages (ts <= watermark)
+    // stay skipped.
     //
-    // Edge (acceptable): after MAX_CONNECT_FAILURES the process exits and a
-    // fresh process starts with the watermark reset to "now", re-ignoring any
-    // backlog — fine, that's a hard restart, not a rotation.
-    let watermark = Arc::new(AtomicU64::new(now_epoch_ms()));
+    // The cross-restart persistence extends the same guarantee to process
+    // restarts (crash-exit after MAX_CONNECT_FAILURES, `systemctl restart`,
+    // host reboot): the next process resumes from the last processed message
+    // instead of re-seeding to "now" and silently skipping everything that
+    // was delivered while the daemon was down.
+    let watermark = Arc::new(Watermark::load_or_seed(&config.store_dir));
 
     // Trap SIGTERM/SIGINT once and fan it out via a Notify so every cycle can
     // unwind cleanly. `podman stop`/`systemctl stop` send SIGTERM and SIGKILL
@@ -582,13 +587,14 @@ fn spawn_shutdown_listener(shutdown: Arc<Notify>) {
 /// (or sync end, or shutdown), then abort the sync task and report why it ended.
 ///
 /// `watermark` is the cross-cycle inbound-message dedupe key, owned by
-/// [`run_daemon`] and passed in (not created here). It is seeded once at daemon
-/// start to "now", so the FIRST cycle ignores pre-startup backlog; LATER cycles
-/// reuse the SAME watermark, so when this cycle's initial sync re-delivers
-/// recent timeline after a client rotation, a message that arrived in the
-/// rotation gap (ts > watermark) is dispatched exactly once while already-seen
-/// messages (ts <= watermark) stay skipped. [`dispatch`] still advances it
-/// monotonically.
+/// [`run_daemon`] and passed in (not created here). It is loaded once at
+/// daemon start from its file in the store dir (falling back to "now" when no
+/// usable file exists, so only the very first run ignores pre-startup
+/// backlog); every cycle reuses the SAME watermark, so when this cycle's
+/// initial sync re-delivers recent timeline after a client rotation, a message
+/// that arrived in the rotation gap (ts > watermark) is dispatched exactly
+/// once while already-seen messages (ts <= watermark) stay skipped.
+/// [`dispatch`] still advances it monotonically (and persists each advance).
 ///
 /// `shutdown` is fired by the daemon's SIGTERM/SIGINT listener; observing it
 /// returns the `"shutdown"` sentinel so [`run_daemon`] can exit cleanly.
@@ -597,7 +603,7 @@ async fn run_cycle<H: MessageHandler>(
     target: &Arc<String>,
     handler: &Arc<H>,
     refresh_deadline: tokio::time::Instant,
-    watermark: Arc<AtomicU64>,
+    watermark: Arc<Watermark>,
     shutdown: &Notify,
 ) -> &'static str {
     // Collect every per-cycle event-handler handle so we can REMOVE them at cycle
@@ -751,7 +757,7 @@ fn register_handler<H: MessageHandler>(
     agent: AgentClient,
     target: Arc<String>,
     handler: Arc<H>,
-    watermark: Arc<AtomicU64>,
+    watermark: Arc<Watermark>,
 ) -> matrix_sdk::event_handler::EventHandlerHandle {
     agent.client().add_event_handler({
         let agent = agent.clone();
@@ -884,7 +890,7 @@ async fn dispatch<H: MessageHandler>(
     agent: &AgentClient,
     target: &str,
     handler: &Arc<H>,
-    watermark: &AtomicU64,
+    watermark: &Watermark,
 ) {
     // Only messages from the configured peer, and only ones newer than anything
     // we've already seen this cycle. The default `authorize` compares
@@ -897,7 +903,7 @@ async fn dispatch<H: MessageHandler>(
         return;
     }
     let ts_ms = u64::from(ev.origin_server_ts.0);
-    if ts_ms <= watermark.load(Ordering::Relaxed) {
+    if ts_ms <= watermark.get() {
         return;
     }
 
@@ -939,17 +945,10 @@ async fn dispatch<H: MessageHandler>(
         _ => return,
     };
 
-    // Advance the watermark BEFORE dispatching: if the handler (or the process)
-    // dies mid-work we must not re-trigger on the same message after restart.
-    watermark
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            if ts_ms > v {
-                Some(ts_ms)
-            } else {
-                None
-            }
-        })
-        .ok();
+    // Advance (and persist) the watermark BEFORE dispatching: if the handler
+    // (or the process) dies mid-work we must not re-trigger on the same
+    // message after restart.
+    watermark.advance(ts_ms);
 
     // Drop only a truly empty message: an attachment with no caption still has
     // `media`, so it must dispatch even though `body` is empty.
@@ -987,6 +986,95 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Cross-restart inbound dedupe watermark: the newest `origin_server_ts` (ms)
+/// already dispatched, held in memory and mirrored to a small file inside the
+/// agent's store dir. A daemon restart resumes from the persisted value, so a
+/// message delivered while the daemon was down (its ts is newer than the last
+/// processed one) is dispatched on the post-restart initial sync instead of
+/// being silently skipped by a fresh "now" seed.
+///
+/// Persistence is best-effort: a write failure is logged and the in-memory
+/// value still dedupes the running process; only resume-after-restart degrades
+/// (back to the old seed-to-"now" behavior).
+struct Watermark {
+    value: AtomicU64,
+    path: PathBuf,
+}
+
+impl Watermark {
+    /// File name inside the store dir, next to the matrix-sdk SQLite stores.
+    const FILE_NAME: &'static str = "inbound-watermark";
+
+    /// Load the persisted watermark from `store_dir`, falling back to "now"
+    /// (and seeding the file) when it is absent or unparsable. The fallback
+    /// preserves the original ignore-pre-startup-backlog behavior exactly
+    /// once: the first start with persistence enabled.
+    fn load_or_seed(store_dir: &Path) -> Self {
+        let path = store_dir.join(Self::FILE_NAME);
+        let value = match Self::load(&path) {
+            Some(ts) => {
+                tracing::info!("inbound watermark restored: {ts} (from {})", path.display());
+                ts
+            }
+            None => {
+                let now = now_epoch_ms();
+                tracing::info!(
+                    "no usable inbound watermark at {}; seeding to now ({now})",
+                    path.display()
+                );
+                Self::persist(&path, now);
+                now
+            }
+        };
+        Self {
+            value: AtomicU64::new(value),
+            path,
+        }
+    }
+
+    fn load(path: &Path) -> Option<u64> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Atomic best-effort write: temp file + rename in the same directory, so
+    /// a crash mid-write can never leave a torn file (worst case the old value
+    /// survives). Failure is a WARN, never fatal.
+    fn persist(path: &Path, value: u64) {
+        let tmp = path.with_extension("tmp");
+        let res = std::fs::write(&tmp, format!("{value}\n"))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = res {
+            tracing::warn!(
+                "failed to persist inbound watermark to {}: {e:#}",
+                path.display()
+            );
+        }
+    }
+
+    /// Current watermark (epoch ms).
+    fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    /// Advance to `ts_ms` if it is newer, mirroring the result to disk. The
+    /// persisted value is re-read from the atomic AFTER the update so a slower
+    /// concurrent advancer tends to write the freshest value; the residual
+    /// write race (stale value persisted last) is accepted — its worst case is
+    /// one already-handled message re-dispatched after a restart, never a lost
+    /// message.
+    fn advance(&self, ts_ms: u64) {
+        let advanced = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                (ts_ms > v).then_some(ts_ms)
+            })
+            .is_ok();
+        if advanced {
+            Self::persist(&self.path, self.get());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1073,5 +1161,90 @@ mod auth_tests {
         assert!(!validate_target("missing-at:matrix.inblock.io", "test"));
         assert!(!validate_target("@:matrix.inblock.io", "test")); // empty localpart
         assert!(!validate_target("@user:", "test")); // empty server
+    }
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::{now_epoch_ms, Watermark};
+    use std::path::PathBuf;
+
+    /// Fresh per-test store dir under the OS temp dir (no tempfile dep: the
+    /// crate has none, and pid + counter is unique enough for `cargo test`).
+    fn temp_store(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aqua-relay-wm-{}-{}-{tag}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn absent_file_falls_back_to_now_and_seeds() {
+        let dir = temp_store("absent");
+        let before = now_epoch_ms();
+        let wm = Watermark::load_or_seed(&dir);
+        let after = now_epoch_ms();
+        // Seeded to "now" (old behavior preserved on first run)...
+        assert!(wm.get() >= before && wm.get() <= after);
+        // ...and the seed is already on disk, so an immediate restart resumes
+        // from it instead of re-seeding.
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(wm.get()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unparsable_file_falls_back_to_now() {
+        let dir = temp_store("garbage");
+        let path = dir.join(Watermark::FILE_NAME);
+        std::fs::write(&path, "not-a-timestamp\n").unwrap();
+        let before = now_epoch_ms();
+        let wm = Watermark::load_or_seed(&dir);
+        assert!(wm.get() >= before, "garbage must fall back to now");
+        // The garbage was replaced by the fresh seed.
+        assert_eq!(Watermark::load(&path), Some(wm.get()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advance_persists_and_reloads_across_restart() {
+        let dir = temp_store("roundtrip");
+        let wm = Watermark::load_or_seed(&dir);
+        let ts = wm.get() + 60_000;
+        wm.advance(ts);
+        assert_eq!(wm.get(), ts);
+        // A "restarted daemon" (fresh load from the same store dir) resumes
+        // from the persisted value, not from "now".
+        let reloaded = Watermark::load_or_seed(&dir);
+        assert_eq!(reloaded.get(), ts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advance_is_monotonic_in_memory_and_on_disk() {
+        let dir = temp_store("monotonic");
+        let path = dir.join(Watermark::FILE_NAME);
+        let wm = Watermark::load_or_seed(&dir);
+        let newer = wm.get() + 1_000;
+        wm.advance(newer);
+        // An older (or equal) timestamp must neither regress memory nor disk.
+        wm.advance(newer - 500);
+        wm.advance(newer);
+        assert_eq!(wm.get(), newer);
+        assert_eq!(Watermark::load(&path), Some(newer));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_handles_trailing_whitespace() {
+        let dir = temp_store("trim");
+        let path = dir.join(Watermark::FILE_NAME);
+        std::fs::write(&path, "1749740000000\n").unwrap();
+        assert_eq!(Watermark::load(&path), Some(1_749_740_000_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
