@@ -4,7 +4,9 @@
 # localhost/aqua-matrix-agent:poc image in one shot. For each registry entry it does
 # `spawn-consultant.sh --replace --keep-config`, i.e. podman rm -f + re-run reusing the
 # per-label persist volume, so each DID + memory is PRESERVED and each hand-customized
-# config is used VERBATIM (never re-rendered from the template).
+# config is used VERBATIM (never re-rendered from the template). One opt-in exception:
+# --refresh-prompt adopts the template's system_prompt/description/ref_mounts into each
+# kept config, preserving everything else (hello, homeserver, identity).
 #
 # This replaces the old "rm -f each container, then run each recreate-<label>.sh by hand"
 # procedure (and the easy-to-get-wrong manual recreate of the generic container).
@@ -12,9 +14,12 @@
 # Registry: ~/.aqua-matrix-test/consultants.registry  (override with CONSULTANTS_REGISTRY)
 #
 # Usage:
-#   bash ~/roll-consultant-fleet.sh --dry-run      # show what would roll, do nothing
-#   bash ~/roll-consultant-fleet.sh --build        # rebuild image first, then roll all
-#   bash ~/roll-consultant-fleet.sh                # roll all on the existing image
+#   bash ~/roll-consultant-fleet.sh --dry-run        # show what would roll, do nothing
+#   bash ~/roll-consultant-fleet.sh --build          # rebuild image first, then roll all
+#   bash ~/roll-consultant-fleet.sh --refresh-prompt # also adopt the template's updated
+#                                                    # system_prompt/description/ref_mounts
+#                                                    # (customizations + DIDs preserved)
+#   bash ~/roll-consultant-fleet.sh                  # roll all on the existing image
 #
 set -euo pipefail
 
@@ -22,12 +27,14 @@ REG="${CONSULTANTS_REGISTRY:-/home/waldknoten-01/.aqua-matrix-test/consultants.r
 SPAWN=/home/waldknoten-01/spawn-consultant.sh
 BUILD_SH=/home/waldknoten-01/aqua-agents/scripts/build-image.sh
 DRY=0; BUILD=0
+EXTRA=()   # extra flags passed through to spawn-consultant.sh
 
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --build)   BUILD=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --refresh-prompt) EXTRA+=(--refresh-prompt) ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) echo "!! unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -58,9 +65,9 @@ while IFS=$'\t' read -r label target display _; do
   echo
   echo "── rolling: ${label}   (${display})"
   if [ "$DRY" -eq 1 ]; then
-    echo "   (dry-run) bash $SPAWN --replace --keep-config --label ${label}"
+    echo "   (dry-run) bash $SPAWN --replace --keep-config ${EXTRA[*]:-} --label ${label}"
   else
-    if ! bash "$SPAWN" --replace --keep-config --label "$label"; then
+    if ! bash "$SPAWN" --replace --keep-config ${EXTRA[@]+"${EXTRA[@]}"} --label "$label"; then
       echo "!! roll FAILED for ${label} (continuing with the rest)" >&2
       rc=1
     fi

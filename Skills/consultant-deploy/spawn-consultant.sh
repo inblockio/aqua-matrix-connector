@@ -18,6 +18,18 @@
 # persist volume, so the DID + memory are PRESERVED — this is the image-roll path.
 # `--fresh` forces a brand-new identity by wiping the persist dir first.
 #
+# Grounding refs: the repos in REFS_REPOS are mounted read-only at /refs inside the
+# container. Before EVERY launch the script verifies each repo exists on the host
+# (missing = fatal, with a clone hint) and is on the latest upstream commit:
+# clean + behind upstream gets a fast-forward pull; dirty / diverged / offline gets
+# a loud warning and is mounted as-is (never destructive). Skip the freshness pass
+# (presence stays fatal) with --no-refresh-refs.
+#
+# A template prompt change reaches EXISTING consultants via --refresh-prompt: it adopts
+# the template's system_prompt/description/ref_mounts into the kept config, preserving
+# hello/homeserver customizations and identity. Fleet-wide:
+#   roll-consultant-fleet.sh --refresh-prompt
+#
 # Examples:
 #   # new consultant (fresh identity), and DM Tim an onboarding message to forward:
 #   bash ~/spawn-consultant.sh --label gawain \
@@ -44,10 +56,17 @@ REPLACE=0             # rm -f an existing container first (image roll; DID prese
 FRESH=0               # wipe persist dir first (force a brand-new identity)
 ONBOARD=0             # after connect, DM Tim a forward-ready onboarding message
 KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never clobber customizations)
+REFRESH_REFS=1        # fast-forward the /refs repos before launch (--no-refresh-refs to skip)
+REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mounts into the config
 TEMPLATE="${CONSULTANT_TEMPLATE:-/home/waldknoten-01/.aqua-matrix-test/consultant-config.template.json}"
 IMAGE="${CONSULTANT_IMAGE:-localhost/aqua-matrix-agent:poc}"
+REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
+# Grounding repos, mounted ro at /refs/<name>. This ONE list drives the presence check,
+# the freshness pass, and the podman -v flags, so the three can never drift apart.
+# Keep it in sync with ref_mounts in consultant-config.template.json.
+REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem)
 
-usage() { sed -n '2,40p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,46p' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,6 +81,8 @@ while [ $# -gt 0 ]; do
     --fresh)   FRESH=1; shift ;;
     --onboard) ONBOARD=1; shift ;;
     --keep-config) KEEP_CONFIG=1; shift ;;
+    --no-refresh-refs) REFRESH_REFS=0; shift ;;
+    --refresh-prompt) REFRESH_PROMPT=1; shift ;;
     -h|--help) usage 0 ;;
     *) echo "!! unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -137,6 +158,60 @@ fi
 : "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN, or populate $TOKEN_FILE via:  claude setup-token}"
 
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+# ---------------------------------------------------------------- refs grounding
+# The consultant's knowledge is the host checkouts in REFS_REPOS, bind-mounted ro at
+# /refs. A missing repo is FATAL (the mount would fail, or silently ground the agent
+# in nothing). The freshness pass brings each repo to the latest upstream commit when
+# that is safe (clean tree, fast-forward only) and warns loudly otherwise; it never
+# rewrites local work. Network failure is non-fatal: an offline host mounts as-is.
+refresh_refs() {
+  local rc=0 repo dir behind ahead
+  for repo in "${REFS_REPOS[@]}"; do
+    dir="$REFS_BASE/$repo"
+    if [ ! -d "$dir" ]; then
+      echo "!! refs repo MISSING: $dir" >&2
+      echo "   clone it first:  git clone https://github.com/inblockio/${repo}.git $dir" >&2
+      rc=1; continue
+    fi
+    if [ "$REFRESH_REFS" -eq 0 ]; then
+      echo ">> refs: $repo present (freshness pass skipped via --no-refresh-refs)"
+      continue
+    fi
+    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "!! refs: $dir is not a git checkout; cannot verify freshness, mounting as-is" >&2
+      continue
+    fi
+    if ! git -C "$dir" fetch --quiet 2>/dev/null; then
+      echo "!! refs: fetch failed for $repo (offline?); mounting the checkout as-is" >&2
+      continue
+    fi
+    if ! git -C "$dir" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+      echo "!! refs: $repo has no upstream configured; cannot verify freshness, mounting as-is" >&2
+      continue
+    fi
+    behind="$(git -C "$dir" rev-list --count 'HEAD..@{upstream}')"
+    ahead="$(git -C "$dir" rev-list --count '@{upstream}..HEAD')"
+    if [ "$behind" -eq 0 ]; then
+      echo ">> refs: $repo up to date ($(git -C "$dir" rev-parse --short HEAD))"
+    elif [ "$ahead" -gt 0 ]; then
+      echo "!! refs: $repo DIVERGED from upstream ($ahead ahead / $behind behind); resolve manually, mounting as-is" >&2
+    elif [ -n "$(git -C "$dir" status --porcelain)" ]; then
+      echo "!! refs: $repo is $behind commit(s) behind upstream but the tree is DIRTY; not pulling, mounting as-is" >&2
+    elif git -C "$dir" pull --ff-only --quiet 2>/dev/null; then
+      echo ">> refs: $repo fast-forwarded $behind commit(s) to $(git -C "$dir" rev-parse --short HEAD)"
+    else
+      echo "!! refs: fast-forward pull failed for $repo; mounting the checkout as-is" >&2
+    fi
+  done
+  return "$rc"
+}
+refresh_refs || { echo "!! aborting: missing refs repo(s), see clone hints above" >&2; exit 1; }
+
+REF_MOUNT_ARGS=()
+for repo in "${REFS_REPOS[@]}"; do
+  REF_MOUNT_ARGS+=( -v "$REFS_BASE/$repo:/refs/$repo:ro" )
+done
 
 # ---------------------------------------------------------------- notify (best effort)
 # DM Tim from the host CLI identity (independent of any container), never fatal.
@@ -224,6 +299,27 @@ print(f">> rendered config {out} from base {base}  (id={_id}, display={display!r
 PY
 fi
 
+# --refresh-prompt: adopt the template's prompt surface into the (kept or re-rendered)
+# config, so a template prompt update can reach existing consultants without clobbering
+# their customizations (hello, homeserver, ...). Identity fields are untouched.
+if [ "$REFRESH_PROMPT" -eq 1 ]; then
+  [ -f "$TEMPLATE" ] || { echo "!! --refresh-prompt: missing template $TEMPLATE" >&2; exit 2; }
+  python3 - "$TEMPLATE" "$CFG" <<'PY'
+import json, sys
+tpl_path, cfg_path = sys.argv[1:3]
+tpl = json.load(open(tpl_path))
+cfg = json.load(open(cfg_path))
+fields = ("system_prompt", "description", "ref_mounts")
+changed = [k for k in fields if cfg.get(k) != tpl[k]]
+for k in fields:
+    cfg[k] = tpl[k]
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=True)
+    f.write("\n")
+print(">> --refresh-prompt: adopted template " + (", ".join(changed) if changed else "fields (already current)") + f" into {cfg_path}")
+PY
+fi
+
 # ---------------------------------------------------------------- container lifecycle
 if podman container exists "$NAME"; then
   if [ "$REPLACE" -eq 1 ]; then
@@ -269,8 +365,7 @@ CID="$(podman run -d \
   -v "$CFG:/agent/config.json:ro" \
   -v "$STORE:/agent/store:U" \
   -v "$MEM:/agent/memory:U" \
-  -v /home/waldknoten-01/aqua-rs-sdk:/refs/aqua-rs-sdk:ro \
-  -v /home/waldknoten-01/aqua-spec:/refs/aqua-spec:ro \
+  "${REF_MOUNT_ARGS[@]}" \
   "$IMAGE" 2>&1)"
 run_rc=$?
 set -e
@@ -309,7 +404,7 @@ Hi ${HUMAN_NAME}! You now have your own dedicated Aqua Consultant on Matrix.
 To start, send a direct message to:
   ${MXID}
 
-It's a read-only assistant that answers questions about the Aqua protocol, spec, and Rust SDK, grounded in the latest local Aqua sources. On first contact it'll greet you and ask a couple of quick questions (your name, background, what brings you to Aqua, and how deep you want to go), then tailor everything to you. It only explains and cites — it never modifies anything.
+It's a read-only assistant that answers questions about the Aqua protocol, spec, and Rust SDK, plus the repository ecosystem around them and the governance principles behind them, grounded in the latest local Aqua sources. On first contact it'll greet you and ask a couple of quick questions (your name, background, what brings you to Aqua, and how deep you want to go), then tailor everything to you. It only explains and cites — it never modifies anything.
 ———
 EOF
 )"

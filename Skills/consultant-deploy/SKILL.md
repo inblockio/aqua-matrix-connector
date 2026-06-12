@@ -9,7 +9,11 @@ Deploy and maintain **dedicated, single-target Aqua consultants** — one contai
 running `localhost/aqua-matrix-agent:poc` (the `aqua-matrix-claude-p` backend), bound to exactly
 ONE peer MXID by the relay firewall (`authorize(sender == target)` in
 [`crates/aqua-matrix-relay`](../../crates/aqua-matrix-relay/src/lib.rs)). Each consultant is a
-read-only Aqua-protocol assistant grounded in the `/refs` repos.
+read-only Aqua-protocol assistant grounded in four repos mounted read-only at `/refs`:
+`aqua-rs-sdk` (reference implementation), `aqua-spec` (authoritative spec),
+`aqua-ecosystem` (trust-layer map: tiers, products, per-repo registry facts), and
+`aqua-governance-corpus` (governance principles, ICT kernels, deliberation methods).
+The system prompt in `consultant-config.template.json` tells the agent how to use each.
 
 This skill replaces the old approach of hand-cloning a `recreate-<label>-consultant.sh` per peer.
 One generic launcher does it all; a registry + roller image-upgrades the whole fleet.
@@ -37,6 +41,9 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 ## Prerequisites
 
 - Image built: `bash ~/aqua-agents/scripts/build-image.sh` (stages the 4 sibling repos + host `claude`, retags `:poc`).
+- Refs checkouts on the host: `~/aqua-rs-sdk`, `~/aqua-spec`, `~/aqua-governance-corpus`,
+  `~/aqua-ecosystem` (all under `github.com/inblockio/`). The spawner mounts them ro at
+  `/refs/<name>` and **refuses to launch if one is missing** (it prints the exact clone command).
 - OAuth token at `~/.aqua-matrix-heartbeat/claude-oauth-token` (passed **by reference** — never on a command line).
 - `~/.aqua-matrix-notify/notify-tim.sh` (operator DMs) and `target/debug/aqua-activity-watch` (built) for the watcher.
 
@@ -95,6 +102,35 @@ bash ~/roll-consultant-fleet.sh --dry-run     # preview
 bash ~/roll-consultant-fleet.sh --build        # rebuild image, then roll all
 ```
 
+After a **template prompt change** (a new grounding repo, a new behavioural rule), plain
+`--keep-config` would leave existing consultants on the old prompt. Add `--refresh-prompt`
+so each kept config adopts the template's current `system_prompt`/`description`/`ref_mounts`
+while everything else (hello, homeserver, DID, memory) is preserved:
+
+```bash
+bash ~/roll-consultant-fleet.sh --refresh-prompt
+```
+
+## Refs grounding and freshness (automatic)
+
+The agent's knowledge is the live host checkouts, bind-mounted read-only; a host-side
+`git pull` is visible to running consultants immediately. On **every** launch (spawn,
+relabel, and each consultant of a fleet roll) the spawner runs a refs check over the
+`REFS_REPOS` list, so a rebuild can never ship stale or missing grounding:
+
+| Repo state | Behaviour |
+|---|---|
+| missing on host | **FATAL**: refuses to launch, prints the `git clone` command |
+| clean + behind upstream | fast-forward pull, logs old/new state |
+| dirty + behind | loud warning, mounted as-is (local work never touched) |
+| diverged from upstream | loud warning, mounted as-is (resolve manually) |
+| fetch fails (offline) / no upstream / not a git checkout | warning, mounted as-is |
+
+`--no-refresh-refs` skips the freshness pass (presence stays fatal). The mount flags,
+the presence check, and the freshness pass are all driven by the single `REFS_REPOS`
+list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
+`consultant-config.template.json` (which the system prompt mirrors).
+
 ## Identity & lifecycle flags
 
 | Flag | Effect |
@@ -104,17 +140,29 @@ bash ~/roll-consultant-fleet.sh --build        # rebuild image, then roll all
 | `--keep-config` | Use the existing config verbatim (no re-render); derives id/target/display from it. |
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) |
 | `--onboard` | After connect, derive the agent MXID from logs and DM the operator a forward-ready onboarding message. |
+| `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
+| `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
 
 ## Invariants the tooling enforces (verified by adversarial audit, 2026-06-08)
 
-- **Security posture is byte-identical** to the proven original `recreate-zdnaez-consultant.sh`:
-  `--restart on-failure`, `--memory 2048m --cpus 2 --pids-limit 512`, `--cap-drop ALL`,
-  `--security-opt no-new-privileges`, `--tmpfs /tmp`, config + `/refs` mounted `:ro`, persist
-  store/memory mounted `:U`, OAuth token passed **by reference** (`-e CLAUDE_CODE_OAUTH_TOKEN`, no value).
+- **Security posture is byte-identical** to the proven original `recreate-zdnaez-consultant.sh`
+  for the resource/caps/token flags: `--restart on-failure`, `--memory 2048m --cpus 2 --pids-limit 512`,
+  `--cap-drop ALL`, `--security-opt no-new-privileges`, `--tmpfs /tmp`, OAuth token passed
+  **by reference** (`-e CLAUDE_CODE_OAUTH_TOKEN`, no value).
   Keep it that way — verify after any edit:
   ```bash
-  diff <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e |-v )' ~/recreate-zdnaez-consultant.sh) \
-       <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e |-v )' ~/spawn-consultant.sh)
+  diff <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e )' ~/recreate-zdnaez-consultant.sh) \
+       <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e )' ~/spawn-consultant.sh)
+  ```
+- **Mounts**: config mounted `:ro`, persist store/memory mounted `:U`, every `REFS_REPOS` repo
+  mounted `:ro`. Since 2026-06-12 the refs mounts are list-driven and the legacy two-mount
+  baseline was deliberately extended with `aqua-governance-corpus` + `aqua-ecosystem`, so the
+  `-v` lines no longer byte-match the legacy script (the flag diff above intentionally excludes
+  them). Verify nothing mounts writable:
+  ```bash
+  grep -n 'REF_MOUNT_ARGS+' ~/spawn-consultant.sh        # the one mount template; must end :ro
+  podman inspect aqua-agent-<label>-aqua-consultant-1 \
+    --format '{{range .Mounts}}{{.Destination}} rw={{.RW}}{{"\n"}}{{end}}'   # every /refs/* rw=false
   ```
 - **Single-target binding** — the relay matches one exact target; never widen a consultant to >1 peer.
 - **Guards**: placeholder/non-MXID target rejected; `--display` rejects quote/newline (systemd-unit
@@ -147,6 +195,8 @@ Recovery matrix: [`docs/RECOVERY.md`](../../docs/RECOVERY.md).
 podman ps --filter name=aqua-agent-<label>            # Up, restarts 0
 podman logs aqua-agent-<label>-aqua-consultant-1 | grep -E 'agent DID|connected|display name set|daemon starting'
 systemctl --user is-active aqua-activity-watch-<label>.service
+podman inspect aqua-agent-<label>-aqua-consultant-1 \
+  --format '{{range .Mounts}}{{.Destination}} {{end}}'   # expect all four /refs/* + config + store + memory
 ```
 
 Healthy = `daemon starting (target: <the one peer>)`, `connected store_wiped=false` (for `--replace`),
