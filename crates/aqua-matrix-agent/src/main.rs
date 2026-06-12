@@ -42,6 +42,13 @@ struct Args {
     #[arg(long, env = "AGENT_STORE_DIR")]
     store_dir: Option<PathBuf>,
 
+    #[arg(
+        long,
+        env = "AGENT_DEVICE_ID",
+        help = "Pin an explicit Matrix device_id (e.g. a role name like 'heartbeat'). Omit to derive a stable id from the agent DID."
+    )]
+    device_id: Option<String>,
+
     #[arg(long, help = "Message to send (omit to skip sending)")]
     message: Option<String>,
 
@@ -87,6 +94,7 @@ async fn main() -> Result<()> {
         client_id: args.client_id,
         redirect_uri: args.redirect_uri,
         store_dir: args.store_dir.unwrap_or_else(default_store_dir),
+        device_id: args.device_id,
     };
 
     // One-shot CLI: connect once and exit. The long-running daemon modes moved

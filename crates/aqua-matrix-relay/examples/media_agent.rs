@@ -146,6 +146,8 @@ async fn main() {
         client_id: None,
         redirect_uri: None,
         store_dir: PathBuf::from(home).join(".aqua-matrix-media"),
+        // None → connect() derives a stable device_id from the DID.
+        device_id: None,
     };
 
     // Whoever is allowed to talk to the agent. Set AGENT_TARGET (e.g. in a
