@@ -267,6 +267,28 @@ pub fn stable_device_id(did: &str) -> String {
     format!("AQUA_{}", &hex[..12])
 }
 
+/// Resolve the effective stable device_id: the explicit value (trimmed) when
+/// given and non-empty, else the id derived from the DID.
+///
+/// A blank explicit value (e.g. `AGENT_DEVICE_ID=`) is treated as unset so a
+/// misconfiguration falls back to the derived id rather than pinning an empty
+/// device scope. An explicit id with INTERNAL whitespace is rejected outright:
+/// the device_id rides in the OAuth `scope` parameter, which is
+/// whitespace-delimited, so the server would silently truncate `"my device"`
+/// to `"my"` and the cache-divergence guard would then discard the session
+/// cache on every connect. Failing loudly here surfaces the config bug at
+/// startup instead.
+fn resolve_effective_device_id(explicit: Option<&str>, did: &str) -> Result<String> {
+    match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if s.chars().any(char::is_whitespace) => Err(anyhow!(
+            "explicit device_id {s:?} contains whitespace; device_id is carried in the \
+             whitespace-delimited OAuth scope and would be silently truncated by the server"
+        )),
+        Some(s) => Ok(s.to_owned()),
+        None => Ok(stable_device_id(did)),
+    }
+}
+
 #[derive(Deserialize)]
 struct WhoAmI {
     user_id: String,
@@ -438,17 +460,10 @@ async fn acquire_session(
     //   (b) otherwise a deterministic id derived from the DID
     //       (`stable_device_id`), so existing deployments get stability with
     //       zero new config.
-    // A blank explicit value (e.g. `AGENT_DEVICE_ID=`) is treated as unset so
-    // a misconfiguration falls back to the derived id rather than pinning an
-    // empty device scope. See docs/ARCHITECTURE.md "Identity and device-id
-    // persistence".
-    let effective_device_id = config
-        .device_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| stable_device_id(&key.did()));
+    // See `resolve_effective_device_id` for the blank/whitespace handling and
+    // docs/ARCHITECTURE.md "Identity and device-id persistence".
+    let effective_device_id =
+        resolve_effective_device_id(config.device_id.as_deref(), &key.did())?;
     tracing::info!("effective device_id: {effective_device_id}");
 
     let now_unix = unix_now();
@@ -572,6 +587,19 @@ async fn acquire_session(
 
     let identity = resolve_identity(&config.matrix_url, &tokens.access_token).await?;
     tracing::info!("matrix user: {}, device: {}", identity.user_id, identity.device_id);
+    // The deployed siwx-oidc honours the proposed device scope verbatim. If a
+    // server ever ignores it, the divergence guard above would discard the
+    // cache on EVERY connect (perpetual full OAuth, store wipes on reauth).
+    // Diagnose that server-side defect at auth time, not as a guard warn later.
+    if identity.device_id != effective_device_id {
+        tracing::error!(
+            "server provisioned device_id {} instead of the requested {}; the session cache \
+             will be discarded on the next connect. Check that the siwx-oidc version honours \
+             the device scope.",
+            identity.device_id,
+            effective_device_id
+        );
+    }
 
     let expires_at_unix = unix_now().saturating_add(expires_in);
     config_file.session = Some(SessionCache {
@@ -1786,6 +1814,22 @@ mod tests {
             hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "suffix must be lowercase hex, got {hex}"
         );
+    }
+
+    #[test]
+    fn effective_device_id_resolution() {
+        let did = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+        // Explicit id honoured, surrounding whitespace trimmed.
+        assert_eq!(
+            resolve_effective_device_id(Some("  heartbeat "), did).unwrap(),
+            "heartbeat"
+        );
+        // Blank / unset fall back to the derived id.
+        assert_eq!(resolve_effective_device_id(Some("   "), did).unwrap(), stable_device_id(did));
+        assert_eq!(resolve_effective_device_id(None, did).unwrap(), stable_device_id(did));
+        // Internal whitespace would be truncated by the whitespace-delimited
+        // OAuth scope on the server side; it must be rejected loudly.
+        assert!(resolve_effective_device_id(Some("my device"), did).is_err());
     }
 
     #[test]
