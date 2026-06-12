@@ -155,6 +155,15 @@ pub struct AgentConfig {
     pub client_id: Option<String>,
     pub redirect_uri: Option<String>,
     pub store_dir: PathBuf,
+    /// Optional explicit Matrix `device_id` to pin (e.g. a role-named device
+    /// like `heartbeat`, set via `AGENT_DEVICE_ID`). When `None`, `connect`
+    /// derives a deterministic, stable id from the agent's DID via
+    /// [`stable_device_id`], so existing deployments get device stability with
+    /// zero new config. Either way the resolved id is passed to siwx-oidc on
+    /// every login, so the agent reuses ONE stable Synapse device instead of
+    /// minting a fresh `SIWX_<uuid>` each time. See
+    /// docs/ARCHITECTURE.md "Identity and device-id persistence".
+    pub device_id: Option<String>,
 }
 
 pub struct Message {
@@ -235,6 +244,27 @@ pub fn did_from_key_file(path: &Path) -> Result<String> {
         std::fs::write(path, key.to_pem()?).context("failed to write key")?;
         Ok(key.did())
     }
+}
+
+/// Derive a deterministic, stable Synapse `device_id` from an agent's DID.
+///
+/// Scheme: `AQUA_` + the first 12 lowercase-hex characters of `SHA-256(did)`.
+/// This is the zero-config default device id used whenever an operator has not
+/// pinned an explicit [`AgentConfig::device_id`] / `AGENT_DEVICE_ID`. Because it
+/// is a pure function of the DID, the same agent re-derives the SAME device on
+/// every login and restart, so siwx-oidc's idempotent device upsert reuses one
+/// stable Synapse device instead of minting a fresh `SIWX_<uuid>` each time.
+///
+/// Properties (see the unit tests): deterministic (same DID -> same id),
+/// distinct (different DIDs almost never collide -- 48 bits of digest), and a
+/// valid device_id (compact ASCII, no whitespace, well under Synapse's length
+/// limit). 12 hex chars is short enough to stay readable in logs yet wide
+/// enough that a collision across a realistic fleet is negligible.
+pub fn stable_device_id(did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(did.as_bytes());
+    let hex = hex::encode(digest); // lowercase hex, 64 chars
+    format!("AQUA_{}", &hex[..12])
 }
 
 #[derive(Deserialize)]
@@ -376,11 +406,19 @@ async fn resolve_oidc_client(
 ///   1. Cached access token still within its TTL  → use it (no network).
 ///   2. Cached refresh token → exchange for a new access token via
 ///      `siwx_oidc_auth::refresh()` (preserves device_id → crypto store stays valid).
-///   3. Fresh `did:key` authentication → mints a new device_id.
+///   3. Fresh `did:key` authentication → pins the stable `effective_device_id`
+///      (explicit `AGENT_DEVICE_ID` or derived from the DID via
+///      [`stable_device_id`]), so the agent reuses ONE Synapse device instead of
+///      minting a fresh `SIWX_<uuid>` each time.
+///
+/// A cached session whose `device_id` does not match the effective id is
+/// discarded up front (the `SIWX_` → `AQUA_` migration guard, see below), so
+/// every tier converges on the stable device.
 ///
 /// Returns `(access_token, user_id, device_id, expires_at_unix)`. This is the
 /// single source of truth for "give me a live token", shared by the initial
-/// `connect()` and the on-401 / near-expiry self-heal in `reauth_inner()`.
+/// `connect()` and the on-401 / near-expiry self-heal in `reauth_inner()` —
+/// which therefore pin the stable device_id identically.
 /// `force_new` skips the still-valid-cache shortcut so a session that is
 /// near-expiry (but not yet rejected) is rotated rather than reused.
 async fn acquire_session(
@@ -392,8 +430,53 @@ async fn acquire_session(
     config_path: &Path,
     force_new: bool,
 ) -> Result<(String, String, String, u64)> {
+    // Resolve the EFFECTIVE stable device_id, pinned on every fresh auth so the
+    // agent reuses ONE Synapse device instead of minting a fresh `SIWX_<uuid>`
+    // each time. Precedence:
+    //   (a) explicit `config.device_id` / `AGENT_DEVICE_ID` (ops can name a
+    //       role device like `heartbeat`);
+    //   (b) otherwise a deterministic id derived from the DID
+    //       (`stable_device_id`), so existing deployments get stability with
+    //       zero new config.
+    // A blank explicit value (e.g. `AGENT_DEVICE_ID=`) is treated as unset so
+    // a misconfiguration falls back to the derived id rather than pinning an
+    // empty device scope. See docs/ARCHITECTURE.md "Identity and device-id
+    // persistence".
+    let effective_device_id = config
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| stable_device_id(&key.did()));
+    tracing::info!("effective device_id: {effective_device_id}");
+
     let now_unix = unix_now();
-    let cached_clone = config_file.session.clone();
+    // SIWX_ → AQUA_ TRANSITION (cache divergence guard): a session cached before
+    // stable device_ids existed holds an old `SIWX_<uuid>`, while we now pin
+    // `AQUA_…` (or an explicit AGENT_DEVICE_ID). Reusing/refreshing such a cache
+    // would keep the agent on the OLD device for up to the refresh-token TTL
+    // (~24h). So we only honour the cache when its `device_id` already matches
+    // the effective id; otherwise we discard it and fall through to a fresh auth
+    // that provisions the stable device. The store, still bound to the old
+    // device, then fails `restore_session` with "account in the store doesn't
+    // match", and the caller's wipe-and-retry rebuilds it for the new device
+    // (a one-time fresh provision + crypto-store reset, cross-signing
+    // re-bootstraps). This makes the transition deterministic and converge on
+    // the first login, not eventually. The same guard handles an operator
+    // changing AGENT_DEVICE_ID.
+    let cached_clone = config_file.session.clone().filter(|sess| {
+        if sess.device_id == effective_device_id {
+            true
+        } else {
+            tracing::warn!(
+                "cached session device_id {} != effective {}; discarding cache to converge on the stable device",
+                sess.device_id,
+                effective_device_id
+            );
+            false
+        }
+    });
 
     let session_data: Option<(String, String, String, u64)> = if let Some(sess) = cached_clone {
         if !force_new && sess.expires_at_unix > now_unix + 30 {
@@ -462,10 +545,24 @@ async fn acquire_session(
         return Ok(quad);
     }
 
-    tracing::info!("authenticating against {}", config.siwx_url);
-    let tokens = siwx_oidc_auth::authenticate(&config.siwx_url, client_id, redirect_uri, key)
-        .await
-        .context("siwx-oidc authentication failed")?;
+    tracing::info!(
+        "authenticating against {} (pinning device_id {})",
+        config.siwx_url,
+        effective_device_id
+    );
+    // Pin the stable device_id so siwx-oidc provisions (idempotent upsert,
+    // never deletes) that exact Synapse device instead of minting a fresh
+    // `SIWX_<uuid>`. Re-provisioning the same id preserves the device's E2EE
+    // keys, so the agent keeps one stable device across every login.
+    let tokens = siwx_oidc_auth::authenticate_with_device(
+        &config.siwx_url,
+        client_id,
+        redirect_uri,
+        key,
+        Some(&effective_device_id),
+    )
+    .await
+    .context("siwx-oidc authentication failed")?;
     let expires_in = tokens.expires_in.unwrap_or(300);
     tracing::info!(
         "access token acquired (expires in {}s, refresh_token: {})",
@@ -663,7 +760,8 @@ impl AgentClient {
         // Resolve OIDC client + a usable Matrix session (cached token → refresh
         // grant → fresh did:key auth). Both steps live in standalone helpers so
         // the on-401 / near-expiry self-heal (`reauth_inner`) re-mints exactly
-        // the same way. See docs/ARCHITECTURE.md "Identity and device-id persistence".
+        // the same way — including the stable device_id pinning, which lives in
+        // `acquire_session`. See docs/ARCHITECTURE.md "Identity and device-id persistence".
         let config_path = config.store_dir.join("config.toml");
         let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
 
@@ -689,10 +787,14 @@ impl AgentClient {
         std::fs::create_dir_all(&config.store_dir)?;
 
         // Build client + restore session, with one wipe-and-retry on store mismatch.
-        // siwx-oidc mints a new device_id on every fresh auth; the SQLite crypto
-        // store binds to the device_id it was created with. When they diverge we
-        // wipe matrix-sdk-*.sqlite3* (NOT config.toml) and let cross-signing
-        // re-bootstrap on the new device.
+        // We now pin a STABLE device_id, so a fresh auth normally returns the
+        // SAME device and the existing SQLite crypto store still matches — no
+        // wipe. The retry remains for the genuine divergence cases: the one-time
+        // SIWX_ → AQUA_ migration (the store is still bound to the old
+        // `SIWX_<uuid>`), or an operator changing AGENT_DEVICE_ID. The store
+        // binds to the device_id it was created with; when they diverge we wipe
+        // matrix-sdk-*.sqlite3* (NOT config.toml) and let cross-signing
+        // re-bootstrap on the (new) stable device.
         let mut wiped = false;
         let client = match build_and_restore(
             &config.matrix_url,
@@ -1652,6 +1754,38 @@ mod tests {
             "bare M_UNKNOWN/500 is a server internal error"
         );
         assert!(!is_unknown_token(&server_err), "a server fault is not a token rejection");
+    }
+
+    #[test]
+    fn stable_device_id_is_deterministic() {
+        // Same DID always derives the same device_id: this is what makes the
+        // default (no AGENT_DEVICE_ID) stable across logins and restarts.
+        let did = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+        assert_eq!(stable_device_id(did), stable_device_id(did));
+    }
+
+    #[test]
+    fn stable_device_id_is_distinct_per_did() {
+        // Different agents (DIDs) must not collide onto the same Synapse device.
+        let a = stable_device_id("did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH");
+        let b = stable_device_id("did:pkh:eip155:1:0x0000000000000000000000000000000000000001");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stable_device_id_is_a_valid_device_id() {
+        // Synapse device_ids must be compact ASCII with no whitespace. We also
+        // pin the documented AQUA_ prefix + 12 lowercase-hex chars scheme.
+        let id = stable_device_id("did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH");
+        assert!(id.starts_with("AQUA_"), "expected AQUA_ prefix, got {id}");
+        assert_eq!(id.len(), "AQUA_".len() + 12, "expected 5 + 12 chars, got {id}");
+        assert!(!id.chars().any(|c| c.is_whitespace()), "must contain no whitespace");
+        assert!(id.is_ascii(), "must be ASCII");
+        let hex = &id["AQUA_".len()..];
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "suffix must be lowercase hex, got {hex}"
+        );
     }
 
     #[test]

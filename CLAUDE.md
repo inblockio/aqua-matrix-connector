@@ -170,6 +170,7 @@ your own. Precedence, high → low: explicit CLI flag > process env (e.g. system
 | `--redirect-uri` | `OIDC_REDIRECT_URI` | `http://localhost:0/callback` | OIDC redirect URI |
 | `--target` | `AGENT_TARGET` | none (required for `--message`/`--read`) | Matrix user ID to message; set via `.env` (see `.env.example`) |
 | `--store-dir` | `AGENT_STORE_DIR` | `~/.aqua-matrix-agent` | SQLite + config directory |
+| `--device-id` | `AGENT_DEVICE_ID` | derived `AQUA_<sha256(did)[..12]>` | Pin a stable Matrix device_id; omit to derive one from the DID |
 | `--message` | | | Message text to send |
 | `--read` | | | Read recent messages |
 | `--read-limit` | | `20` | Number of messages to fetch |

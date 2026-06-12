@@ -136,6 +136,7 @@ dependencies = [
 [[package]]
 name = "aqua-auth"
 version = "0.2.0"
+source = "git+https://github.com/inblockio/aqua-rs-auth#056cb348fcb0fdddb4651dbed08b27184d4670d9"
 dependencies = [
  "bs58",
  "ed25519-dalek",
@@ -154,6 +155,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "hex",
  "imagesize",
  "matrix-sdk",
  "matrix-sdk-base",
@@ -162,6 +164,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "siwx-oidc-auth",
  "tokio",
  "toml 0.8.23",

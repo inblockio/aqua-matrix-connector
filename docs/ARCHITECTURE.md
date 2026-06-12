@@ -127,25 +127,33 @@ Tradeoff: the daemon holds an open HTTP connection to the homeserver continuousl
 
 ## Identity and device-id persistence
 
-Matrix `device_id` is server-assigned on every fresh OAuth login. matrix-sdk's SQLite crypto store binds to the `device_id` it was created with, so a `device_id` change against an existing store errors with `account in the store doesn't match`. We preserve `device_id` (and therefore the crypto store) across restarts using siwx-oidc's refresh-token grant.
+Matrix `device_id` was historically server-assigned on every fresh OAuth login (a new `SIWX_<uuid>` each time). matrix-sdk's SQLite crypto store binds to the `device_id` it was created with, so a `device_id` change against an existing store errors with `account in the store doesn't match`. We now pin a **stable `device_id`** on every login, so the agent reuses ONE Synapse device across logins and restarts, and the refresh-token grant remains the fast path that also preserves it.
 
-**Three-tier resolution in `AgentClient::connect`** (`<store_dir>/config.toml` holds the cache):
+**Stable device_id (pinned on every login).** `acquire_session` (the single token-acquisition path, shared by `AgentClient::connect` and the on-401 / near-expiry self-heal `reauth_inner`) resolves an *effective* `device_id` and passes it to `siwx_oidc_auth::authenticate_with_device(..., Some(id))`. The siwx-oidc server then provisions (idempotent upsert, never deletes) that exact device instead of minting a fresh `SIWX_<uuid>`, so the device's E2EE keys survive each login. Resolution precedence:
+
+- **(a) Explicit** `AgentConfig.device_id` / `AGENT_DEVICE_ID` — lets ops give a role-named device (e.g. `heartbeat`).
+- **(b) Derived** (default, zero config) — `stable_device_id(did)` = `AQUA_` + the first 12 lowercase-hex chars of `SHA-256(did)`. A pure function of the DID, so the same agent re-derives the SAME device every time. Existing deployments get device stability with no new config.
+
+**Three-tier session resolution in `acquire_session`** (`<store_dir>/config.toml` holds the cache):
 
 1. **Cached access token still within TTL** → validate via `/whoami`, reuse. No network beyond the cheap whoami call.
-2. **Access token expired but refresh_token present** → call `siwx_oidc_auth::refresh(server, client_id, refresh_token, did)` to mint a new access token. `device_id` is preserved across this exchange because the refresh grant is bound to the original login session. Persist the new access token (and rotated refresh token, if the server rotated) back to config.toml.
-3. **No cached session, refresh failed, or refresh_token missing** → fresh `siwx_oidc_auth::authenticate(...)`. This is the only path that mints a new `device_id`. The fresh AuthTokens come with a new refresh_token (24h TTL on siwx-oidc standalone) which is persisted for next time.
+2. **Access token expired but refresh_token present** → call `siwx_oidc_auth::refresh(server, client_id, refresh_token, did)` to mint a new access token. `device_id` is preserved across this exchange because the refresh grant is bound to the original login session (no device scope needed — the server carries it). Persist the new access token (and rotated refresh token, if the server rotated) back to config.toml.
+3. **No cached session, refresh failed, or refresh_token missing** → fresh `authenticate_with_device(..., Some(effective_id))`, which provisions the stable device. The fresh AuthTokens come with a new refresh_token (24h TTL on siwx-oidc standalone) which is persisted for next time.
 
-If step 3 minted a new `device_id` and the existing SQLite store rejects it with "account in the store doesn't match", the connect code wipes `<store_dir>/matrix-sdk-*.sqlite3*` (NOT `config.toml`) and retries `restore_session` once. The previous `ExecStartPre=rm -f ...sqlite3*` workaround in the systemd unit is removed; the in-code path replaces it.
+**Cache divergence guard (the `SIWX_` → `AQUA_` transition).** Before honouring tiers 1–2, `connect` checks the cached session's `device_id` against the effective id. A session cached *before* stable device_ids existed holds an old `SIWX_<uuid>`; reusing or refreshing it would keep the agent on the old device for up to the refresh-token TTL. So a mismatched cache is **discarded**, forcing tier 3, which provisions the stable device. The store, still bound to the old device, then fails `restore_session` with "account in the store doesn't match", and the existing wipe-and-retry rebuilds it. This makes the migration deterministic and converge on the **first** login after upgrade, not eventually. The same guard handles an operator changing `AGENT_DEVICE_ID`.
+
+If tier 3 returns a `device_id` the existing SQLite store rejects with "account in the store doesn't match", the connect code wipes `<store_dir>/matrix-sdk-*.sqlite3*` (NOT `config.toml`) and retries `restore_session` once, then cross-signing re-bootstraps. The previous `ExecStartPre=rm -f ...sqlite3*` workaround in the systemd unit is removed; the in-code path replaces it.
 
 **Resulting behavior:**
 
 | Time since last activity | `device_id` after restart? | Network calls |
 |---|---|---|
-| Within access-token TTL (~5 min) | Same | 1 `/whoami` |
-| Within refresh-token TTL (24h) | Same | 1 `/token` (refresh grant) |
-| Beyond refresh-token TTL | New (crypto store wiped + rebuilt) | Full OAuth code flow + cross-signing rebootstrap |
+| Within access-token TTL (~5 min) | Same (stable) | 1 `/whoami` |
+| Within refresh-token TTL (24h) | Same (stable) | 1 `/token` (refresh grant) |
+| Beyond refresh-token TTL | Same (stable) — re-provisioned by the pinned id; store survives, no wipe | Full OAuth code flow |
+| First login after `SIWX_`→`AQUA_` upgrade, or `AGENT_DEVICE_ID` change | Changes to the stable id (crypto store wiped + rebuilt once) | Full OAuth code flow + cross-signing rebootstrap |
 
-So practical operation — restarts within a single day, or even after a long weekend if the daemon was kept alive enough to refresh — preserves identity completely. Only multi-day downtime forces a fresh device. The daemon recovers automatically from any of these cases without manual intervention.
+So practical operation preserves identity completely, and even multi-day downtime now keeps the SAME device because the id is re-derived and re-provisioned rather than freshly minted. A crypto-store wipe is now a one-time migration event (or a deliberate device rename), not a routine consequence of token expiry. The daemon recovers automatically from any of these cases without manual intervention.
 
 **Persisted fields in `SessionCache`** (`<store_dir>/config.toml` under `[session]`):
 
@@ -155,7 +163,7 @@ So practical operation — restarts within a single day, or even after a long we
 | `expires_at_unix` | When the access token expires. We trigger refresh 30s early. |
 | `refresh_token` | siwx-oidc refresh-grant token (opaque `mcr_*`). 24h TTL on standalone. |
 | `did` | Required by the refresh-grant call (siwx-oidc signature: `refresh(server, client_id, refresh_token, did)`). |
-| `user_id` / `device_id` | Server-assigned; checked against `/whoami` to detect drift; required for `restore_session`. |
+| `user_id` / `device_id` | `user_id` is server-assigned; `device_id` is the stable id we pin (`AQUA_…` or an explicit `AGENT_DEVICE_ID`). Both are checked against `/whoami` to detect drift and against the effective id to drive the migration guard; required for `restore_session`. |
 
 **Upstream dependency:** this design relies on `siwx-oidc-auth` shipping `AuthTokens.refresh_token` and `siwx_oidc_auth::refresh(...)`. Since commit `ab3ad3f` of the siwx-oidc repo these are available; we depend via `path = "../siwx-oidc/siwx-oidc-auth"` (sibling checkout) rather than a pinned git rev, because the newer commit's workspace also requires the `aqua-auth` crate at `../../aqua-auth` which cargo cannot fetch through a single git dep. To set up a fresh dev host: `git clone https://github.com/inblockio/siwx-oidc.git && git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
 
