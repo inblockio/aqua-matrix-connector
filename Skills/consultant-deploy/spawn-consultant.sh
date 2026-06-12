@@ -30,6 +30,13 @@
 # hello/homeserver customizations and identity. Fleet-wide:
 #   roll-consultant-fleet.sh --refresh-prompt
 #
+# The UN-LABELED generic consultant (container aqua-agent-aqua-consultant-1, config
+# aqua-consultant-config.json, persist aqua-consultant-persist — no <label>- prefix,
+# bound to the operator's own MXID) is selected with --generic instead of --label.
+# It behaves identically except that no activity watcher is wired (its peer IS the
+# operator — no self-notification). The registry label `generic` is RESERVED for it,
+# so roll-consultant-fleet.sh rolls it with the rest of the fleet.
+#
 # Examples:
 #   # new consultant (fresh identity), and DM Tim an onboarding message to forward:
 #   bash ~/spawn-consultant.sh --label gawain \
@@ -44,6 +51,9 @@
 #   # image roll (config used VERBATIM, nothing re-rendered) — used by roll-consultant-fleet.sh:
 #   bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez
 #
+#   # same image roll for the un-labeled generic consultant (operator-bound):
+#   bash ~/spawn-consultant.sh --replace --keep-config --generic
+#
 set -euo pipefail
 
 # ---------------------------------------------------------------- defaults / args
@@ -52,6 +62,7 @@ TARGET=""
 DISPLAY_NAME=""
 ID=""                 # defaults to <label>-aqua-consultant-1
 HUMAN_NAME=""         # friendly name for the onboarding message (defaults to display)
+GENERIC=0             # target the UN-LABELED generic consultant instead of a --label one
 REPLACE=0             # rm -f an existing container first (image roll; DID preserved)
 FRESH=0               # wipe persist dir first (force a brand-new identity)
 ONBOARD=0             # after connect, DM Tim a forward-ready onboarding message
@@ -66,7 +77,7 @@ REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
 # Keep it in sync with ref_mounts in consultant-config.template.json.
 REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem)
 
-usage() { sed -n '2,46p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,56p' "$0"; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -77,6 +88,7 @@ while [ $# -gt 0 ]; do
     --name)    HUMAN_NAME="$2"; shift 2 ;;
     --template) TEMPLATE="$2"; shift 2 ;;
     --image)   IMAGE="$2"; shift 2 ;;
+    --generic) GENERIC=1; shift ;;
     --replace) REPLACE=1; shift ;;
     --fresh)   FRESH=1; shift ;;
     --onboard) ONBOARD=1; shift ;;
@@ -95,15 +107,25 @@ if [ "$FRESH" -eq 1 ] && [ "$KEEP_CONFIG" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------- validate label + paths
-[ -n "$LABEL" ] || { echo "!! --label is required (e.g. gawain)" >&2; exit 2; }
-# label must be a safe slug (used in container name + paths + systemd unit)
-case "$LABEL" in
-  *[!a-z0-9-]*|"") echo "!! --label must be lowercase [a-z0-9-]: '$LABEL'" >&2; exit 2 ;;
-esac
+# STEM is the shared name fragment: container aqua-agent-<STEM>-1, config <STEM>-config.json,
+# persist <STEM>-persist, default id <STEM>-1. Labeled consultants use <label>-aqua-consultant;
+# the un-labeled generic one (--generic) uses plain aqua-consultant — no other difference.
+if [ "$GENERIC" -eq 1 ]; then
+  [ -z "$LABEL" ] || { echo "!! --generic and --label are mutually exclusive" >&2; exit 2; }
+  STEM="aqua-consultant"
+else
+  [ -n "$LABEL" ] || { echo "!! --label is required (e.g. gawain), or --generic for the un-labeled consultant" >&2; exit 2; }
+  # label must be a safe slug (used in container name + paths + systemd unit)
+  case "$LABEL" in
+    *[!a-z0-9-]*|"") echo "!! --label must be lowercase [a-z0-9-]: '$LABEL'" >&2; exit 2 ;;
+    generic) echo "!! the label 'generic' is reserved for the un-labeled consultant — use --generic" >&2; exit 2 ;;
+  esac
+  STEM="${LABEL}-aqua-consultant"
+fi
 
-NAME="aqua-agent-${LABEL}-aqua-consultant-1"
-CFG="/home/waldknoten-01/.aqua-matrix-test/${LABEL}-aqua-consultant-config.json"
-PERSIST="/home/waldknoten-01/.aqua-matrix-test/${LABEL}-aqua-consultant-persist"
+NAME="aqua-agent-${STEM}-1"
+CFG="/home/waldknoten-01/.aqua-matrix-test/${STEM}-config.json"
+PERSIST="/home/waldknoten-01/.aqua-matrix-test/${STEM}-persist"
 STORE="$PERSIST/store"
 MEM="$PERSIST/memory"
 
@@ -129,7 +151,7 @@ else
   [ -n "$DISPLAY_NAME" ] || { echo "!! --display is required (e.g. 'Aqua Consultant (Gawain)')" >&2; exit 2; }
   [ -f "$TEMPLATE" ] || { echo "!! missing config template $TEMPLATE" >&2; exit 2; }
 fi
-: "${ID:=${LABEL}-aqua-consultant-1}"
+: "${ID:=${STEM}-1}"
 : "${HUMAN_NAME:=$DISPLAY_NAME}"
 
 # GUARD: refuse a misbound instance. Anchored to the template sentinel (not an uppercase
@@ -225,6 +247,12 @@ notify() {
 # Host-level systemd user service: tails this instance's inbound.jsonl and DMs Tim on
 # the peer's FIRST message + every 10th. Idempotent; never fatal.
 ensure_activity_watch() {
+  if [ "$GENERIC" -eq 1 ]; then
+    # The generic consultant's peer IS the operator — a watcher would DM Tim about
+    # Tim's own messages. Deliberately never wired (also: the unit name is label-derived).
+    echo ">> --generic: no activity watcher (peer is the operator; no self-notification)"
+    return 0
+  fi
   command -v systemctl >/dev/null 2>&1 || { echo "watch: systemctl absent; skipping watcher" >&2; return 0; }
   local activity_log="$MEM/activity/inbound.jsonl"
   local unit="aqua-activity-watch-${LABEL}.service"
@@ -333,10 +361,11 @@ if podman container exists "$NAME"; then
 fi
 
 if [ "$FRESH" -eq 1 ]; then
-  # PERSIST is LABEL-derived and LABEL is slug-validated, but assert the expected prefix before
-  # any rm -rf so a future refactor can never point this at a stray path.
+  # PERSIST is STEM-derived and the label half is slug-validated, but assert the expected
+  # shape before any rm -rf so a future refactor can never point this at a stray path.
   case "$PERSIST" in
     /home/waldknoten-01/.aqua-matrix-test/*-aqua-consultant-persist) : ;;
+    /home/waldknoten-01/.aqua-matrix-test/aqua-consultant-persist) : ;;   # --generic
     *) echo "!! refusing --fresh: unexpected persist path '$PERSIST'" >&2; exit 2 ;;
   esac
   echo ">> --fresh: wiping persist dir for a brand-new identity ($PERSIST)"

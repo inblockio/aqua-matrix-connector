@@ -11,6 +11,10 @@
 # This replaces the old "rm -f each container, then run each recreate-<label>.sh by hand"
 # procedure (and the easy-to-get-wrong manual recreate of the generic container).
 #
+# The registry label `generic` is RESERVED: it selects the UN-LABELED operator-bound
+# consultant (aqua-agent-aqua-consultant-1) and rolls it via spawn-consultant.sh
+# --generic instead of --label, so one roll covers the whole fleet including it.
+#
 # Registry: ~/.aqua-matrix-test/consultants.registry  (override with CONSULTANTS_REGISTRY)
 #
 # Usage:
@@ -34,7 +38,7 @@ for a in "$@"; do
     --dry-run) DRY=1 ;;
     --build)   BUILD=1 ;;
     --refresh-prompt) EXTRA+=(--refresh-prompt) ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "!! unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -59,15 +63,17 @@ while IFS=$'\t' read -r label target display _; do
   label="${label%"${label##*[![:space:]]}"}"
   case "$label" in
     ''|\#*) continue ;;                                  # blank or comment row
+    generic) SEL=(--generic) ;;                          # RESERVED: the un-labeled operator-bound consultant
     *[!a-z0-9-]*)                                        # not a valid slug (e.g. a shifted MXID from a blank label column)
       echo "!! skipping malformed registry label: '$label' (must be [a-z0-9-])" >&2; rc=1; continue ;;
+    *) SEL=(--label "$label") ;;
   esac
   echo
   echo "── rolling: ${label}   (${display})"
   if [ "$DRY" -eq 1 ]; then
-    echo "   (dry-run) bash $SPAWN --replace --keep-config ${EXTRA[*]:-} --label ${label}"
+    echo "   (dry-run) bash $SPAWN --replace --keep-config ${EXTRA[*]:-} ${SEL[*]}"
   else
-    if ! bash "$SPAWN" --replace --keep-config ${EXTRA[@]+"${EXTRA[@]}"} --label "$label"; then
+    if ! bash "$SPAWN" --replace --keep-config ${EXTRA[@]+"${EXTRA[@]}"} "${SEL[@]}"; then
       echo "!! roll FAILED for ${label} (continuing with the rest)" >&2
       rc=1
     fi
