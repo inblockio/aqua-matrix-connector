@@ -60,6 +60,13 @@ struct Args {
 
     #[arg(long, help = "Print agent DID and exit")]
     print_did: bool,
+
+    #[arg(
+        long,
+        env = "AGENT_DISPLAY_NAME",
+        help = "Set the Matrix profile display name / alias (idempotent); applied on connect"
+    )]
+    display_name: Option<String>,
 }
 
 fn default_store_dir() -> PathBuf {
@@ -108,6 +115,18 @@ async fn main() -> Result<()> {
         agent.sync_once().await?;
     }
 
+    // Set the profile display name (alias) when requested. Idempotent: the
+    // homeserver PUT is skipped when the name already matches, so wiring this
+    // into a per-send .env re-asserts the alias cheaply on every invocation.
+    if let Some(ref name) = args.display_name {
+        // Best-effort, mirroring the relay: a cosmetic profile write must never
+        // block a send (this CLI is the critical-alert notify path).
+        match agent.set_display_name(name).await {
+            Ok(()) => println!("display name set to {name:?}"),
+            Err(e) => eprintln!("warning: failed to set display name {name:?}: {e:#}"),
+        }
+    }
+
     // --message / --read need a target; resolve it once with a clear error if
     // neither --target nor AGENT_TARGET (e.g. from .env) was provided.
     if args.message.is_some() || args.read {
@@ -147,7 +166,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if args.message.is_none() && !args.read {
+    if args.message.is_none() && !args.read && args.display_name.is_none() {
         println!("connected as {} ({})", agent.user_id(), agent.did());
         println!("use --message to send or --read to read messages");
     }
