@@ -192,6 +192,146 @@ async fn e2ee_bidirectional_messaging() {
     println!("  Messages verified decryptable in both directions");
 }
 
+/// Regression test for the `413 M_TOO_LARGE` streaming-edit failure: a large
+/// streamed reply must roll over onto multiple messages and arrive intact,
+/// never as one oversize (and rejected) edit.
+///
+/// Agent A streams ~30 KB of markdown through a `ReplyStream` (the exact path a
+/// claude-channel reply uses). The connector must split it onto several messages
+/// at clean paragraph boundaries. We then verify at Agent B that:
+///   * every paragraph sentinel arrives (no chunk was silently dropped — i.e. no
+///     edit 413'd, since a 413 is now swallowed best-effort and would otherwise
+///     leave a hole),
+///   * each sentinel lands intact inside a single message (no mid-word split),
+///   * the reply spans several messages (rollover actually happened),
+///   * nothing is "[unable to decrypt]".
+#[tokio::test]
+async fn streaming_rollover_delivers_large_reply_without_413() {
+    tracing_subscriber::fmt()
+        .with_env_filter("warn,aqua_matrix_agent=info")
+        .try_init()
+        .ok();
+
+    let _serial = E2E_LOCK.lock().await;
+
+    let agent_a = AgentClient::connect(agent_config("agent.pem"))
+        .await
+        .expect("Agent A failed to connect");
+    let agent_b = AgentClient::connect(agent_config("agent-b.pem"))
+        .await
+        .expect("Agent B failed to connect");
+    println!("A={} B={}", agent_a.user_id(), agent_b.user_id());
+
+    // Establish the DM room and exchange keys (same handshake as the bidi test).
+    agent_a
+        .send_dm(agent_b.user_id(), "e2e-rollover-room-setup")
+        .await
+        .expect("room setup");
+    sync_n(&agent_b, 2).await;
+    agent_b.join_invited_rooms().await.expect("B join");
+    sync_n(&agent_b, 2).await;
+    sync_n(&agent_a, 2).await;
+    // B → A so A learns B's device keys before encrypting the stream to B.
+    agent_b
+        .send_dm(agent_a.user_id(), "e2e-rollover-hello")
+        .await
+        .expect("B->A hello");
+    sync_n(&agent_a, 2).await;
+
+    // Build ~30 KB of markdown: 60 paragraphs, each opening with a unique
+    // sentinel, separated by blank lines so the splitter has clean boundaries.
+    let tag = uuid::Uuid::new_v4().to_string();
+    const PARAS: usize = 60;
+    let sentinel = |i: usize| format!("PARA_{i:03}_{tag}");
+    let mut big = String::new();
+    for i in 0..PARAS {
+        if i > 0 {
+            big.push_str("\n\n");
+        }
+        big.push_str(&sentinel(i));
+        big.push_str(": ");
+        // ~480 bytes of filler so each paragraph is well under one message budget.
+        big.push_str(&"the quick brown fox jumps over the lazy dog. ".repeat(11));
+    }
+    println!("streaming {} bytes across {PARAS} paragraphs", big.len());
+    assert!(big.len() > 25_000, "test payload should be large");
+
+    // Stream it through a ReplyStream in token-sized pushes, exactly as the
+    // backend does. None of these may panic; finish must succeed.
+    let mut stream = agent_a
+        .reply_stream(agent_b.user_id())
+        .await
+        .expect("open reply stream");
+    for piece in big.as_bytes().chunks(2_000) {
+        let s = std::str::from_utf8(piece).unwrap_or("");
+        stream.push(s).await.expect("push never errors");
+    }
+    stream
+        .finish(None)
+        .await
+        .expect("finish must land (the authoritative write)");
+    println!("stream finished");
+
+    let room_b = agent_b
+        .dm_room_id(agent_a.user_id())
+        .await
+        .expect("dm room")
+        .expect("dm room exists");
+
+    // Settle: a real client retries decryption as Megolm keys arrive over sync.
+    // We verify only OUR tagged content (the room is shared across runs, so its
+    // history contains unrelated, long-rotated UTD events — counting those would
+    // be meaningless). Loop until every sentinel of THIS reply is decrypted, or
+    // give up. A genuinely dropped chunk (silent 413) never resolves → fail.
+    let mut messages = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for attempt in 0..30 {
+        sync_n(&agent_b, 1).await;
+        messages = agent_b
+            .messages(&room_b, 200)
+            .await
+            .expect("read messages");
+        missing = (0..PARAS)
+            .map(sentinel)
+            .filter(|s| !messages.iter().any(|m| m.body.contains(s)))
+            .collect();
+        let utd = messages.iter().filter(|m| m.body == "[unable to decrypt]").count();
+        println!("settle attempt {attempt}: {} sentinels missing, {utd} UTD in window", missing.len());
+        if missing.is_empty() {
+            break;
+        }
+    }
+
+    // Every sentinel must appear intact inside SOME single message body. A
+    // dropped chunk (e.g. a silently-413'd edit) would make its sentinel absent;
+    // a mid-word split would break the contiguous sentinel string.
+    assert!(
+        missing.is_empty(),
+        "{} sentinels never arrived/decrypted (chunk dropped or cut mid-token): {:?}",
+        missing.len(),
+        &missing[..missing.len().min(5)]
+    );
+
+    // Rollover actually happened: the reply must span several messages, not one.
+    let carrying = messages
+        .iter()
+        .filter(|m| (0..PARAS).any(|i| m.body.contains(&sentinel(i))))
+        .count();
+    assert!(
+        carrying >= 4,
+        "expected the reply to roll over onto several messages, got {carrying}"
+    );
+    let one_holds_all = messages
+        .iter()
+        .any(|m| (0..PARAS).all(|i| m.body.contains(&sentinel(i))));
+    assert!(!one_holds_all, "the whole reply fit in one message — no rollover");
+
+    println!(
+        "\nROLLOVER E2E PASSED: {} bytes delivered across {carrying} messages, all {PARAS} sentinels intact, no 413",
+        big.len()
+    );
+}
+
 /// Minimal, dependency-free SHA-256 (FIPS 180-4). Used only by the room-mapping
 /// proof test to recompute lk-jwt-service's LiveKit room alias locally, so the
 /// test has no new crate deps and is reproducible offline.
