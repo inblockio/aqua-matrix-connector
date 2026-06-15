@@ -201,6 +201,15 @@ pub trait MessageHandler: Send + Sync + 'static {
         self.role().to_string()
     }
 
+    /// Optional path to a local image file set as the agent's Matrix profile
+    /// avatar on first connect, mirroring [`display_name`](Self::display_name).
+    /// `None` (the default) leaves the avatar untouched, so existing backends
+    /// are unaffected. Inside a container this is typically a read-only mount
+    /// such as `/agent/avatar.png`.
+    fn avatar_path(&self) -> Option<String> {
+        None
+    }
+
     /// One-time greeting DM'd to `target` on the first successful connect.
     /// `None` stays silent.
     fn hello(&self, _agent: &AgentClient) -> Option<String> {
@@ -492,6 +501,14 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
                 tracing::warn!("{}: set display name failed: {e:#}", handler.role());
             } else {
                 tracing::info!("{}: display name set to {:?}", handler.role(), alias);
+            }
+            // Set the profile avatar the same way: best-effort, never blocks
+            // startup. set_avatar is idempotent (skips re-upload when unchanged).
+            if let Some(avatar) = handler.avatar_path() {
+                match agent.set_avatar(std::path::Path::new(&avatar)).await {
+                    Ok(()) => tracing::info!("{}: avatar set from {:?}", handler.role(), avatar),
+                    Err(e) => tracing::warn!("{}: set avatar failed: {e:#}", handler.role()),
+                }
             }
             if let Some(hello) = handler.hello(&agent) {
                 // Only greet into an EXISTING DM room. If none resolves yet (the
