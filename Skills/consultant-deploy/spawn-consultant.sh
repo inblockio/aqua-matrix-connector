@@ -36,6 +36,10 @@
 #        --target '@did-key-…:matrix.inblock.io' \
 #        --display 'Aqua Consultant (Gawain)' --onboard --name Gawain
 #
+#   # with a per-consultant avatar (mounted ro at /agent/avatar.png; set on first connect):
+#   bash ~/spawn-consultant.sh --label gawain --target '@did-key-…:matrix.inblock.io' \
+#        --display 'Aqua Consultant (Gawain)' --avatar ~/.aqua-matrix-test/gawain-avatar.png
+#
 #   # relabel / re-point an EXISTING consultant (DID + memory + bespoke config preserved —
 #   # the render MERGES onto the existing config, overriding only target/display):
 #   bash ~/spawn-consultant.sh --replace --label zdnaez \
@@ -50,6 +54,7 @@ set -euo pipefail
 LABEL=""
 TARGET=""
 DISPLAY_NAME=""
+AVATAR=""             # optional avatar image; mounted ro at /agent/avatar.png + rendered into avatar_path
 ID=""                 # defaults to <label>-aqua-consultant-1
 HUMAN_NAME=""         # friendly name for the onboarding message (defaults to display)
 REPLACE=0             # rm -f an existing container first (image roll; DID preserved)
@@ -73,6 +78,7 @@ while [ $# -gt 0 ]; do
     --label)   LABEL="$2"; shift 2 ;;
     --target)  TARGET="$2"; shift 2 ;;
     --display) DISPLAY_NAME="$2"; shift 2 ;;
+    --avatar)  AVATAR="$2"; shift 2 ;;
     --id)      ID="$2"; shift 2 ;;
     --name)    HUMAN_NAME="$2"; shift 2 ;;
     --template) TEMPLATE="$2"; shift 2 ;;
@@ -213,6 +219,16 @@ for repo in "${REFS_REPOS[@]}"; do
   REF_MOUNT_ARGS+=( -v "$REFS_BASE/$repo:/refs/$repo:ro" )
 done
 
+# Optional avatar: mounted READ-ONLY at a fixed path the agent reads on first
+# connect. The image stays a ro mount (never embedded in config); only its
+# container path is recorded as avatar_path during the render below.
+AVATAR_CONTAINER_PATH="/agent/avatar.png"
+AVATAR_MOUNT_ARGS=()
+if [ -n "$AVATAR" ]; then
+  [ -f "$AVATAR" ] || { echo "!! --avatar file not found: $AVATAR" >&2; exit 2; }
+  AVATAR_MOUNT_ARGS+=( -v "$AVATAR:$AVATAR_CONTAINER_PATH:ro" )
+fi
+
 # ---------------------------------------------------------------- notify (best effort)
 # DM Tim from the host CLI identity (independent of any container), never fatal.
 NOTIFY=/home/waldknoten-01/.aqua-matrix-notify/notify-tim.sh
@@ -285,17 +301,20 @@ else
   # preserves hand-customizations like a bespoke hello), otherwise the generic template. Only
   # id/target/display_name are overridden. To force a clean template render, delete $CFG first.
   BASE="$TEMPLATE"; [ -f "$CFG" ] && BASE="$CFG"
-  python3 - "$BASE" "$CFG" "$ID" "$TARGET" "$DISPLAY_NAME" <<'PY'
+  python3 - "$BASE" "$CFG" "$ID" "$TARGET" "$DISPLAY_NAME" "${AVATAR:+$AVATAR_CONTAINER_PATH}" <<'PY'
 import json, sys
 base, out, _id, target, display = sys.argv[1:6]
+avatar = sys.argv[6] if len(sys.argv) > 6 else ""
 cfg = json.load(open(base))
 cfg['id'] = _id
 cfg['target'] = target
 cfg['display_name'] = display
+if avatar:
+    cfg['avatar_path'] = avatar
 with open(out, 'w') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=True)
     f.write('\n')
-print(f">> rendered config {out} from base {base}  (id={_id}, display={display!r})")
+print(f">> rendered config {out} from base {base}  (id={_id}, display={display!r}, avatar={avatar!r})")
 PY
 fi
 
@@ -366,6 +385,7 @@ CID="$(podman run -d \
   -v "$STORE:/agent/store:U" \
   -v "$MEM:/agent/memory:U" \
   "${REF_MOUNT_ARGS[@]}" \
+  "${AVATAR_MOUNT_ARGS[@]}" \
   "$IMAGE" 2>&1)"
 run_rc=$?
 set -e
