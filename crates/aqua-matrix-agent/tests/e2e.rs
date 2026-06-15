@@ -479,6 +479,23 @@ async fn streaming_rollover_delivers_large_reply_without_413() {
     println!("streaming {} bytes across {PARAS} paragraphs", big.len());
     assert!(big.len() > 25_000, "test payload should be large");
 
+    // Snapshot the room's existing event-ids BEFORE streaming, so the
+    // placeholder check below inspects only messages THIS run produces (the shared
+    // room's history contains bare "…" from runs that predate this fix; a
+    // timestamp filter would be fooled by host/homeserver clock skew).
+    let room_b = agent_b
+        .dm_room_id(agent_a.user_id())
+        .await
+        .expect("dm room")
+        .expect("dm room exists");
+    let baseline: std::collections::HashSet<String> = agent_b
+        .messages(&room_b, 200)
+        .await
+        .expect("baseline read")
+        .into_iter()
+        .map(|m| m.event_id)
+        .collect();
+
     // Stream it through a ReplyStream in token-sized pushes, exactly as the
     // backend does. None of these may panic; finish must succeed.
     let mut stream = agent_a
@@ -494,12 +511,6 @@ async fn streaming_rollover_delivers_large_reply_without_413() {
         .await
         .expect("finish must land (the authoritative write)");
     println!("stream finished");
-
-    let room_b = agent_b
-        .dm_room_id(agent_a.user_id())
-        .await
-        .expect("dm room")
-        .expect("dm room exists");
 
     // Settle: a real client retries decryption as Megolm keys arrive over sync.
     // We verify only OUR tagged content (the room is shared across runs, so its
@@ -535,21 +546,21 @@ async fn streaming_rollover_delivers_large_reply_without_413() {
         &missing[..missing.len().min(5)]
     );
 
-    // No message may be a bare placeholder: the first message (and every rollover
-    // continuation) must carry real content, so the receiver's push notification
-    // previews the answer rather than "…". An edit fallback body is "* <content>".
-    let placeholders: Vec<&String> = messages
+    // No NEW message (not in the pre-stream baseline) may be a bare placeholder:
+    // the first message and every rollover continuation must carry real content, so
+    // the receiver's push notification previews the answer rather than "…". An edit
+    // fallback body is "* <content>".
+    let placeholders = messages
         .iter()
-        .map(|m| &m.body)
-        .filter(|b| {
-            let t = b.trim_start_matches("* ").trim();
+        .filter(|m| !baseline.contains(&m.event_id))
+        .filter(|m| {
+            let t = m.body.trim_start_matches("* ").trim();
             t == "…" || t.is_empty()
         })
-        .collect();
-    assert!(
-        placeholders.is_empty(),
-        "received {} bare placeholder message(s) — first send / continuation must carry content",
-        placeholders.len()
+        .count();
+    assert_eq!(
+        placeholders, 0,
+        "received {placeholders} bare placeholder message(s) from this run — first send / continuation must carry content"
     );
 
     // Rollover actually happened: the reply must span several messages, not one.
