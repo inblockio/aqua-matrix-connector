@@ -10,7 +10,7 @@
 | H4 | claude failure → error delivered with the same guarantee | Confirmed (code) | claude-p spawn `Err(e)` arm: `record_reply(errtext)` → `send_dm_reliable` → `mark_delivered` else `request_recycle`; relay redelivers |
 | H5 | delivery errors never reach the stale-resume self-heal → session preserved | Confirmed (code) | `stream_claude` only `bail!`s on (None,Some,empty); delivery paths set `delivered`/`reply_text`, never Err; self-heal fires only on genuine claude failure |
 | H6 | builds, unit tests pass, dep-direction holds | Confirmed | connector 35 + relay suites pass; agents 6 pass; `check-dep-direction.sh` OK; both `cargo build` clean (no warnings) |
-| H7 | rebuilt image rolled fleet-wide, DIDs/memory intact | _pending deploy_ | _TBD_ |
+| H7 | rebuilt image rolled fleet-wide, DIDs/memory intact | Confirmed | image `2d823e73a4fa`; 7 containers + host daemon Up; affected `aqua-agent-aqua-consultant-1` DID `z6MkmPz99…` identical post-roll; tim-channel + host `z6MkozJj…` preserved (store_wiped=false) |
 
 ## Layer 2: Acceptance Criteria
 
@@ -20,7 +20,11 @@
 | AC2 | a message read but interrupted by restart is answered after restart | Confirmed (unit+code) | journal `Pending` survives reload; `replay_inbox` re-dispatches on startup |
 | AC3 | claude failure → user receives an error message | Confirmed (code) | guaranteed-error path in claude-p spawn task |
 | AC4 | answer + error delivery confirmed or durably retried | Met | live E2E confirmed delivery + drain; unconfirmed → journal `ToDeliver` → cycle redelivery |
-| AC5 | fleet deployed; identities/memory preserved | _TBD_ | post-roll DIDs |
+| AC5 | fleet deployed; identities/memory preserved | Met | 7 containers + host daemon on image `2d823e73a4fa`; all DIDs preserved |
+
+## Verdict
+All 7 hypotheses Confirmed; all 5 acceptance criteria Met. Shipped (connector `ee7b6e4`,
+agents `a790460`) and deployed fleet-wide on image `2d823e73a4fa`, identities/memory preserved.
 
 ## Design notes
 - Self-heal = redelivery on a fresh-token cycle + `request_recycle` (immediate), NOT an
