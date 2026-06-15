@@ -5,11 +5,13 @@
 #![recursion_limit = "256"]
 
 mod call;
+mod durable;
 mod media;
 mod recovery;
 mod registry;
 mod rtc_keys;
 
+pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
 pub use rtc_keys::{
     CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
@@ -191,6 +193,17 @@ pub struct AgentClient {
     /// MatrixSession refresh hits Synapse's native endpoint, not siwx-oidc's
     /// `/token`), so the rotation has to happen at this layer.
     config: AgentConfig,
+    /// Durable work-journal for the delivery+inbox promise, injected by the relay
+    /// (`run_daemon`) so a handler running on a *clone* of this client can record
+    /// its answer/error durably ([`record_reply`](Self::record_reply)) and mark it
+    /// delivered ([`mark_delivered`](Self::mark_delivered)). `None` for one-shot
+    /// CLI use, where there is no daemon lifecycle to redeliver.
+    journal: Option<std::sync::Arc<WorkJournal>>,
+    /// Signalled by a handler ([`request_recycle`](Self::request_recycle)) when a
+    /// live delivery failed, so `run_daemon` ends the current cycle and reconnects
+    /// with a fresh token to redeliver the journalled reply within seconds rather
+    /// than waiting for the next scheduled cycle.
+    recycle: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl AgentClient {
@@ -203,6 +216,50 @@ impl AgentClient {
 
     pub fn expires_at_unix(&self) -> u64 {
         self.expires_at_unix
+    }
+
+    /// Inject the durable work-journal and recycle signal (called once per cycle by
+    /// the relay, before the client is cloned into handlers). After this, a handler
+    /// holding a clone can durably record and complete its replies.
+    pub fn attach_durability(
+        &mut self,
+        journal: std::sync::Arc<WorkJournal>,
+        recycle: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        self.journal = Some(journal);
+        self.recycle = Some(recycle);
+    }
+
+    /// Whether a durable journal is attached (daemon mode). Handlers use this to
+    /// decide between the durable promise path and a plain one-shot send.
+    pub fn has_journal(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    /// Durably record the answer/error for the inbound message `event_id` so it is
+    /// guaranteed to be delivered (redelivered by the relay across restarts/token
+    /// rotation) even if the live send below fails. No-op without a journal.
+    pub fn record_reply(&self, event_id: &str, text: &str) {
+        if let Some(j) = &self.journal {
+            j.set_to_deliver(event_id, text);
+        }
+    }
+
+    /// Mark the inbound message `event_id` fully handled — its answer/error has been
+    /// confirmed delivered. Removes it from the durable inbox. No-op without a journal.
+    pub fn mark_delivered(&self, event_id: &str) {
+        if let Some(j) = &self.journal {
+            j.mark_done(event_id);
+        }
+    }
+
+    /// Ask `run_daemon` to end the current cycle and reconnect now (fresh token), so
+    /// a journalled-but-undelivered reply is redelivered within seconds. No-op if no
+    /// recycle signal is attached.
+    pub fn request_recycle(&self) {
+        if let Some(r) = &self.recycle {
+            r.notify_one();
+        }
     }
 }
 
@@ -918,6 +975,8 @@ impl AgentClient {
             user_id,
             expires_at_unix,
             config,
+            journal: None,
+            recycle: None,
         })
     }
 
