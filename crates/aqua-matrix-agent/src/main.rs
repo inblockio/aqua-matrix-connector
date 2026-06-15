@@ -67,6 +67,13 @@ struct Args {
         help = "Set the Matrix profile display name / alias (idempotent); applied on connect"
     )]
     display_name: Option<String>,
+
+    #[arg(
+        long,
+        env = "AGENT_AVATAR",
+        help = "Set the Matrix profile avatar from an image file (png/jpg/gif/webp); applied on connect (idempotent)"
+    )]
+    avatar: Option<String>,
 }
 
 fn default_store_dir() -> PathBuf {
@@ -127,6 +134,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(ref avatar) = args.avatar {
+        // Best-effort, mirroring the display-name write above.
+        match agent.set_avatar(std::path::Path::new(avatar)).await {
+            Ok(()) => println!("avatar set from {avatar:?}"),
+            Err(e) => eprintln!("warning: failed to set avatar {avatar:?}: {e:#}"),
+        }
+    }
+
     // --message / --read need a target; resolve it once with a clear error if
     // neither --target nor AGENT_TARGET (e.g. from .env) was provided.
     if args.message.is_some() || args.read {
@@ -166,7 +181,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if args.message.is_none() && !args.read && args.display_name.is_none() {
+    if args.message.is_none() && !args.read && args.display_name.is_none() && args.avatar.is_none() {
         println!("connected as {} ({})", agent.user_id(), agent.did());
         println!("use --message to send or --read to read messages");
     }

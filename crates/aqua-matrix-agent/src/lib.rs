@@ -34,6 +34,7 @@ use matrix_sdk::{
 use serde::{Deserialize, Serialize};
 use siwx_oidc_auth::SiwxKey;
 use std::path::{Path, PathBuf};
+use mime::Mime;
 
 // ---------------------------------------------------------------------------
 // Config file (persisted OIDC credentials)
@@ -204,6 +205,39 @@ impl AgentClient {
     pub fn expires_at_unix(&self) -> u64 {
         self.expires_at_unix
     }
+}
+
+/// Detect a Matrix-acceptable image mime from the file's magic bytes. Keyed on
+/// content rather than extension so the uploaded `content_type` always matches
+/// the actual bytes — the deploy pipeline mounts the image at a fixed
+/// `/agent/avatar.png` path regardless of its real format, so an
+/// extension-based guess would be wrong. Dependency-free.
+fn avatar_mime(data: &[u8]) -> Result<Mime> {
+    let kind = if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "image/png"
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        return Err(anyhow!(
+            "unrecognized avatar image format (expected jpeg/png/gif/webp by content)"
+        ));
+    };
+    kind.parse::<Mime>()
+        .map_err(|e| anyhow!("failed to parse mime {kind:?}: {e}"))
+}
+
+/// Dependency-free content fingerprint for avatar change-detection. This is NOT
+/// a cryptographic hash and is not a security boundary — it only decides whether
+/// the on-disk avatar differs from the one we last uploaded.
+fn content_fingerprint(data: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 /// Load configuration from a `.env` file into the process environment, to be
@@ -1400,6 +1434,40 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Set this agent's Matrix profile avatar from a local image file. Mirrors
+    /// [`set_display_name`]: best-effort and idempotent across reconnects. The
+    /// relay re-applies this on every first sync cycle, so to avoid re-uploading
+    /// (and orphaning media on the homeserver) we cache the content fingerprint
+    /// of the last-applied avatar in a sentinel under the store dir and skip the
+    /// upload when the file is unchanged AND the account still advertises an
+    /// avatar URL.
+    pub async fn set_avatar(&self, path: &Path) -> Result<()> {
+        let data = std::fs::read(path)
+            .with_context(|| format!("failed to read avatar file {}", path.display()))?;
+        let mime = avatar_mime(&data)?;
+        let fingerprint = content_fingerprint(&data);
+        let sentinel = self.config.store_dir.join(".avatar-fingerprint");
+        let account = self.client.account();
+
+        if std::fs::read_to_string(&sentinel).ok().as_deref() == Some(fingerprint.as_str())
+            && account
+                .get_avatar_url()
+                .await
+                .context("failed to read current avatar url")?
+                .is_some()
+        {
+            return Ok(());
+        }
+
+        account
+            .upload_avatar(&mime, data)
+            .await
+            .context("failed to upload avatar")?;
+        // Best-effort cache; a failed write just means we re-upload next time.
+        let _ = std::fs::write(&sentinel, &fingerprint);
+        Ok(())
+    }
+
     pub async fn messages(&self, room_id: &str, limit: u32) -> Result<Vec<Message>> {
         let room_id: &RoomId = room_id
             .try_into()
@@ -1701,6 +1769,38 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn avatar_mime_detects_by_magic_bytes() {
+        assert_eq!(avatar_mime(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().to_string(), "image/jpeg");
+        assert_eq!(
+            avatar_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap().to_string(),
+            "image/png"
+        );
+        assert_eq!(avatar_mime(b"GIF89a\x00\x00").unwrap().to_string(), "image/gif");
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(avatar_mime(&webp).unwrap().to_string(), "image/webp");
+    }
+
+    #[test]
+    fn avatar_mime_rejects_unknown() {
+        assert!(avatar_mime(b"not an image at all").is_err());
+        assert!(avatar_mime(&[]).is_err());
+        // A JPEG file misnamed .png must STILL be detected as jpeg by content.
+        assert_eq!(avatar_mime(&[0xFF, 0xD8, 0xFF, 0x00]).unwrap().to_string(), "image/jpeg");
+    }
+
+    #[test]
+    fn content_fingerprint_is_stable_and_distinguishing() {
+        let a = content_fingerprint(b"hello");
+        let b = content_fingerprint(b"hello");
+        let c = content_fingerprint(b"world");
+        assert_eq!(a, b, "same bytes -> same fingerprint (idempotency)");
+        assert_ne!(a, c, "different bytes -> different fingerprint");
+        assert_eq!(a.len(), 16);
+    }
 
     #[test]
     fn config_file_roundtrip() {
