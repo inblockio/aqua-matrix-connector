@@ -207,28 +207,27 @@ impl AgentClient {
     }
 }
 
-/// Pick a Matrix-acceptable image mime from a file extension. Avatars are
-/// PNG/JPEG/GIF/WebP in practice; resolved from the extension to avoid pulling
-/// in a mime-sniffing dependency.
-fn avatar_mime(path: &Path) -> Result<Mime> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let s = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        other => {
-            return Err(anyhow!(
-                "unsupported avatar image extension {other:?} (use png/jpg/gif/webp)"
-            ))
-        }
+/// Detect a Matrix-acceptable image mime from the file's magic bytes. Keyed on
+/// content rather than extension so the uploaded `content_type` always matches
+/// the actual bytes — the deploy pipeline mounts the image at a fixed
+/// `/agent/avatar.png` path regardless of its real format, so an
+/// extension-based guess would be wrong. Dependency-free.
+fn avatar_mime(data: &[u8]) -> Result<Mime> {
+    let kind = if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "image/png"
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        return Err(anyhow!(
+            "unrecognized avatar image format (expected jpeg/png/gif/webp by content)"
+        ));
     };
-    s.parse::<Mime>()
-        .map_err(|e| anyhow!("failed to parse mime {s:?}: {e}"))
+    kind.parse::<Mime>()
+        .map_err(|e| anyhow!("failed to parse mime {kind:?}: {e}"))
 }
 
 /// Dependency-free content fingerprint for avatar change-detection. This is NOT
@@ -1445,7 +1444,7 @@ impl AgentClient {
     pub async fn set_avatar(&self, path: &Path) -> Result<()> {
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read avatar file {}", path.display()))?;
-        let mime = avatar_mime(path)?;
+        let mime = avatar_mime(&data)?;
         let fingerprint = content_fingerprint(&data);
         let sentinel = self.config.store_dir.join(".avatar-fingerprint");
         let account = self.client.account();
@@ -1772,18 +1771,25 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn avatar_mime_maps_known_extensions() {
-        assert_eq!(avatar_mime(Path::new("a.png")).unwrap().to_string(), "image/png");
-        assert_eq!(avatar_mime(Path::new("a.jpg")).unwrap().to_string(), "image/jpeg");
-        assert_eq!(avatar_mime(Path::new("A.JPEG")).unwrap().to_string(), "image/jpeg");
-        assert_eq!(avatar_mime(Path::new("a.gif")).unwrap().to_string(), "image/gif");
-        assert_eq!(avatar_mime(Path::new("a.webp")).unwrap().to_string(), "image/webp");
+    fn avatar_mime_detects_by_magic_bytes() {
+        assert_eq!(avatar_mime(&[0xFF, 0xD8, 0xFF, 0xE0]).unwrap().to_string(), "image/jpeg");
+        assert_eq!(
+            avatar_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap().to_string(),
+            "image/png"
+        );
+        assert_eq!(avatar_mime(b"GIF89a\x00\x00").unwrap().to_string(), "image/gif");
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(avatar_mime(&webp).unwrap().to_string(), "image/webp");
     }
 
     #[test]
     fn avatar_mime_rejects_unknown() {
-        assert!(avatar_mime(Path::new("a.bmp")).is_err());
-        assert!(avatar_mime(Path::new("noext")).is_err());
+        assert!(avatar_mime(b"not an image at all").is_err());
+        assert!(avatar_mime(&[]).is_err());
+        // A JPEG file misnamed .png must STILL be detected as jpeg by content.
+        assert_eq!(avatar_mime(&[0xFF, 0xD8, 0xFF, 0x00]).unwrap().to_string(), "image/jpeg");
     }
 
     #[test]
