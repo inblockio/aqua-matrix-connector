@@ -535,6 +535,23 @@ async fn streaming_rollover_delivers_large_reply_without_413() {
         &missing[..missing.len().min(5)]
     );
 
+    // No message may be a bare placeholder: the first message (and every rollover
+    // continuation) must carry real content, so the receiver's push notification
+    // previews the answer rather than "…". An edit fallback body is "* <content>".
+    let placeholders: Vec<&String> = messages
+        .iter()
+        .map(|m| &m.body)
+        .filter(|b| {
+            let t = b.trim_start_matches("* ").trim();
+            t == "…" || t.is_empty()
+        })
+        .collect();
+    assert!(
+        placeholders.is_empty(),
+        "received {} bare placeholder message(s) — first send / continuation must carry content",
+        placeholders.len()
+    );
+
     // Rollover actually happened: the reply must span several messages, not one.
     let carrying = messages
         .iter()

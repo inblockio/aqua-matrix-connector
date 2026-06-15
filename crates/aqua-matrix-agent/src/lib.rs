@@ -1606,6 +1606,13 @@ const STREAM_MIN_SPLIT_BYTES: usize = 1_500;
 /// (or adversarial) output cannot flood a room. Beyond this the tail is truncated.
 const STREAM_MAX_MESSAGES: usize = 50;
 
+/// Hold the FIRST message of a streamed reply back until the buffer carries at
+/// least this many bytes, so the receiver's push notification previews the first
+/// lines of the answer instead of a bare placeholder. The typing indicator covers
+/// the brief wait; a short reply that never reaches this is sent whole by
+/// [`ReplyStream::finish`]. ~120 bytes ≈ a line or two — enough to be meaningful.
+const FIRST_MESSAGE_MIN_BYTES: usize = 120;
+
 /// The *final* transmission of a reply must not be silently dropped: throttled
 /// intermediate edits are best-effort (each is superseded by the next), but the
 /// last edit / one-shot send carries the authoritative, complete text. If its
@@ -1705,32 +1712,58 @@ impl Drop for TypingGuard {
 /// exceed Matrix's event-size cap (the `413 M_TOO_LARGE` failure mode).
 pub struct ReplyStream {
     room: matrix_sdk::Room,
-    /// The *current* (still editable) message; rollover advances this.
-    event_id: OwnedEventId,
+    /// The *current* (still editable) message; rollover advances this. `None`
+    /// until the first message is actually sent — we hold it back (see
+    /// [`FIRST_MESSAGE_MIN_BYTES`]) so the receiver's push notification previews
+    /// real text rather than a bare placeholder.
+    event_id: Option<OwnedEventId>,
     /// Markdown shown in the current message only (earlier rolled-over messages
     /// are already finalized and frozen).
     buf: String,
     last_edit: Instant,
     pending: bool,
-    /// How many messages this reply has opened so far (≥ 1). Used to bound
-    /// fan-out and to know whether any rollover has happened in `finish`.
+    /// How many messages this reply has opened so far (0 before the first send).
+    /// Used to bound fan-out and to know whether any rollover has happened in
+    /// `finish`.
     messages: usize,
 }
 
 impl ReplyStream {
     async fn start(room: matrix_sdk::Room) -> Result<Self> {
-        let resp = room
-            .send(RoomMessageEventContent::text_plain("…"))
-            .await
-            .context("failed to send streaming placeholder")?;
+        // Deliberately send NOTHING yet: a placeholder "…" would fire a push
+        // notification with no content. The first real message is sent by `push`
+        // once the buffer is meaningful, or by `finish` for a short reply. The
+        // caller shows a typing indicator until then.
         Ok(Self {
             room,
-            event_id: resp.response.event_id.clone(),
+            event_id: None,
             buf: String::new(),
             last_edit: Instant::now(),
             pending: false,
-            messages: 1,
+            messages: 0,
         })
+    }
+
+    /// Whether the first real message has been sent yet. The caller keeps its
+    /// typing indicator up until this is true, so there is no silent gap while the
+    /// first chunk is held back for a meaningful notification.
+    pub fn has_started(&self) -> bool {
+        self.event_id.is_some()
+    }
+
+    /// Send the first message as a NEW message carrying the buffer so far, so the
+    /// receiver's notification previews the first lines. Best-effort: on failure
+    /// we stay un-started and retry on the next `push` / `finish`.
+    async fn send_first(&mut self) {
+        match self.send_new(&render_streaming(&self.buf)).await {
+            Ok(ev) => {
+                self.event_id = Some(ev);
+                self.messages = 1;
+                self.last_edit = Instant::now();
+                self.pending = false;
+            }
+            Err(e) => tracing::warn!("reply-stream: first message send failed (will retry): {e:#}"),
+        }
     }
 
     /// Append `chunk` to the reply, editing the message in place at most once
@@ -1749,6 +1782,16 @@ impl ReplyStream {
     pub async fn push(&mut self, chunk: &str) -> Result<()> {
         self.buf.push_str(chunk);
         self.pending = true;
+        // No live message yet: hold the first send back until the buffer carries
+        // enough for a meaningful push notification (the first lines). Until then
+        // there is nothing to roll over or edit; the caller's typing indicator
+        // covers the wait.
+        if self.event_id.is_none() {
+            if self.buf.len() >= FIRST_MESSAGE_MIN_BYTES {
+                self.send_first().await;
+            }
+            return Ok(());
+        }
         // Roll over *before* the next edit, so an oversize edit is never sent.
         while self.buf.len() > STREAM_ROLLOVER_BYTES && self.messages < STREAM_MAX_MESSAGES {
             if !self.roll_over().await {
@@ -1786,10 +1829,17 @@ impl ReplyStream {
             text
         };
         let chunks = split_for_matrix(&text, STREAM_ROLLOVER_BYTES);
-        // First chunk replaces the current live message; the rest are fresh
-        // messages. All must land — retry each until acknowledged.
         let first = chunks.first().cloned().unwrap_or_default();
-        retry_finalize("reply-finalize", || self.edit(&first)).await?;
+        // If a live message exists, the first chunk replaces it (edit); otherwise
+        // (a short reply held back below the first-flush threshold, or a failed
+        // first send) the first chunk is sent as a brand-new message so it still
+        // lands and notifies meaningfully. The rest are fresh messages. All must
+        // land — retry each until the homeserver acknowledges it.
+        if self.event_id.is_some() {
+            retry_finalize("reply-finalize", || self.edit(&first)).await?;
+        } else {
+            retry_finalize("reply-finalize", || self.send_plain(&first)).await?;
+        }
         for chunk in chunks.iter().skip(1) {
             retry_finalize("reply-continuation", || self.send_plain(chunk)).await?;
         }
@@ -1808,8 +1858,12 @@ impl ReplyStream {
             _ => raw_head.to_string(),
         };
         let (head_final, fence_open) = close_open_fence(&head);
-        // Open the continuation FIRST; on failure leave everything untouched.
-        let new_ev = match self.new_message().await {
+        let tail = self.buf[cut..].trim_start_matches('\n').to_string();
+        let new_buf = if fence_open { format!("```\n{tail}") } else { tail };
+        // Open the continuation WITH its content (not a bare "…") so its push
+        // notification, if any, previews real text. Do it FIRST; on failure leave
+        // everything untouched.
+        let new_ev = match self.send_new(&render_streaming(&new_buf)).await {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!("reply-rollover: cannot open continuation message: {e:#}");
@@ -1821,26 +1875,22 @@ impl ReplyStream {
         if let Err(e) = retry_finalize("reply-rollover", || self.edit(&head_final)).await {
             tracing::warn!("reply-rollover: failed to finalize a rolled-over message: {e:#}");
         }
-        let tail = self.buf[cut..].trim_start_matches('\n').to_string();
-        self.event_id = new_ev;
+        self.event_id = Some(new_ev);
         self.messages += 1;
-        self.buf = if fence_open {
-            format!("```\n{tail}")
-        } else {
-            tail
-        };
-        // Allow an immediate first edit of the new message.
-        self.last_edit = Instant::now()
-            .checked_sub(STREAM_EDIT_INTERVAL)
-            .unwrap_or_else(Instant::now);
+        self.buf = new_buf;
+        // The continuation was just sent with current content; next edit waits a
+        // full interval.
+        self.last_edit = Instant::now();
         true
     }
 
-    /// Send a fresh placeholder and return its event id (the new live message).
-    async fn new_message(&self) -> Result<OwnedEventId> {
+    /// Send `body` as a fresh message and return its event id (a new live
+    /// message). Used to open a rollover continuation and the first message —
+    /// always with real content so it never notifies as a bare placeholder.
+    async fn send_new(&self, body: &str) -> Result<OwnedEventId> {
         let resp = self
             .room
-            .send(RoomMessageEventContent::text_plain("…"))
+            .send(RoomMessageEventContent::text_markdown(body))
             .await
             .context("failed to open continuation message")?;
         Ok(resp.response.event_id.clone())
@@ -1855,12 +1905,17 @@ impl ReplyStream {
     }
 
     async fn edit(&self, body: &str) -> Result<()> {
+        // Only valid once a live message exists; callers (throttled edit, rollover
+        // freeze, finish-with-event) ensure that. Defensive no-op otherwise.
+        let Some(event_id) = self.event_id.clone() else {
+            return Ok(());
+        };
         // Build the replacement directly rather than via Room::make_edit_event,
         // which fetches the target event from the server on every call (a
-        // round-trip per edit, and racy right after we send the placeholder).
+        // round-trip per edit, and racy right after we send the message).
         // We are the author and already hold the event id, so this is safe.
         let content = RoomMessageEventContent::text_markdown(body)
-            .make_replacement(ReplacementMetadata::new(self.event_id.clone(), None));
+            .make_replacement(ReplacementMetadata::new(event_id, None));
         self.room
             .send(content)
             .await
