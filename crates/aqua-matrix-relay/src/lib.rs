@@ -67,6 +67,7 @@ use matrix_sdk::{
 // attachment's kind and download it without touching matrix-sdk.
 pub use aqua_matrix_agent::{
     load_dotenv, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream, TypingGuard,
+    WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
 
@@ -252,6 +253,20 @@ pub trait MessageHandler: Send + Sync + 'static {
         msg: &InboundMessage<'_>,
     ) -> anyhow::Result<()>;
 
+    /// Does this handler take ownership of completing the durable work-journal
+    /// item itself (via [`AgentClient::record_reply`]/[`AgentClient::mark_delivered`])?
+    ///
+    /// Default `false`: the handler answers synchronously inside `handle_message`,
+    /// so the relay auto-completes the journal item when `handle_message` returns
+    /// `Ok`. Override to `true` for a handler that spawns a detached task (e.g. a
+    /// long `claude -p` turn) — `handle_message` returns *before* the answer
+    /// exists, so the relay must NOT auto-complete; the handler signals completion
+    /// when its task actually finishes. Getting this wrong drops the durable
+    /// guarantee (auto-complete erases the inbox item before it is answered).
+    fn owns_completion(&self) -> bool {
+        false
+    }
+
     /// Handle an inbound call-signaling event (invite / Element-Call ring /
     /// hangup) from `target`, already sender-authorized by the relay. The
     /// default is a no-op, so existing handlers are unaffected.
@@ -414,6 +429,19 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // was delivered while the daemon was down.
     let watermark = Arc::new(Watermark::load_or_seed(&config.store_dir));
 
+    // Durable work-journal: the inbox+outbox that makes every accepted message a
+    // promise (answered-or-errored, delivery confirmed) across restarts AND token
+    // rotation. The watermark stops sync from re-delivering an already-seen event;
+    // the journal is what guarantees an accepted event is actually *completed*
+    // (answered + delivered) — it persists `Pending` (needs the handler to run)
+    // and `ToDeliver { text }` (answer produced, delivery owed) until done.
+    // `recycle` lets a handler request an immediate reconnect so a
+    // journalled-but-undelivered reply is redelivered on a fresh token in seconds,
+    // not at the next scheduled rotation.
+    let journal = Arc::new(WorkJournal::load_or_empty(&config.store_dir));
+    let recycle = Arc::new(Notify::new());
+    let mut replay_pending = true;
+
     // Trap SIGTERM/SIGINT once and fan it out via a Notify so every cycle can
     // unwind cleanly. `podman stop`/`systemctl stop` send SIGTERM and SIGKILL
     // after a grace period; handling it lets us abort the in-flight sync and
@@ -425,7 +453,7 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     let mut first_cycle = true;
     let mut consecutive_failures: u32 = 0;
     loop {
-        let agent = match AgentClient::connect(config.clone()).await {
+        let mut agent = match AgentClient::connect(config.clone()).await {
             Ok(a) => {
                 consecutive_failures = 0;
                 a
@@ -481,6 +509,26 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // next round-trip). Best-effort.
         if let Err(e) = agent.sync_once().await {
             tracing::warn!("{}: settle sync_once failed: {e:#}", handler.role());
+        }
+
+        // Attach the durable journal + recycle signal so a handler running on a
+        // clone of this client can record/complete its replies durably.
+        agent.attach_durability(journal.clone(), recycle.clone());
+
+        // Redeliver any answer/error produced but not confirmed delivered (a
+        // token-rotation failure last cycle, or a prior crash) — now on this
+        // cycle's fresh token. Each confirmed send clears its journal entry; a
+        // still-failing one stays for the next cycle. This is the outbound half of
+        // the promise: a reply can never be silently dropped.
+        drain_deliveries(&agent, &target, &journal, handler.role()).await;
+
+        // Once per process: replay inbound messages that were accepted but never
+        // answered (crash/restart mid-turn). The watermark prevents sync from
+        // re-delivering them, so the journal is the only thing that can — this is
+        // the inbox promise surviving a restart.
+        if replay_pending {
+            replay_pending = false;
+            replay_inbox(&agent, &target, &handler, &journal).await;
         }
 
         let now = unix_now_secs();
@@ -552,6 +600,8 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
             &handler,
             refresh_deadline,
             watermark.clone(),
+            journal.clone(),
+            &recycle,
             &shutdown,
         )
         .await;
@@ -621,6 +671,8 @@ async fn run_cycle<H: MessageHandler>(
     handler: &Arc<H>,
     refresh_deadline: tokio::time::Instant,
     watermark: Arc<Watermark>,
+    journal: Arc<WorkJournal>,
+    recycle: &Notify,
     shutdown: &Notify,
 ) -> &'static str {
     // Collect every per-cycle event-handler handle so we can REMOVE them at cycle
@@ -635,6 +687,7 @@ async fn run_cycle<H: MessageHandler>(
         target.clone(),
         handler.clone(),
         watermark,
+        journal,
     ));
     // Surface inbound call signaling (invite / Element-Call ring / hangup) to the
     // handler's `on_call`. Separate from `register_handler` because call events
@@ -667,6 +720,7 @@ async fn run_cycle<H: MessageHandler>(
                 tokio::select! {
                     biased;
                     _ = shutdown.notified() => break "shutdown",
+                    _ = recycle.notified() => break "recycle",
                     _ = tokio::time::sleep_until(refresh_deadline) => break "refresh-deadline",
                     res = &mut sync_task => {
                         log_sync_end(res);
@@ -682,6 +736,7 @@ async fn run_cycle<H: MessageHandler>(
             tokio::select! {
                 biased;
                 _ = shutdown.notified() => "shutdown",
+                _ = recycle.notified() => "recycle",
                 _ = tokio::time::sleep_until(refresh_deadline) => "refresh-deadline",
                 res = &mut sync_task => {
                     log_sync_end(res);
@@ -775,6 +830,7 @@ fn register_handler<H: MessageHandler>(
     target: Arc<String>,
     handler: Arc<H>,
     watermark: Arc<Watermark>,
+    journal: Arc<WorkJournal>,
 ) -> matrix_sdk::event_handler::EventHandlerHandle {
     agent.client().add_event_handler({
         let agent = agent.clone();
@@ -783,8 +839,9 @@ fn register_handler<H: MessageHandler>(
             let target = target.clone();
             let handler = handler.clone();
             let watermark = watermark.clone();
+            let journal = journal.clone();
             async move {
-                dispatch(ev, room, &agent, &target, &handler, &watermark).await;
+                dispatch(ev, room, &agent, &target, &handler, &watermark, &journal).await;
             }
         }
     })
@@ -908,6 +965,7 @@ async fn dispatch<H: MessageHandler>(
     target: &str,
     handler: &Arc<H>,
     watermark: &Watermark,
+    journal: &WorkJournal,
 ) {
     // Only messages from the configured peer, and only ones newer than anything
     // we've already seen this cycle. The default `authorize` compares
@@ -973,6 +1031,31 @@ async fn dispatch<H: MessageHandler>(
         return;
     }
 
+    // Durable inbox: record the message BEFORE handling so a crash/restart
+    // mid-turn replays it (the watermark above stops sync from re-delivering it,
+    // so the journal is the only thing that can). `enqueue` is idempotent on
+    // event_id and returns `false` if the event is already tracked — a rare
+    // re-sync race where it is already in-flight (`Pending`) or answered and
+    // awaiting delivery (`ToDeliver`). In that case do NOT re-dispatch: the
+    // existing handler run / the cycle drain already owns it; re-running would
+    // double-process (a duplicate answer).
+    let newly_enqueued = journal.enqueue(WorkItem {
+        event_id: ev.event_id.to_string(),
+        room_id: room.room_id().to_string(),
+        ts_ms,
+        msgtype: ev.content.msgtype.msgtype().to_string(),
+        body: body.clone(),
+        state: WorkState::Pending,
+    });
+    if !newly_enqueued {
+        tracing::debug!(
+            "{}: event {} already tracked in the work-journal; not re-dispatching",
+            handler.role(),
+            ev.event_id
+        );
+        return;
+    }
+
     let msg = InboundMessage {
         sender_mxid: ev.sender.as_str(),
         sender_did: None,
@@ -988,6 +1071,96 @@ async fn dispatch<H: MessageHandler>(
     // serving. (Errors are the handler's domain; the transport stays up.)
     if let Err(e) = handler.handle_message(agent, target, &msg).await {
         tracing::warn!("{}: handle_message failed: {e:#}", handler.role());
+    }
+
+    // Completion of the durable item:
+    //  - A handler that answers synchronously inside `handle_message` is DONE now,
+    //    so auto-complete (covers echo/heartbeat and keeps their behaviour simple).
+    //  - A handler that `owns_completion()` (claude-p spawns a detached task) has
+    //    NOT answered yet; it records `ToDeliver` and marks done from its own task.
+    //    Auto-completing here would erase the inbox item before it is answered.
+    if !handler.owns_completion() {
+        journal.mark_done(ev.event_id.as_str());
+    }
+}
+
+/// Redeliver every `ToDeliver` journal entry — an answer/error that was produced
+/// but whose live send was not confirmed (token rotation, a transient server
+/// error, or a crash before delivery). Runs at the start of each cycle, so the
+/// send uses this cycle's freshly-minted token: that IS the self-heal for the
+/// token-rotation drop. A confirmed send clears the entry; a still-failing one
+/// stays for the next cycle. Never re-runs the handler (the text is cached).
+async fn drain_deliveries(
+    agent: &AgentClient,
+    target: &str,
+    journal: &WorkJournal,
+    role: &str,
+) {
+    for item in journal.pending_deliveries() {
+        let WorkState::ToDeliver { text } = &item.state else {
+            continue;
+        };
+        match agent.send_dm_chunked(target, text).await {
+            Ok(_) => {
+                journal.mark_done(&item.event_id);
+                tracing::info!("{role}: redelivered journalled reply for {}", item.event_id);
+            }
+            Err(e) => tracing::warn!(
+                "{role}: redelivery of {} failed (will retry next cycle): {e:#}",
+                item.event_id
+            ),
+        }
+    }
+}
+
+/// Replay inbound messages that were accepted but never answered — `Pending`
+/// items left by a crash/restart mid-turn. The dedupe watermark prevents sync
+/// from re-delivering them, so without this they would be silently dropped; this
+/// is the inbox promise surviving a restart. Runs ONCE per process (the live sync
+/// path handles everything after). Text-only: a media handle can't be re-resolved
+/// across a restart, so a replayed media message carries just its caption (logged).
+async fn replay_inbox<H: MessageHandler>(
+    agent: &AgentClient,
+    target: &str,
+    handler: &Arc<H>,
+    journal: &WorkJournal,
+) {
+    let pending = journal.pending_work();
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "{}: replaying {} unfinished inbox message(s) after restart",
+        handler.role(),
+        pending.len()
+    );
+    for item in pending {
+        if item.msgtype != "m.text" {
+            tracing::warn!(
+                "{}: replaying non-text message {} ({}) with caption only — media not re-fetchable after restart",
+                handler.role(),
+                item.event_id,
+                item.msgtype
+            );
+        }
+        let msg = InboundMessage {
+            sender_mxid: target,
+            sender_did: None,
+            event_id: &item.event_id,
+            room_id: &item.room_id,
+            timestamp_ms: item.ts_ms,
+            msgtype: &item.msgtype,
+            body: &item.body,
+            media: None,
+        };
+        if let Err(e) = handler.handle_message(agent, target, &msg).await {
+            tracing::warn!("{}: replay handle_message failed: {e:#}", handler.role());
+        }
+        // Mirror dispatch's completion rule: a synchronous handler is done now; an
+        // owns_completion handler completes from its own (re-spawned) task.
+        if !handler.owns_completion() {
+            journal.mark_done(&item.event_id);
+        }
     }
 }
 
