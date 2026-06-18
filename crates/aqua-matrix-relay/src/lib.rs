@@ -219,6 +219,13 @@ pub trait MessageHandler: Send + Sync + 'static {
         None
     }
 
+    /// Called once the `hello` DM has been CONFIRMED sent (first connect only).
+    /// Lets a handler durably record that the greeting was delivered, so a
+    /// transient send failure (for example a stale-token first cycle, which is
+    /// then fixed by a restart) never advances any "already greeted" state on a
+    /// delivery that did not actually land. Default: no-op.
+    fn hello_delivered(&self) {}
+
     /// Periodic tick interval. `None` (the default) disables the timer; the
     /// daemon then only reacts to inbound messages.
     fn tick_interval(&self) -> Option<Duration> {
@@ -573,6 +580,10 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
                     Ok(Some(_)) => {
                         if let Err(e) = agent.send_dm(&target, &hello).await {
                             tracing::warn!("{}: hello send failed: {e:#}", handler.role());
+                        } else {
+                            // Greeting confirmed delivered: let the handler commit
+                            // any "already greeted" state now, not on a failed send.
+                            handler.hello_delivered();
                         }
                     }
                     _ => tracing::info!(
