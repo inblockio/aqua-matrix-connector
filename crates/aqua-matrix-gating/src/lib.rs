@@ -23,10 +23,18 @@
 
 pub mod destructive;
 mod ask_bridge;
+mod md_bridge;
 mod pending;
 
 pub use ask_bridge::{accept_loop, AskBridge};
+pub use md_bridge::MdBridge;
 pub use pending::PendingMap;
+
+// Re-export the shared markdown-filename helpers so the backend imports them
+// from one place (gating) alongside [`MdBridge`]. The bridge names the
+// attachment from the model-supplied filename; the backend backstop names it
+// from the document's H1; both use the SAME `slugify`, so they cannot drift.
+pub use aqua_matrix_md_mcp::{safe_md_filename, slugify};
 
 /// The MCP server key in the generated `ask_human` `--mcp-config`. The
 /// fully-qualified tool name `claude` sees is therefore `mcp__ask__ask_human`
@@ -53,6 +61,29 @@ Before any destructive or irreversible action (deleting files, `rm`/`rm -rf`, `g
 exact command and its blast radius, and proceed only if the answer authorises it. If it returns an \
 error or a denial, do NOT perform the action — stop and report it.";
 
+/// The MCP server key in the generated `send_markdown_file` `--mcp-config`. The
+/// fully-qualified tool name `claude` sees is therefore
+/// `mcp__md__send_markdown_file` (see [`MD_FILE_TOOL`]).
+pub const MD_SERVER_KEY: &str = "md";
+
+/// The fully-qualified `send_markdown_file` MCP tool name the backend merges
+/// into `--allowedTools` when the md bridge is up. Derived from [`MD_SERVER_KEY`]
+/// so the two cannot drift (the `md_tool_name_matches_server_key` test enforces
+/// it).
+pub const MD_FILE_TOOL: &str = concat!("mcp__", "md", "__send_markdown_file");
+
+/// The two-pathway markdown protocol, injected via `--append-system-prompt` on
+/// every conversational run. It is the SINGLE source of markdown-handling
+/// instruction for the agent: pathway A delivers a file via the tool, pathway B
+/// replies with an inline fenced code block, and the agent must never report a
+/// container path as a deliverable. Kept consistent with the tool results so a
+/// `delivered false` never causes a double delivery. No em dashes (house style).
+pub const MD_SYSTEM_PROMPT: &str = "You can deliver markdown two ways, and you must pick the right one.\n\n\
+PATHWAY A, markdown FILE. If the user asks for the answer as a file (for example \"give me the markdown file\", \"the markdown FILE\", \"send it as a file\", \"as a .md\", \"export this as a markdown file\", \"send me a markdown file\"), call the tool mcp__md__send_markdown_file with a short descriptive filename and the full markdown document as the markdown argument. Do not write, create, or save any file yourself with any other tool for this, and never tell the user a local path or a container path. After the tool returns delivered true, confirm briefly, for example \"Sent it to you as a markdown file.\" If the tool says it could not attach the file but the content was sent another way, do not paste it again; just briefly say it could not be attached as a file. Only if the tool explicitly says nothing was sent should you paste the full document inline.\n\n\
+PATHWAY B, markdown OUTPUT. If the user asks for the answer in markdown inline (for example \"in markdown\", \"as markdown\", \"format that as markdown\", \"show the markdown\", without the word file), reply with a single fenced markdown code block: three backticks, then the word markdown, then a newline, the document, and three backticks. Do not attach a file.\n\n\
+Disambiguation. The words file, markdown file, .md, attachment, download, or \"send it as a file\" mean PATHWAY A, the tool. The phrases \"in markdown\" or \"as markdown\" without the word file mean PATHWAY B, the inline code block.\n\n\
+MUST NOT. Never write the deliverable into your own memory or any container path and then report that path to the user as the deliverable. The user cannot open container paths. Use the tool for files, or an inline code block for output. You may still write to your own memory files for your own continuity, but a memory path is never a deliverable you give the user.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +94,19 @@ mod tests {
         // `mcp__<ASK_SERVER_KEY>__ask_human`. If `ASK_SERVER_KEY` ever changes,
         // this fails until `ASK_HUMAN_TOOL`'s `concat!` is updated to match.
         assert_eq!(ASK_HUMAN_TOOL, format!("mcp__{ASK_SERVER_KEY}__ask_human"));
+    }
+
+    #[test]
+    fn md_tool_name_matches_server_key() {
+        // Same invariant for the markdown tool: `MD_FILE_TOOL` must always be
+        // `mcp__<MD_SERVER_KEY>__send_markdown_file`.
+        assert_eq!(MD_FILE_TOOL, format!("mcp__{MD_SERVER_KEY}__send_markdown_file"));
+    }
+
+    #[test]
+    fn md_system_prompt_has_no_em_or_en_dashes() {
+        // House style: the agent-facing protocol must carry no em/en dashes.
+        assert!(!MD_SYSTEM_PROMPT.contains('\u{2014}'), "em dash present");
+        assert!(!MD_SYSTEM_PROMPT.contains('\u{2013}'), "en dash present");
     }
 }

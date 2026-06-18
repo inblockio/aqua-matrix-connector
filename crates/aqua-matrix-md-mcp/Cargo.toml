@@ -1,0 +1,23 @@
+[package]
+name = "aqua-matrix-md-mcp"
+version.workspace = true
+edition.workspace = true
+description = "Tiny stdio MCP server exposing one tool, `send_markdown_file(filename, markdown) -> delivered`, that bridges a Markdown document over a per-run unix socket to the daemon (which owns the Matrix session) for delivery as an attached `.md` file. The library half (`ipc`, `jsonrpc`, filename helpers) is reused by the daemon-side bridge and the backend backstop."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_matrix_md_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aqua-matrix-md-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

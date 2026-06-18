@@ -35,6 +35,7 @@ CONNECTOR_CRATES=(
   aqua-matrix-agent
   aqua-matrix-relay
   aqua-matrix-ask-mcp
+  aqua-matrix-md-mcp
   aqua-matrix-orchestrator
   aqua-matrix-gating
   aqua-activity-watch
