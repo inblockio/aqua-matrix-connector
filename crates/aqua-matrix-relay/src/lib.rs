@@ -1079,6 +1079,7 @@ async fn backfill_missed<H: MessageHandler>(
         let mut utd = 0usize;
         for room in agent.client().joined_rooms() {
             let mut from: Option<String> = None;
+            let mut pages = 0usize;
             for _ in 0..BACKFILL_MAX_PAGES {
                 let mut opts = MessagesOptions::backward();
                 opts.limit = UInt::from(BACKFILL_PAGE);
@@ -1127,6 +1128,20 @@ async fn backfill_missed<H: MessageHandler>(
                 if reached_watermark || empty || from.is_none() {
                     break;
                 }
+                pages += 1;
+            }
+            // Walked the whole page budget without meeting the watermark: there
+            // is older unhandled history than one cycle will reconsider. Say so.
+            // A silent truncation here would look exactly like "nothing to catch
+            // up on", which is the failure this whole function exists to end.
+            if pages >= BACKFILL_MAX_PAGES {
+                tracing::warn!(
+                    "{}: backfill hit its {} page limit in {} without reaching the watermark ({since}); \
+                     older unhandled messages remain and will not be picked up automatically",
+                    handler.role(),
+                    BACKFILL_MAX_PAGES,
+                    room.room_id()
+                );
             }
         }
         (pending, utd)
