@@ -48,6 +48,8 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
   `github.com/inblockio/`). The spawner mounts them ro at
   `/refs/<name>` and **refuses to launch if one is missing** (it prints the exact clone command).
 - OAuth token at `~/.aqua-matrix-heartbeat/claude-oauth-token` (passed **by reference** — never on a command line).
+- Optional: `~/.aqua-secrets/deepgram.env` (one line, `DEEPGRAM_API_KEY=...`) for voice messages, also
+  passed by reference. Missing file = voice stays disabled, nothing else changes. See "Voice messages".
 - `~/.aqua-matrix-notify/notify-tim.sh` (operator DMs) and `target/debug/aqua-activity-watch` (built) for the watcher.
 
 ## Add a new consultant
@@ -160,13 +162,17 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 | `--onboard` | After connect, derive the agent MXID from logs and DM the operator a forward-ready onboarding message. |
 | `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
 | `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
+| `--voice on\|off` | Patch only `voice.enabled` in the rendered/kept config (idempotent, sibling voice keys preserved, `off` keeps the block). Without it the config's voice block is left exactly as it is. See "Voice messages". |
+| `--print-run` | Print the assembled `podman run` argument vector one arg per line and exit 0 **before** any container, systemd unit, DM, `--replace` removal or `--fresh` wipe. Implies `--no-refresh-refs` (presence still enforced). Still renders/patches the config and creates the persist dirs (they are the run's inputs). Secrets print as bare names only. |
 
 ## Invariants the tooling enforces (verified by adversarial audit, 2026-06-08)
 
 - **Security posture is byte-identical** to the proven original `recreate-zdnaez-consultant.sh`
   for the resource/caps/token flags: `--restart on-failure`, `--memory 2048m --cpus 2 --pids-limit 512`,
   `--cap-drop ALL`, `--security-opt no-new-privileges`, `--tmpfs /tmp`, OAuth token passed
-  **by reference** (`-e CLAUDE_CODE_OAUTH_TOKEN`, no value).
+  **by reference** (`-e CLAUDE_CODE_OAUTH_TOKEN`, no value). The optional Deepgram key follows the
+  same rule (`-e DEEPGRAM_API_KEY`, bare, only when the env file yields one). Since 2026-09-13 the
+  argument vector is assembled once (`RUN_ARGS`) and feeds both `--print-run` and the real run.
   Keep it that way — verify after any edit:
   ```bash
   diff <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e )' ~/recreate-zdnaez-consultant.sh) \
@@ -186,6 +192,54 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 - **Guards**: placeholder/non-MXID target rejected; `--display` rejects quote/newline (systemd-unit
   injection); registry parser skips indented comments and rejects non-slug labels; `--fresh` asserts
   the persist-path prefix before any `rm -rf`.
+
+## Voice messages (opt-in, per consultant)
+
+The agent's voice-note turn (Deepgram STT for the peer's note, Deepgram TTS for the answer) is
+gated by `voice.enabled` in the per-instance config and is **absent/false by default**. Two
+pieces of plumbing in `spawn-consultant.sh`, both no-ops until you opt in:
+
+| Piece | What it does |
+|---|---|
+| Key, by reference | If `${AQUA_DEEPGRAM_ENV:-$HOME/.aqua-secrets/deepgram.env}` is readable and yields a non-empty `DEEPGRAM_API_KEY`, the spawner passes it to podman as a bare `-e DEEPGRAM_API_KEY` (value never on a command line, never in `podman inspect`). The file is sourced in a subshell and only that one variable is captured. No file: one notice line, voice stays disabled. |
+| Switch | `--voice on` sets `voice.enabled = true` (creating `{"enabled": true}` when the block is absent, otherwise flipping only that key and keeping siblings such as `tts_voice`). `--voice off` flips it to `false` and **keeps** the block; on a config with no block it writes nothing. Anything but `on`/`off` is rejected. |
+
+**Image before config.** `voice` is an unknown field to every image older than the voice
+feature, and the template structs are `deny_unknown_fields`, so a consultant carrying a `voice`
+block on an old image crash-loops. Roll the image first, then `--voice on`. The spawner never
+injects the block on its own: `--replace --keep-config` (the fleet roll) carries an existing
+block through verbatim, `--refresh-prompt` only touches `system_prompt`/`description`/`ref_mounts`,
+and the template itself has no `voice` key.
+
+A config with `voice.enabled=true` but no key still launches (the agent logs the missing key and
+disables voice at runtime); the spawner prints `!! voice: enabled in config but DEEPGRAM_API_KEY
+is not available` so the gap is visible at deploy time.
+
+```bash
+# enable on one consultant whose container already runs the voice-aware image:
+bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez --voice on
+# preview the exact argument vector first, nothing started (secrets as bare names):
+bash ~/spawn-consultant.sh --print-run --replace --keep-config --label zdnaez --voice on
+```
+
+Fleet-wide enablement is a separate decision (third-party processing disclosure to peers).
+
+### Tests (no live side effects)
+
+`tests/spawn-consultant-args.sh` renders the argument vector with `--print-run` in a sandbox
+(temp HOME, test dir, refs base, token and env files; `podman`/`systemctl` replaced by shims
+that fail and record any call) and asserts: no key file means no `DEEPGRAM_API_KEY`; a fake
+key file means exactly one bare `-e DEEPGRAM_API_KEY` and the value nowhere; `--voice on|off`
+flips only that key; `--replace --keep-config` preserves the block; `inblockio.github.io` is in
+`REFS_REPOS` and mounted `:ro`; the shims were never called.
+
+```bash
+bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
+```
+
+The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
+avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
+`CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`.
 
 ## Boot-time restore (reboot survival)
 

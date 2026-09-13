@@ -54,6 +54,35 @@
 # at /agent/avatar.png, which the agent uploads as its Matrix avatar. Override the source with
 # --avatar PATH. A missing asset is a non-fatal warning, so a consultant without one still runs.
 #
+# Voice messages (opt-in, per consultant): the agent's voice-note turn (Deepgram STT + TTS)
+# is gated by `voice.enabled` in the config, absent/false by default. Two pieces of plumbing:
+#   1. The key. If ${AQUA_DEEPGRAM_ENV:-$HOME/.aqua-secrets/deepgram.env} exists and yields a
+#      non-empty DEEPGRAM_API_KEY, it is passed to podman as a bare `-e DEEPGRAM_API_KEY`
+#      (same by-reference discipline as the OAuth token: never on a command line, never in
+#      `podman inspect`). No file = one notice line, voice stays disabled, nothing else changes.
+#   2. The switch. --voice on|off patches ONLY `voice.enabled` in the rendered/kept config
+#      (idempotent; sibling voice keys preserved; `off` keeps the block). Without --voice the
+#      config is left exactly as it is, so `--replace --keep-config` preserves the block and
+#      --refresh-prompt never touches it. IMAGE BEFORE CONFIG: `voice` is an unknown field to
+#      images older than the voice feature (deny_unknown_fields), so roll the image first and
+#      only then `--voice on`; `--voice off` on a config with no block writes nothing.
+#      A config with voice on but no key still launches (loud warning; the agent disables
+#      voice at runtime and logs it).
+#
+# --print-run: assemble everything, print the `podman run` argument vector one arg per line,
+# exit 0. Stops BEFORE any container, systemd unit, DM, --replace removal or --fresh wipe,
+# and implies --no-refresh-refs (presence of every refs repo is still checked). It DOES
+# render/patch the config file and create the persist dirs, since those are the run's
+# inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
+#
+# Env overrides (all optional; the defaults are this host's live paths):
+#   CONSULTANT_TEST_DIR     dir holding configs/persist/avatars/template (default ~/.aqua-matrix-test)
+#   CONSULTANT_TEMPLATE     config template path (default $CONSULTANT_TEST_DIR/consultant-config.template.json)
+#   CONSULTANT_REFS_BASE    parent dir of the REFS_REPOS checkouts (default /home/waldknoten-01)
+#   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
+#   AQUA_CLAUDE_TOKEN_FILE  OAuth token file (default ~/.aqua-matrix-heartbeat/claude-oauth-token)
+#   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
+#
 # Examples:
 #   # new consultant (fresh identity) with a female persona; DM Tim a forward-ready intro:
 #   bash ~/spawn-consultant.sh --label gawain \
@@ -70,6 +99,12 @@
 #
 #   # same image roll for the un-labeled generic consultant (operator-bound):
 #   bash ~/spawn-consultant.sh --replace --keep-config --generic
+#
+#   # enable voice messages on an existing consultant (image already rolled to a voice-aware build):
+#   bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez --voice on
+#
+#   # preview the exact podman argument vector, nothing started:
+#   bash ~/spawn-consultant.sh --print-run --label zdnaez --target '@…:matrix.inblock.io' --persona Coralie
 #
 set -euo pipefail
 
@@ -89,7 +124,12 @@ KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never cl
 REFRESH_REFS=1        # fast-forward the /refs repos before launch (--no-refresh-refs to skip)
 REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mounts into the config
 AVATAR=""             # explicit avatar image path; default = <test-dir>/<key>-avatar.jpg (key = label, or "generic")
-TEMPLATE="${CONSULTANT_TEMPLATE:-/home/waldknoten-01/.aqua-matrix-test/consultant-config.template.json}"
+VOICE=""              # --voice on|off: patch voice.enabled in the config; empty = leave the config untouched
+PRINT_RUN=0           # --print-run: print the podman run argument vector and exit 0 before any side effect
+# Host state dir: per-instance configs, persist volumes, avatars, and the config template.
+# Overridable so the arg-rendering tests can run in a sandbox without touching live state.
+TEST_DIR="${CONSULTANT_TEST_DIR:-/home/waldknoten-01/.aqua-matrix-test}"
+TEMPLATE="${CONSULTANT_TEMPLATE:-$TEST_DIR/consultant-config.template.json}"
 IMAGE="${CONSULTANT_IMAGE:-localhost/aqua-matrix-agent:poc}"
 REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
 # Persona rendering helper, alongside this script (resolve through the ~/ symlink).
@@ -121,6 +161,8 @@ while [ $# -gt 0 ]; do
     --keep-config) KEEP_CONFIG=1; shift ;;
     --no-refresh-refs) REFRESH_REFS=0; shift ;;
     --refresh-prompt) REFRESH_PROMPT=1; shift ;;
+    --voice)   VOICE="$2"; shift 2 ;;
+    --print-run) PRINT_RUN=1; shift ;;
     -h|--help) usage 0 ;;
     *) echo "!! unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -131,6 +173,12 @@ if [ "$FRESH" -eq 1 ] && [ "$KEEP_CONFIG" -eq 1 ]; then
   echo "!! --fresh and --keep-config are contradictory (--fresh wipes the identity/memory --keep-config preserves)." >&2
   exit 2
 fi
+case "$VOICE" in
+  ""|on|off) : ;;
+  *) echo "!! --voice takes exactly 'on' or 'off' (got '$VOICE')" >&2; exit 2 ;;
+esac
+# --print-run must not fetch/pull anything; presence of the refs repos is still enforced.
+[ "$PRINT_RUN" -eq 1 ] && REFRESH_REFS=0
 
 # ---------------------------------------------------------------- validate label + paths
 # STEM is the shared name fragment: container aqua-agent-<STEM>-1, config <STEM>-config.json,
@@ -150,8 +198,8 @@ else
 fi
 
 NAME="aqua-agent-${STEM}-1"
-CFG="/home/waldknoten-01/.aqua-matrix-test/${STEM}-config.json"
-PERSIST="/home/waldknoten-01/.aqua-matrix-test/${STEM}-persist"
+CFG="$TEST_DIR/${STEM}-config.json"
+PERSIST="$TEST_DIR/${STEM}-persist"
 STORE="$PERSIST/store"
 MEM="$PERSIST/memory"
 
@@ -216,6 +264,31 @@ if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -s "$TOKEN_FILE" ]; then
 fi
 : "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN, or populate $TOKEN_FILE via:  claude setup-token}"
 
+# ---------------------------------------------------------------- Deepgram key (optional, by reference)
+# Voice messages need DEEPGRAM_API_KEY inside the container. Same discipline as the OAuth
+# token: the value is taken from a file and handed to podman as a bare `-e NAME` (inherited
+# from this process's environment), so it never appears on a command line, in `podman
+# inspect`, or in this script's output. The file is sourced in a SUBSHELL and only the one
+# variable is captured, so nothing else in it (other vars, shell options) leaks in here.
+# An already-exported DEEPGRAM_API_KEY wins over the file. No file = silent skip (one notice
+# line): the container starts unchanged and voice stays disabled.
+DEEPGRAM_ENV_FILE="${AQUA_DEEPGRAM_ENV:-$HOME/.aqua-secrets/deepgram.env}"
+if [ -z "${DEEPGRAM_API_KEY:-}" ] && [ -r "$DEEPGRAM_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  # A malformed file must not abort the spawn: it degrades to "no key" plus the notice below.
+  DEEPGRAM_API_KEY="$(set -a; . "$DEEPGRAM_ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "${DEEPGRAM_API_KEY:-}")" || DEEPGRAM_API_KEY=""
+fi
+DEEPGRAM_ENV_ARGS=()
+if [ -n "${DEEPGRAM_API_KEY:-}" ]; then
+  export DEEPGRAM_API_KEY
+  DEEPGRAM_ENV_ARGS+=( -e DEEPGRAM_API_KEY )
+  echo ">> voice: DEEPGRAM_API_KEY available (by reference), passed into the container as a bare -e"
+elif [ -e "$DEEPGRAM_ENV_FILE" ]; then
+  echo "!! voice: $DEEPGRAM_ENV_FILE exists but yields no DEEPGRAM_API_KEY (unreadable, or empty); voice stays disabled" >&2
+else
+  echo ">> voice: no Deepgram env file at $DEEPGRAM_ENV_FILE, voice stays disabled"
+fi
+
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 
 # ---------------------------------------------------------------- refs grounding
@@ -279,7 +352,7 @@ done
 # for the un-labeled consultant. Override the source with --avatar PATH. A missing asset is a
 # non-fatal warning so a consultant without one still launches (just with no avatar).
 if [ "$GENERIC" -eq 1 ]; then AVATAR_KEY="generic"; else AVATAR_KEY="$LABEL"; fi
-AVATAR_SRC="${AVATAR:-/home/waldknoten-01/.aqua-matrix-test/${AVATAR_KEY}-avatar.jpg}"
+AVATAR_SRC="${AVATAR:-$TEST_DIR/${AVATAR_KEY}-avatar.jpg}"
 AVATAR_MOUNT_ARGS=()
 if [ -f "$AVATAR_SRC" ]; then
   AVATAR_MOUNT_ARGS+=( -v "$AVATAR_SRC:/agent/avatar.png:ro" )
@@ -407,6 +480,76 @@ if changed:
     print(f">> avatar_path {'set ' + want if want else 'removed'} in {path}")
 PY
 
+# --voice on|off: patch voice.enabled in the (rendered or kept) config, idempotently and
+# without touching any other key. `on` creates {"enabled": true} when the block is absent
+# and otherwise flips only `enabled`, preserving sibling voice keys (tts_voice, ...). `off`
+# flips `enabled` to false and KEEPS the block. `off` on a config with no voice block writes
+# nothing: absent already means disabled, and injecting the key would trip deny_unknown_fields
+# on an image older than the voice feature (image-before-config). No --voice = no write at
+# all, which is what lets --replace --keep-config carry an existing block through unchanged.
+if [ -n "$VOICE" ]; then
+python3 - "$CFG" "$VOICE" <<'PY'
+import json, sys
+path, mode = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path))
+want = mode == "on"
+voice = cfg.get("voice")
+if not isinstance(voice, dict):
+    if not want:
+        print(f">> voice: no voice block in {path}; already disabled, nothing written")
+        sys.exit(0)
+    voice = {}
+    cfg["voice"] = voice
+if voice.get("enabled") is want:
+    print(f">> voice: already {mode} in {path}, nothing written")
+    sys.exit(0)
+voice["enabled"] = want
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=True); f.write("\n")
+print(f">> voice: set voice.enabled={'true' if want else 'false'} in {path}")
+PY
+fi
+
+# A config with voice on but no key still launches (the agent logs the missing key and
+# disables voice at runtime), but say so loudly: this is almost always a missing env file.
+if [ "${#DEEPGRAM_ENV_ARGS[@]}" -eq 0 ] && python3 - "$CFG" <<'PY'
+import json, sys
+v = json.load(open(sys.argv[1])).get("voice")
+sys.exit(0 if isinstance(v, dict) and v.get("enabled") is True else 1)
+PY
+then
+  echo "!! voice: enabled in config but DEEPGRAM_API_KEY is not available (no readable $DEEPGRAM_ENV_FILE?); launching anyway, the agent will disable voice at runtime" >&2
+fi
+
+# ---------------------------------------------------------------- assemble the run
+# ONE argument vector feeds both --print-run and the real `podman run`, so what is printed
+# is exactly what runs. Secrets are bare `-e NAME` (inherited), never `-e NAME=value`. The
+# resource/caps/token lines are byte-identical to the legacy recreate-*.sh (see SKILL.md,
+# "Invariants"); keep them that way.
+RUN_ARGS=( \
+  --name "$NAME" \
+  --restart on-failure \
+  --memory 2048m --cpus 2 --pids-limit 512 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp \
+  -e AGENT_TARGET="$TARGET" \
+  -e AGENT_CONFIG_FILE=/agent/config.json \
+  -e CLAUDE_CODE_OAUTH_TOKEN \
+  "${DEEPGRAM_ENV_ARGS[@]}" \
+  -v "$CFG:/agent/config.json:ro" \
+  -v "$STORE:/agent/store:U" \
+  -v "$MEM:/agent/memory:U" \
+  "${REF_MOUNT_ARGS[@]}" \
+  "${AVATAR_MOUNT_ARGS[@]}" \
+  "$IMAGE" \
+)
+
+if [ "$PRINT_RUN" -eq 1 ]; then
+  echo ">> --print-run: podman run argument vector follows (one per line); no container, no systemd unit, no DM, no --replace/--fresh" >&2
+  printf '%s\n' podman run -d "${RUN_ARGS[@]}"
+  exit 0
+fi
+
 # ---------------------------------------------------------------- container lifecycle
 if podman container exists "$NAME"; then
   if [ "$REPLACE" -eq 1 ]; then
@@ -423,8 +566,8 @@ if [ "$FRESH" -eq 1 ]; then
   # PERSIST is STEM-derived and the label half is slug-validated, but assert the expected
   # shape before any rm -rf so a future refactor can never point this at a stray path.
   case "$PERSIST" in
-    /home/waldknoten-01/.aqua-matrix-test/*-aqua-consultant-persist) : ;;
-    /home/waldknoten-01/.aqua-matrix-test/aqua-consultant-persist) : ;;   # --generic
+    "$TEST_DIR"/*-aqua-consultant-persist) : ;;
+    "$TEST_DIR"/aqua-consultant-persist) : ;;   # --generic
     *) echo "!! refusing --fresh: unexpected persist path '$PERSIST'" >&2; exit 2 ;;
   esac
   echo ">> --fresh: wiping persist dir for a brand-new identity ($PERSIST)"
@@ -441,21 +584,7 @@ echo ">> persist volume ready, $IDENTITY_NOTE"
 
 echo ">> launching $NAME bound single-target to $TARGET"
 set +e
-CID="$(podman run -d \
-  --name "$NAME" \
-  --restart on-failure \
-  --memory 2048m --cpus 2 --pids-limit 512 \
-  --cap-drop ALL --security-opt no-new-privileges \
-  --tmpfs /tmp \
-  -e AGENT_TARGET="$TARGET" \
-  -e AGENT_CONFIG_FILE=/agent/config.json \
-  -e CLAUDE_CODE_OAUTH_TOKEN \
-  -v "$CFG:/agent/config.json:ro" \
-  -v "$STORE:/agent/store:U" \
-  -v "$MEM:/agent/memory:U" \
-  "${REF_MOUNT_ARGS[@]}" \
-  "${AVATAR_MOUNT_ARGS[@]}" \
-  "$IMAGE" 2>&1)"
+CID="$(podman run -d "${RUN_ARGS[@]}" 2>&1)"
 run_rc=$?
 set -e
 
