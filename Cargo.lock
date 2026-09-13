@@ -135,9 +135,10 @@ dependencies = [
 
 [[package]]
 name = "aqua-auth"
-version = "0.2.0"
-source = "git+https://github.com/inblockio/aqua-rs-auth#056cb348fcb0fdddb4651dbed08b27184d4670d9"
+version = "0.7.0"
+source = "git+https://github.com/inblockio/aqua-rs-auth?tag=v0.7.0#97f69c378f4325004a80bfc61193d1e1cbc6ea91"
 dependencies = [
+ "async-trait",
  "bs58",
  "ed25519-dalek",
  "hex",
