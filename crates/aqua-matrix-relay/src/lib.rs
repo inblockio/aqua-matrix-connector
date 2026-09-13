@@ -47,7 +47,7 @@ use tokio::sync::Notify;
 
 use matrix_sdk::{
     config::SyncSettings,
-    room::Room,
+    room::{MessagesOptions, Room},
     ruma::{
         api::client::receipt::create_receipt::v3::ReceiptType,
         events::{
@@ -56,7 +56,9 @@ use matrix_sdk::{
                 member::{MembershipState, StrippedRoomMemberEvent},
                 message::{MessageType, OriginalSyncRoomMessageEvent},
             },
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         },
+        UInt,
     },
 };
 
@@ -86,6 +88,20 @@ const MIN_CYCLE_SECS: u64 = 15;
 /// process resets that. `StartLimitBurst` still guards against runaway
 /// restarts.
 const MAX_CONNECT_FAILURES: u32 = 3;
+
+/// Events per `/messages` page when [`backfill_missed`] catches up. One page
+/// covers the observed gap many times over; the page size only matters when a
+/// long downtime has to be walked back.
+const BACKFILL_PAGE: u32 = 50;
+/// Hard cap on pages walked per room per cycle, so a room whose history is
+/// entirely newer than the watermark (a watermark seeded far in the past, a
+/// very busy room) cannot turn one cycle start into an unbounded paginate.
+/// `BACKFILL_PAGE * BACKFILL_MAX_PAGES` is the most a single cycle reconsiders.
+const BACKFILL_MAX_PAGES: usize = 4;
+/// Wall-clock budget for the whole backfill scan (all rooms, all pages). On
+/// expiry the cycle proceeds with whatever was collected: catching up is
+/// best-effort, staying connected is not.
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An inbound attachment (image / audio / voice / video / file), decoded from a
 /// Matrix media event for a [`MessageHandler`].
@@ -434,14 +450,12 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // The inbound-message dedupe watermark lives ACROSS cycles AND restarts:
     // loaded from `<store>/inbound-watermark` here (seeded to "now" only when
     // the file is absent or unparsable) and persisted by [`dispatch`] on every
-    // advance. The cross-cycle carry-forward is what stops the rotation gap
-    // from losing a message: when the client rotates (~30 s before token
-    // expiry) the new cycle's initial sync re-delivers recent timeline; with a
-    // per-cycle "now" watermark a DM that landed during the gap (its ts is
-    // just older than the new cycle's start) would look like backlog and be
-    // dropped. Carrying the watermark means a gap message (ts > watermark) is
-    // dispatched exactly once, while already-seen messages (ts <= watermark)
-    // stay skipped.
+    // advance. It records the last message actually DISPATCHED, never the last
+    // one synced, which is what lets `backfill_missed` (called at the top of
+    // every cycle) tell "already answered" from "synced past, never handled".
+    // The three `sync_once` calls below all run before any handler exists, so
+    // without that backfill everything they consume is lost for good: the
+    // rotation gap every cycle, and the whole of any downtime.
     //
     // The cross-restart persistence extends the same guarantee to process
     // restarts (crash-exit after MAX_CONNECT_FAILURES, `systemctl restart`,
@@ -702,11 +716,15 @@ fn spawn_shutdown_listener(shutdown: Arc<Notify>) {
 /// [`run_daemon`] and passed in (not created here). It is loaded once at
 /// daemon start from its file in the store dir (falling back to "now" when no
 /// usable file exists, so only the very first run ignores pre-startup
-/// backlog); every cycle reuses the SAME watermark, so when this cycle's
-/// initial sync re-delivers recent timeline after a client rotation, a message
-/// that arrived in the rotation gap (ts > watermark) is dispatched exactly
+/// backlog); every cycle reuses the SAME watermark, so a message that arrived
+/// while this process was not listening (ts > watermark) is dispatched exactly
 /// once while already-seen messages (ts <= watermark) stay skipped.
 /// [`dispatch`] still advances it monotonically (and persists each advance).
+///
+/// Carrying the watermark is necessary but NOT sufficient, which is what
+/// [`backfill_missed`] is for: the rotation-gap re-delivery this used to rely
+/// on lands in `connect`'s own `sync_once`, before any handler is registered,
+/// so it never reaches [`dispatch`]. See that function for the measurement.
 ///
 /// `shutdown` is fired by the daemon's SIGTERM/SIGINT listener; observing it
 /// returns the `"shutdown"` sentinel so [`run_daemon`] can exit cleanly.
@@ -727,6 +745,9 @@ async fn run_cycle<H: MessageHandler>(
     // never drops on reconnect, leaking its four SQLite connection pools every
     // cycle until the fd count trips EMFILE and the connect-failure circuit breaker.
     let mut handles: Vec<matrix_sdk::event_handler::EventHandlerHandle> = Vec::new();
+    // Kept for the backfill below: `register_handler` takes ownership of both.
+    let backfill_watermark = watermark.clone();
+    let backfill_journal = journal.clone();
     handles.push(register_handler(
         agent.clone(),
         target.clone(),
@@ -750,6 +771,22 @@ async fn run_cycle<H: MessageHandler>(
         target.clone(),
         handler.clone(),
     ));
+
+    // Catch up BEFORE the live stream starts, so anything the handler-less syncs
+    // in `run_daemon` swallowed is answered in arrival order ahead of new
+    // traffic. Handlers are already registered above, so a message that the
+    // live sync also delivers is de-duplicated by the watermark and the
+    // journal rather than answered twice. Bounded by `BACKFILL_TIMEOUT`;
+    // `handle_message` spawns its own task per message, so a slow answer
+    // cannot hold the cycle here.
+    backfill_missed(
+        agent,
+        target,
+        handler,
+        &backfill_watermark,
+        &backfill_journal,
+    )
+    .await;
 
     let sync_client = agent.client().clone();
     let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
@@ -1003,6 +1040,129 @@ async fn dispatch_call<H: MessageHandler>(
     handler.on_call(agent, target, &call).await;
 }
 
+/// Dispatch the messages the sync stream consumed while no handler was listening.
+///
+/// **Why this exists.** [`AgentClient::connect`] runs an initial `sync_once`, and
+/// [`run_daemon`] runs two more (pre-join, then settle) before it ever calls
+/// [`run_cycle`], and `run_cycle` is where the message handlers are registered.
+/// matrix-sdk only hands a sync response to the handlers registered at the moment
+/// it processes that response, so every event delivered in those three syncs
+/// advances the persisted sync token WITHOUT reaching [`dispatch`], and the
+/// server will never send it again. Measured on the live consultant fleet
+/// (2026-09-13): a ~271 s rotation cycle spends ~89 s in that handler-less
+/// window, so roughly one inbound message in three was being dropped silently,
+/// and every message delivered during a restart or a fleet roll was dropped
+/// outright. `run_cycle`'s own doc comment claimed the new cycle's initial sync
+/// re-delivered the gap; it does re-deliver it, into a client with no handlers
+/// attached.
+///
+/// **Why the watermark makes this safe.** The watermark is the last message
+/// actually DISPATCHED, not the last one synced, so anything newer is precisely
+/// what is owed a dispatch. Re-offering an event that the live sync also
+/// delivers costs nothing: [`dispatch`] drops `ts <= watermark`, and the journal's
+/// `enqueue` is idempotent on `event_id`, so a concurrent double-delivery
+/// resolves to exactly one handler run.
+///
+/// Oldest first, across all rooms: [`dispatch`] advances the watermark
+/// monotonically, so dispatching newest-first would move the watermark past the
+/// older messages and drop them for good.
+async fn backfill_missed<H: MessageHandler>(
+    agent: &AgentClient,
+    target: &str,
+    handler: &Arc<H>,
+    watermark: &Watermark,
+    journal: &WorkJournal,
+) {
+    let since = watermark.get();
+    let scan = async {
+        let mut pending: Vec<(u64, Room, OriginalSyncRoomMessageEvent)> = Vec::new();
+        let mut utd = 0usize;
+        for room in agent.client().joined_rooms() {
+            let mut from: Option<String> = None;
+            for _ in 0..BACKFILL_MAX_PAGES {
+                let mut opts = MessagesOptions::backward();
+                opts.limit = UInt::from(BACKFILL_PAGE);
+                opts.from = from.clone();
+                let resp = match room.messages(opts).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(
+                            "{}: backfill scan of {} failed: {e:#}",
+                            handler.role(),
+                            room.room_id()
+                        );
+                        break;
+                    }
+                };
+                let empty = resp.chunk.is_empty();
+                // Backward pagination, so the first event older than the
+                // watermark means everything past it is already accounted for.
+                let mut reached_watermark = false;
+                for event in resp.chunk {
+                    let Some(ts) = event.timestamp() else { continue };
+                    let ts = u64::from(ts.0);
+                    if ts <= since {
+                        reached_watermark = true;
+                        continue;
+                    }
+                    if event.kind.is_utd() {
+                        // Nothing to hand a handler, and nothing this code can
+                        // fix. Counted so a key-sharing fault is visible rather
+                        // than looking like an idle room.
+                        utd += 1;
+                        continue;
+                    }
+                    let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                        msg,
+                    ))) = event.raw().deserialize()
+                    else {
+                        continue;
+                    };
+                    let Some(original) = msg.as_original() else {
+                        continue;
+                    };
+                    pending.push((ts, room.clone(), original.clone()));
+                }
+                from = resp.end;
+                if reached_watermark || empty || from.is_none() {
+                    break;
+                }
+            }
+        }
+        (pending, utd)
+    };
+
+    let (mut pending, utd) = match tokio::time::timeout(BACKFILL_TIMEOUT, scan).await {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(
+                "{}: backfill scan exceeded {}s; continuing without it",
+                handler.role(),
+                BACKFILL_TIMEOUT.as_secs()
+            );
+            return;
+        }
+    };
+    if utd > 0 {
+        tracing::warn!(
+            "{}: backfill skipped {utd} undecryptable event(s) newer than the watermark",
+            handler.role()
+        );
+    }
+    if pending.is_empty() {
+        return;
+    }
+    pending.sort_by_key(|(ts, _, _)| *ts);
+    tracing::info!(
+        "{}: backfill found {} message(s) newer than the inbound watermark ({since}); dispatching oldest first",
+        handler.role(),
+        pending.len()
+    );
+    for (_, room, ev) in pending {
+        dispatch(ev, room, agent, target, handler, watermark, journal).await;
+    }
+}
+
 async fn dispatch<H: MessageHandler>(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -1100,6 +1260,26 @@ async fn dispatch<H: MessageHandler>(
         );
         return;
     }
+
+    // Inbound is logged at INFO, deliberately. Until 2026-09-13 the relay logged
+    // nothing on the inbound path, so "the agent never answered" and "the message
+    // never arrived" were indistinguishable from the journal, and a voice-note
+    // failure on the consultant fleet could not be told apart from a delivery
+    // fault without reading SQLite by hand. One line per accepted message is the
+    // cheapest thing that makes the two distinguishable. Body text is NOT logged:
+    // the msgtype and the attachment kind are enough to route a diagnosis, and
+    // the peer's words are not the journal's business.
+    tracing::info!(
+        "{}: inbound {} from {} (event {}, media: {})",
+        handler.role(),
+        ev.content.msgtype.msgtype(),
+        ev.sender,
+        ev.event_id,
+        media
+            .as_ref()
+            .map(|m| m.kind.as_str())
+            .unwrap_or("none"),
+    );
 
     let msg = InboundMessage {
         sender_mxid: ev.sender.as_str(),
@@ -1429,6 +1609,58 @@ mod watermark_tests {
         // ...and the seed is already on disk, so an immediate restart resumes
         // from it instead of re-seeding.
         assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(wm.get()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The backfill's ascending sort is load-bearing, not tidiness.
+    ///
+    /// `dispatch` gates on `ts <= watermark` and advances the watermark on every
+    /// dispatch, so handing it the NEWEST missed message first marks that instant
+    /// as seen and turns every older missed message into backlog. `/messages`
+    /// pages BACKWARD (newest first), which is exactly the order that loses data,
+    /// so `backfill_missed` sorts by timestamp before it dispatches. Removing
+    /// that sort is silent: the code still compiles, still logs the same count,
+    /// and drops everything but the newest message per cycle.
+    #[test]
+    fn backfill_order_matters_newest_first_would_swallow_the_rest() {
+        let dir = temp_store("backfill-order");
+        let path = dir.join(Watermark::FILE_NAME);
+        // Three missed messages, as `/messages` returns them: newest first.
+        let as_paginated = [300_u64, 200, 100];
+
+        // Wrong order: the first advance buries the other two.
+        std::fs::write(&path, "50\n").unwrap();
+        let wm = Watermark::load_or_seed(&dir);
+        let delivered: Vec<u64> = as_paginated
+            .iter()
+            .copied()
+            .filter(|ts| {
+                let fresh = *ts > wm.get();
+                if fresh {
+                    wm.advance(*ts);
+                }
+                fresh
+            })
+            .collect();
+        assert_eq!(delivered, vec![300], "newest-first drops the older two");
+
+        // What `backfill_missed` actually does: oldest first, all three land.
+        std::fs::write(&path, "50\n").unwrap();
+        let wm = Watermark::load_or_seed(&dir);
+        let mut ordered = as_paginated;
+        ordered.sort();
+        let delivered: Vec<u64> = ordered
+            .iter()
+            .copied()
+            .filter(|ts| {
+                let fresh = *ts > wm.get();
+                if fresh {
+                    wm.advance(*ts);
+                }
+                fresh
+            })
+            .collect();
+        assert_eq!(delivered, vec![100, 200, 300]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
