@@ -514,7 +514,14 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // Sync once first so a pending invite is actually visible: right after
         // connect the initial sync may not yet carry an invite the peer sent
         // moments earlier, and `join_invited_rooms` would then join nothing.
-        if let Err(e) = agent.sync_once().await {
+        //
+        // `_nowait` (timeout=0), like the settle sync below and `connect`'s
+        // own initial sync: no handler is registered yet, so a long-poll here
+        // only holds an inbound DM back until `backfill_missed` runs. With the
+        // default 30 s long-poll these three syncs kept every cycle deaf for up
+        // to ~90 s (fleet average 65-78 s, 26-30 % of wall time, measured
+        // 2026-09-25); see `aqua_matrix_agent::catch_up_sync_settings`.
+        if let Err(e) = agent.sync_once_nowait().await {
             tracing::warn!("{}: pre-join sync_once failed: {e:#}", handler.role());
         }
 
@@ -542,7 +549,7 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // One sync so the peer's device keys are known before we encrypt the
         // hello (otherwise the hello is undecryptable on their side until the
         // next round-trip). Best-effort.
-        if let Err(e) = agent.sync_once().await {
+        if let Err(e) = agent.sync_once_nowait().await {
             tracing::warn!("{}: settle sync_once failed: {e:#}", handler.role());
         }
 
@@ -1056,6 +1063,16 @@ async fn dispatch_call<H: MessageHandler>(
 /// re-delivered the gap; it does re-deliver it, into a client with no handlers
 /// attached.
 ///
+/// **Backfill fixed the loss, not the latency (2026-09-25).** A message caught
+/// here waited until the window closed, and the window was long because each
+/// of those three syncs long-polled for up to 30 s on an idle account: a DM
+/// sent right after a token rotation was answered only when the next cycle's
+/// handlers came up, up to ~90 s later (fleet average 65-78 s). The syncs are
+/// now `timeout=0` catch-up syncs (`AgentClient::sync_once_nowait`,
+/// `aqua_matrix_agent::catch_up_sync_settings`), which shrinks the window to
+/// the few round trips it really needs. This function still covers what
+/// arrives inside it, and everything delivered while the process was down.
+///
 /// **Why the watermark makes this safe.** The watermark is the last message
 /// actually DISPATCHED, not the last one synced, so anything newer is precisely
 /// what is owed a dispatch. Re-offering an event that the live sync also
@@ -1106,12 +1123,24 @@ async fn backfill_missed<H: MessageHandler>(
                         reached_watermark = true;
                         continue;
                     }
-                    if event.kind.is_utd() {
-                        // Nothing to hand a handler, and nothing this code can
-                        // fix. Counted so a key-sharing fault is visible rather
-                        // than looking like an idle room.
-                        utd += 1;
-                        continue;
+                    // `sender` is plaintext even on an undecryptable event, so
+                    // the peer check works for both kinds.
+                    let from_peer = event
+                        .raw()
+                        .get_field::<String>("sender")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|sender| handler.authorize(&sender, target));
+                    match backfill_verdict(ts, since, from_peer, event.kind.is_utd()) {
+                        BackfillVerdict::Skip => continue,
+                        BackfillVerdict::Undecryptable => {
+                            // Nothing to hand a handler, and nothing this code
+                            // can fix. Counted so a key-sharing fault is
+                            // visible rather than looking like an idle room.
+                            utd += 1;
+                            continue;
+                        }
+                        BackfillVerdict::Dispatch => {}
                     }
                     let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
                         msg,
@@ -1160,7 +1189,7 @@ async fn backfill_missed<H: MessageHandler>(
     };
     if utd > 0 {
         tracing::warn!(
-            "{}: backfill skipped {utd} undecryptable event(s) newer than the watermark",
+            "{}: backfill skipped {utd} undecryptable peer event(s) newer than the watermark",
             handler.role()
         );
     }
@@ -1169,12 +1198,51 @@ async fn backfill_missed<H: MessageHandler>(
     }
     pending.sort_by_key(|(ts, _, _)| *ts);
     tracing::info!(
-        "{}: backfill found {} message(s) newer than the inbound watermark ({since}); dispatching oldest first",
+        "{}: backfill found {} message(s) from the peer newer than the inbound watermark ({since}); dispatching oldest first",
         handler.role(),
         pending.len()
     );
     for (_, room, ev) in pending {
         dispatch(ev, room, agent, target, handler, watermark, journal).await;
+    }
+}
+
+/// What [`backfill_missed`] does with one scanned event.
+#[derive(Debug, PartialEq, Eq)]
+enum BackfillVerdict {
+    /// Not owed a dispatch: already handled (at or below the watermark), or
+    /// not from the peer at all.
+    Skip,
+    /// From the peer and newer than the watermark, but not decryptable.
+    Undecryptable,
+    /// From the peer, newer than the watermark, decrypted: dispatch it.
+    Dispatch,
+}
+
+/// Classify one event seen by the backfill scan.
+///
+/// Only the configured peer's messages are owed a dispatch. Before 2026-09-25
+/// the scan queued EVERY `m.room.message` newer than the watermark, which in a
+/// DM is mostly the agent's own replies and their streaming edits.
+/// [`dispatch`] then dropped each of them at `authorize` without advancing the
+/// watermark (correctly: the watermark tracks the last PEER message handled),
+/// so the same own messages were re-found on every cycle and the fleet logged
+/// "backfill found N message(s) newer than the inbound watermark" with N
+/// growing and the watermark apparently stuck. Nothing was owed; the count was
+/// wrong. Filtering here makes the count, the log line and the undecryptable
+/// tally mean what they say.
+fn backfill_verdict(
+    ts_ms: u64,
+    since: u64,
+    from_peer: bool,
+    undecryptable: bool,
+) -> BackfillVerdict {
+    if ts_ms <= since || !from_peer {
+        BackfillVerdict::Skip
+    } else if undecryptable {
+        BackfillVerdict::Undecryptable
+    } else {
+        BackfillVerdict::Dispatch
     }
 }
 
@@ -1728,5 +1796,60 @@ mod watermark_tests {
         std::fs::write(&path, "1749740000000\n").unwrap();
         assert_eq!(Watermark::load(&path), Some(1_749_740_000_000));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod backfill_verdict_tests {
+    use super::{backfill_verdict, mxid_authorized, BackfillVerdict};
+
+    const PEER: &str = "@did-key-z6mkpeer:matrix.inblock.io";
+    const AGENT: &str = "@did-key-z6mkagent:matrix.inblock.io";
+    const WATERMARK: u64 = 1_789_333_555_964;
+
+    fn verdict(ts: u64, sender: &str, utd: bool) -> BackfillVerdict {
+        backfill_verdict(ts, WATERMARK, mxid_authorized(sender, PEER), utd)
+    }
+
+    /// The fleet symptom of 2026-09-25: after the peer's last message the DM
+    /// fills with the agent's own replies and streaming edits, all newer than
+    /// the watermark. They must not be counted as owed (they were: "backfill
+    /// found 8 message(s)" on every cycle for Marina, with 0 dispatched).
+    #[test]
+    fn own_messages_newer_than_the_watermark_are_not_owed() {
+        for i in 1..=8 {
+            assert_eq!(verdict(WATERMARK + i * 1_000, AGENT, false), BackfillVerdict::Skip);
+        }
+    }
+
+    #[test]
+    fn peer_message_newer_than_the_watermark_is_dispatched() {
+        assert_eq!(verdict(WATERMARK + 1, PEER, false), BackfillVerdict::Dispatch);
+    }
+
+    /// Synapse lowercases localparts; the peer check must stay case-insensitive
+    /// here exactly as it is in `dispatch`, or backfill would skip the peer.
+    #[test]
+    fn peer_check_matches_dispatch_authorization() {
+        let lowered = PEER.to_ascii_lowercase();
+        assert_eq!(
+            backfill_verdict(WATERMARK + 1, WATERMARK, mxid_authorized(&lowered, PEER), false),
+            BackfillVerdict::Dispatch
+        );
+    }
+
+    #[test]
+    fn already_handled_peer_message_is_skipped() {
+        assert_eq!(verdict(WATERMARK, PEER, false), BackfillVerdict::Skip);
+        assert_eq!(verdict(WATERMARK - 1, PEER, false), BackfillVerdict::Skip);
+    }
+
+    /// Only the peer's undecryptable events are a key-sharing signal worth a
+    /// warning; the agent's own are not the peer's problem.
+    #[test]
+    fn undecryptable_counts_only_for_the_peer() {
+        assert_eq!(verdict(WATERMARK + 1, PEER, true), BackfillVerdict::Undecryptable);
+        assert_eq!(verdict(WATERMARK + 1, AGENT, true), BackfillVerdict::Skip);
+        assert_eq!(verdict(WATERMARK - 1, PEER, true), BackfillVerdict::Skip);
     }
 }
