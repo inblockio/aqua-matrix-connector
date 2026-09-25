@@ -1017,7 +1017,7 @@ impl AgentClient {
 
         tracing::info!("running initial sync");
         client
-            .sync_once(SyncSettings::default())
+            .sync_once(catch_up_sync_settings())
             .await
             .context("initial sync failed")?;
         // Log device_id on every connect so device CHURN (a fresh did:key auth
@@ -1159,7 +1159,7 @@ impl AgentClient {
         // second concurrent sync racing to-device key delivery.
         if sync_after {
             client
-                .sync_once(SyncSettings::default())
+                .sync_once(catch_up_sync_settings())
                 .await
                 .context("reauth: post-reauth sync failed")?;
         }
@@ -1753,9 +1753,26 @@ impl AgentClient {
         Ok(messages)
     }
 
+    /// One sync that long-polls: it returns as soon as anything new arrives, or
+    /// after matrix-sdk's default 30 s timeout when nothing does. Right for a
+    /// caller that is WAITING for an event (a driver polling for a reply).
+    /// Wrong for a caller that only needs to catch up on state before doing
+    /// something else: use [`AgentClient::sync_once_nowait`] there.
     pub async fn sync_once(&self) -> Result<()> {
         self.client
             .sync_once(SyncSettings::default())
+            .await
+            .context("sync failed")?;
+        Ok(())
+    }
+
+    /// One catch-up sync that never long-polls: it returns everything pending
+    /// since the stored sync token and comes back immediately when nothing is.
+    /// See [`catch_up_sync_settings`] for why the relay's cycle-start syncs
+    /// must use this rather than [`AgentClient::sync_once`].
+    pub async fn sync_once_nowait(&self) -> Result<()> {
+        self.client
+            .sync_once(catch_up_sync_settings())
             .await
             .context("sync failed")?;
         Ok(())
@@ -1937,6 +1954,25 @@ where
 /// `self`, exactly mirroring what this helper proves correct: try once; on a
 /// token rejection, reauth once and retry once; any other error (or a reauth
 /// failure) propagates without a second attempt.
+/// Sync settings for a sync whose job is to CATCH UP, not to wait: the
+/// `/sync` request carries `timeout=0`, so the homeserver answers at once with
+/// whatever is pending instead of holding the request open for up to 30 s
+/// waiting for something new (matrix-sdk's `SyncSettings::default()`).
+///
+/// **Why this matters (2026-09-25 reply-delay RCA).** The relay runs three
+/// syncs per token cycle before any message handler exists: `connect`'s
+/// initial sync and `run_daemon`'s pre-join and settle syncs. With the default
+/// settings each one long-polled for up to 30 s on an idle account, so every
+/// ~270 s cycle opened a window of up to ~90 s in which an inbound DM was only
+/// picked up by the catch-up scan once the window closed. Measured on the live
+/// consultant fleet: that window averaged 65-78 s and peaked at 91 s, 26-30 %
+/// of all wall time. It also made a restart onto a cached token with under a
+/// minute left run its first cycle on an expired token (401 on everything).
+/// None of those syncs is waiting for an event, so none of them should wait.
+pub fn catch_up_sync_settings() -> SyncSettings {
+    SyncSettings::default().timeout(Duration::ZERO)
+}
+
 #[cfg(test)]
 async fn reauth_then_retry<T, Op, OpFut, Reauth, ReauthFut>(mut op: Op, reauth: Reauth) -> Result<T>
 where
@@ -2911,5 +2947,170 @@ mod tests {
             msg.contains("!call:matrix.inblock.io") && msg.contains("not found"),
             "unknown room must read as not found, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod catch_up_sync_tests {
+    //! The relay's cycle-start syncs must not long-poll (2026-09-25 reply-delay
+    //! RCA, see [`catch_up_sync_settings`]). Asserted on the wire: a tiny local
+    //! HTTP responder stands in for the homeserver and records the `/sync`
+    //! request line, so the test pins what the server actually sees (the
+    //! `timeout` query parameter decides how long it holds the request).
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Serve minimal canned Matrix responses on 127.0.0.1 and record the
+    /// request line of every `/sync`. Keep-alive aware: a connection is served
+    /// until the client closes it.
+    async fn fake_homeserver() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let syncs = Arc::new(Mutex::new(Vec::new()));
+        let seen = syncs.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // Read one request head.
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let body_len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < head_end + body_len {
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        buf.drain(..head_end + body_len);
+
+                        let request_line = head.lines().next().unwrap_or("").to_string();
+                        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                        let body = if path.starts_with("/_matrix/client/versions") {
+                            r#"{"versions":["v1.1","v1.11"],"unstable_features":{}}"#
+                        } else if path.starts_with("/_matrix/client/v3/sync") {
+                            seen.lock().unwrap().push(request_line.clone());
+                            r#"{"next_batch":"s_test_1"}"#
+                        } else if path.starts_with("/_matrix/client/v3/keys/upload") {
+                            r#"{"one_time_key_counts":{}}"#
+                        } else if path.starts_with("/_matrix/client/v3/keys/query") {
+                            r#"{"device_keys":{},"failures":{}}"#
+                        } else {
+                            "{}"
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, syncs)
+    }
+
+    fn temp_store(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aqua-catch-up-sync-{tag}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The query value the homeserver sees for `timeout`, if any.
+    fn timeout_param(request_line: &str) -> Option<String> {
+        let target = request_line.split_whitespace().nth(1)?;
+        let (_, query) = target.split_once('?')?;
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("timeout=").map(str::to_string))
+    }
+
+    /// A catch-up sync must ask for `timeout=0`. Before the fix these syncs
+    /// used `SyncSettings::default()`, which sends `timeout=30000`: on an idle
+    /// account the homeserver then holds each request for 30 s, three times
+    /// per token cycle, with no message handler registered.
+    #[tokio::test]
+    async fn catch_up_sync_does_not_long_poll() {
+        let (url, syncs) = fake_homeserver().await;
+        let store = temp_store("nowait");
+        let user: OwnedUserId = "@catchup:localhost".try_into().unwrap();
+        let device: OwnedDeviceId = "CATCHUPDEV".into();
+        let client = build_and_restore(&url, &store, &user, &device, "test-token")
+            .await
+            .expect("client against the fake homeserver");
+
+        let started = Instant::now();
+        client
+            .sync_once(catch_up_sync_settings())
+            .await
+            .expect("sync against the fake homeserver");
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let seen = syncs.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&store);
+        assert_eq!(seen.len(), 1, "exactly one /sync expected, saw {seen:?}");
+        assert_eq!(
+            timeout_param(&seen[0]).as_deref(),
+            Some("0"),
+            "a catch-up sync must not long-poll; request was {:?}",
+            seen[0]
+        );
+    }
+
+    /// The long-polling `sync_once` is kept for callers that wait for an event;
+    /// this pins that the two really differ on the wire, so a future
+    /// "simplification" that merges them cannot pass silently.
+    #[tokio::test]
+    async fn default_sync_still_long_polls() {
+        let (url, syncs) = fake_homeserver().await;
+        let store = temp_store("default");
+        let user: OwnedUserId = "@catchup:localhost".try_into().unwrap();
+        let device: OwnedDeviceId = "CATCHUPDEV".into();
+        let client = build_and_restore(&url, &store, &user, &device, "test-token")
+            .await
+            .expect("client against the fake homeserver");
+        client
+            .sync_once(SyncSettings::default())
+            .await
+            .expect("sync against the fake homeserver");
+        let seen = syncs.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&store);
+        assert_eq!(seen.len(), 1, "exactly one /sync expected, saw {seen:?}");
+        let t: u64 = timeout_param(&seen[0])
+            .expect("default sync sends a timeout")
+            .parse()
+            .unwrap();
+        assert!(t >= 1000, "default sync should long-poll, sent timeout={t}");
     }
 }
