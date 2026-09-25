@@ -231,7 +231,9 @@ Fleet-wide enablement is a separate decision (third-party processing disclosure 
 that fail and record any call) and asserts: no key file means no `DEEPGRAM_API_KEY`; a fake
 key file means exactly one bare `-e DEEPGRAM_API_KEY` and the value nowhere; `--voice on|off`
 flips only that key; `--replace --keep-config` preserves the block; `inblockio.github.io` is in
-`REFS_REPOS` and mounted `:ro`; the shims were never called.
+`REFS_REPOS` and mounted `:ro`; the template pins `model`, a fresh render carries it, and a
+persona re-render or `--refresh-prompt` keeps an existing config's `model` (and never injects one);
+the shims were never called.
 
 ```bash
 bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
@@ -240,6 +242,23 @@ bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
 avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
 `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`.
+
+## Model pin (`model`)
+
+The template sets `"model": "claude-opus-5-5"`, so every NEW spawn is pinned: the relay passes
+`--model <value>` to every `claude -p` run (conversational, plan, resume). Absent means no flag and
+the CLI default applies. Existing configs are pinned by an explicit in-place JSON edit (back up
+first, never `mv` over the bind-mounted file), then a `--replace --keep-config` roll. A persona
+re-render and `--refresh-prompt` both keep whatever `model` a config already has and never inject
+one; `--keep-config` uses the config verbatim.
+
+**Image before config.** `model` is an unknown field to images built before aqua-agents PR #29
+(`deny_unknown_fields`), and a consultant whose config carries it on such an image crash-loops.
+Order: build `:poc` from a main that includes the field, then add `model` to configs, then roll.
+Rollback is the reverse: remove `model` from the configs FIRST, then roll back to the older image.
+`CONSULTANT_IMAGE` (default `localhost/aqua-matrix-agent:poc`) selects the image for a canary;
+because the template now carries `model`, never render a fresh config with `CONSULTANT_IMAGE`
+pointing at a pre-#29 image.
 
 ## Boot-time restore (reboot survival)
 

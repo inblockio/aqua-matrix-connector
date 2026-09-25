@@ -17,6 +17,8 @@
 #   - --voice on / off / on again / off on absent block / bogus value
 #   - --replace --keep-config without --voice preserves the voice block
 #   - REFS_REPOS lists inblockio.github.io and the argv mounts it :ro (all six refs :ro)
+#   - model pin: the template carries model, a fresh render inherits it, a persona re-render and
+#     --refresh-prompt keep an existing config's model and never inject one
 #   - the podman/systemctl shims were never called
 #
 # Usage:  bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
@@ -105,6 +107,22 @@ cfg_voice() {     # cfg_voice <label>: prints the voice block as compact JSON, o
 import json, sys
 c = json.load(open(sys.argv[1]))
 print(json.dumps(c["voice"], sort_keys=True) if "voice" in c else "ABSENT")
+PY
+}
+cfg_model() {     # cfg_model <label>: prints the model value, or ABSENT
+  python3 - "$TEST_DIR/$1-aqua-consultant-config.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+print(c["model"] if "model" in c else "ABSENT")
+PY
+}
+set_model() {     # set_model <label> <value|ABSENT>: edit the config's model in place
+  python3 - "$TEST_DIR/$1-aqua-consultant-config.json" "$2" <<'PY'
+import json, sys
+p, v = sys.argv[1], sys.argv[2]; c = json.load(open(p))
+if v == "ABSENT": c.pop("model", None)
+else: c["model"] = v
+json.dump(c, open(p, "w"), indent=2, ensure_ascii=True); open(p, "a").write("\n")
 PY
 }
 cfg_without_voice_sha() { # everything except the voice key, canonicalised, hashed
@@ -201,6 +219,24 @@ rc=0; run d --replace --keep-config --label alpha || rc=$?
 check "exit 0 (keep-config derives target/display from the config)" [ "$rc" -eq 0 ]
 check "voice block untouched" [ "$(cfg_voice alpha)" = '{"enabled": true, "tts_voice": "aura-2-thalia-en"}' ]
 check "argv still names the same config path" argv_has_line d "$TEST_DIR/alpha-aqua-consultant-config.json:/agent/config.json:ro"
+
+echo "== case G: model pin"
+check "template pins model claude-opus-5-5" \
+  bash -c 'python3 -c "import json,sys; sys.exit(json.load(open(sys.argv[1])).get(\"model\") != \"claude-opus-5-5\")" "$1"' _ "$TEMPLATE"
+check "fresh render from the template carries the model (beta)" [ "$(cfg_model beta)" = "claude-opus-5-5" ]
+set_model alpha claude-test-model
+rc=0; run g1 --label alpha --target "$TARGET" --persona Thalia --name Tester || rc=$?
+check "persona re-render exits 0" [ "$rc" -eq 0 ]
+check "persona re-render keeps an existing custom model" [ "$(cfg_model alpha)" = "claude-test-model" ]
+rc=0; run g2 --replace --keep-config --refresh-prompt --label alpha || rc=$?
+check "--refresh-prompt exits 0" [ "$rc" -eq 0 ]
+check "--refresh-prompt keeps an existing custom model" [ "$(cfg_model alpha)" = "claude-test-model" ]
+set_model alpha ABSENT
+rc=0; run g3 --label alpha --target "$TARGET" --persona Thalia --name Tester || rc=$?
+check "persona re-render never injects a model into a config without one" [ "$(cfg_model alpha)" = "ABSENT" ]
+rc=0; run g4 --replace --keep-config --refresh-prompt --label alpha || rc=$?
+check "--refresh-prompt never injects a model into a config without one" [ "$(cfg_model alpha)" = "ABSENT" ]
+check "voice block survived the model cases" [ "$(cfg_voice alpha)" = '{"enabled": true, "tts_voice": "aura-2-thalia-en"}' ]
 
 echo "== case E: refs mounts"
 check "argv mounts inblockio.github.io read-only" argv_has_line a "$REFS_BASE/inblockio.github.io:/refs/inblockio.github.io:ro"

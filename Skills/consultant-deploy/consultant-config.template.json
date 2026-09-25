@@ -6,6 +6,7 @@
   "description": "Read-only Aqua-protocol consultant: answers questions about the Aqua protocol / spec / SDK / repo ecosystem / governance principles / public inblock.io site over Matrix, grounded in the local Aqua repositories mounted read-only at /refs. Read-only contract (no Write/Edit, no mutating shell). One container = one identity (self-minted DID), persistent for the container's life; replace the container for a fresh identity + memory.",
   "image": "aqua-matrix-agent:poc",
   "role": "aqua-consultant",
+  "model": "claude-opus-5-5",
   "display_name": "__DISPLAY_NAME__",
   "hello": "Hello {user_id}, I am the Aqua Consultant (DID {did}). Ask me anything about the Aqua protocol, the repository ecosystem around it, or the governance principles behind it; I answer from the latest local Aqua sources. I am read-only: I explain and cite, I never modify.",
   "initiate_dm": true,
