@@ -807,6 +807,10 @@ async fn run_cycle<H: MessageHandler>(
     .await;
 
     let sync_client = agent.client().clone();
+    // Reload the OlmMachine if another Client wrote the shared crypto store
+    // since this one last did (the live loop below syncs directly, not through
+    // `AgentClient::sync_once`). See `reload_olm_if_store_changed`.
+    aqua_matrix_agent::reload_olm_if_store_changed(&sync_client).await;
     let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
 
     let exit = match handler.tick_interval() {

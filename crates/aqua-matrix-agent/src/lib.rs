@@ -472,7 +472,93 @@ async fn build_and_restore(
         .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
         .await
         .context("failed to restore session")?;
+    // Every Client built here opens its OWN OlmMachine over the SAME SQLite
+    // crypto store, and callers routinely keep more than one alive (token
+    // rotation builds a fresh Client while clones of the old one live on in
+    // delivery/wrap-up tasks). Enabling matrix-sdk's crypto-store lock gives
+    // each Client a generation counter, so [`reload_olm_if_store_changed`]
+    // can tell when ANOTHER Client wrote the store and reload before touching
+    // it. See that function for the 2026-09-15 OTK-collision incident.
+    client
+        .encryption()
+        .enable_cross_process_store_lock(crypto_store_lock_holder())
+        .await
+        .context("failed to enable the crypto-store lock")?;
     Ok(client)
+}
+
+/// A holder name for the crypto-store lock that is unique per Client, not
+/// just per process. matrix-sdk treats two lock users with the SAME holder
+/// name as one owner (both "acquire" it, neither ever reloads), so reusing a
+/// per-process constant would silently disable the protection for exactly
+/// the in-process case it exists for.
+fn crypto_store_lock_holder() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static BOOT: OnceLock<u128> = OnceLock::new();
+    let boot = BOOT.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
+    format!(
+        "aqua-{}-{boot:x}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Upper bound (ms) on the backoff while waiting for the crypto-store lock.
+/// The lock is only ever held briefly (our pre-sync check, or matrix-sdk's
+/// own room-key share before an encrypted send); we deliberately do NOT hold
+/// it across a long-poll sync. The backoff doubles from 10 ms up to this cap,
+/// so a pathological wait gives up after roughly 10 s and the sync proceeds.
+const CRYPTO_STORE_LOCK_MAX_BACKOFF_MS: u32 = 5_000;
+
+/// Reload this Client's in-memory OlmMachine if another Client (in this
+/// process or another) has written the shared crypto store since this one
+/// last held the lock. Call it before every sync.
+///
+/// WHY (incident 2026-09-15 23:21, device AQUA_bbd18d366866; 71k failed
+/// uploads over 12 days): the Scribe's token refresh built a fresh Client B,
+/// whose initial sync decrypted a peer's Olm pre-key message (consuming a
+/// one-time key) and uploaded the replacement OTK `AAAAAAAAAEE`. B was then
+/// discarded and the older Client A kept. A's in-memory Olm account predated
+/// B's writes, so on its next sync it minted a DIFFERENT key under the same
+/// id `AAAAAAAAAEE` and persisted that account over B's. From then on every
+/// `/keys/upload` 400'd "One time key ... already exists", the device could
+/// never replenish its OTKs, and peers could no longer open Olm sessions to
+/// it (Olm-deaf: missed room keys and call media keys). The server-side
+/// divergence is permanent for that device_id, so it also needs a device
+/// rotation to recover.
+///
+/// The lock is taken and released immediately rather than held across the
+/// sync: a long-poll holds for up to 30 s, and matrix-sdk's own
+/// `preshare_room_key` spins on the same lock, so holding it would stall
+/// every concurrent encrypted send behind the poll. Concurrent syncs on one
+/// device are already forbidden by design (H9 single-sync), so the gap left
+/// open (two Clients syncing AT THE SAME TIME) is not a pattern we run.
+/// A failure to take the lock degrades to the old behaviour (WARN, then sync).
+pub async fn reload_olm_if_store_changed(client: &Client) {
+    if let Err(e) = client
+        .encryption()
+        .spin_lock_store(Some(CRYPTO_STORE_LOCK_MAX_BACKOFF_MS))
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            "crypto-store lock not obtained; syncing without a stale-OlmMachine check"
+        );
+    }
+}
+
+/// `Client::sync_once`, preceded by [`reload_olm_if_store_changed`]. Every
+/// sync the connector drives goes through here.
+async fn sync_once_fresh(client: &Client, settings: SyncSettings) -> matrix_sdk::Result<()> {
+    reload_olm_if_store_changed(client).await;
+    client.sync_once(settings).await.map(|_| ())
 }
 
 async fn resolve_identity(matrix_url: &str, access_token: &str) -> Result<WhoAmI> {
@@ -1087,8 +1173,7 @@ impl AgentClient {
         };
 
         tracing::info!("running initial sync");
-        client
-            .sync_once(catch_up_sync_settings())
+        sync_once_fresh(&client, catch_up_sync_settings())
             .await
             .context("initial sync failed")?;
         // Log device_id on every connect so device CHURN (a fresh did:key auth
@@ -1229,8 +1314,7 @@ impl AgentClient {
         // Skipped for token-only refreshes (see `sync_after` doc) to avoid a
         // second concurrent sync racing to-device key delivery.
         if sync_after {
-            client
-                .sync_once(catch_up_sync_settings())
+            sync_once_fresh(&client, catch_up_sync_settings())
                 .await
                 .context("reauth: post-reauth sync failed")?;
         }
@@ -1830,8 +1914,7 @@ impl AgentClient {
     /// Wrong for a caller that only needs to catch up on state before doing
     /// something else: use [`AgentClient::sync_once_nowait`] there.
     pub async fn sync_once(&self) -> Result<()> {
-        self.client
-            .sync_once(SyncSettings::default())
+        sync_once_fresh(&self.client, SyncSettings::default())
             .await
             .context("sync failed")?;
         Ok(())
@@ -1842,8 +1925,7 @@ impl AgentClient {
     /// See [`catch_up_sync_settings`] for why the relay's cycle-start syncs
     /// must use this rather than [`AgentClient::sync_once`].
     pub async fn sync_once_nowait(&self) -> Result<()> {
-        self.client
-            .sync_once(catch_up_sync_settings())
+        sync_once_fresh(&self.client, catch_up_sync_settings())
             .await
             .context("sync failed")?;
         Ok(())
@@ -3411,5 +3493,252 @@ mod stale_client_tests {
         ] {
             assert!(!is_unregistered_client(&anyhow!(no.to_string())), "{no}");
         }
+    }
+}
+
+/// Two Clients over ONE crypto store, the shape the Scribe's token refresh
+/// produced on 2026-09-15: a fresh Client B syncs (and uploads one-time keys),
+/// then the older Client A syncs again with the Olm account it loaded before
+/// B's writes. Synapse rejects an OTK id it already holds with different key
+/// material ("One time key ... already exists"); the fake homeserver below
+/// records exactly that condition.
+#[cfg(test)]
+mod stale_olm_machine_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[derive(Default)]
+    struct KeyServer {
+        /// OTK id -> public key, as first accepted.
+        otks: HashMap<String, String>,
+        /// OTK ids re-uploaded with DIFFERENT key material (Synapse's 400).
+        collisions: Vec<String>,
+        uploads: usize,
+        /// Unique `next_batch` per sync: matrix-sdk skips a response whose
+        /// token it has already seen ("Got the same sync response twice").
+        syncs: u64,
+    }
+
+    async fn fake_homeserver() -> (String, Arc<Mutex<KeyServer>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(KeyServer::default()));
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let st = st.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                        let body_len = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < head_end + body_len {
+                            match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let req_body = buf[head_end..head_end + body_len].to_vec();
+                        buf.drain(..head_end + body_len);
+
+                        let request_line = head.lines().next().unwrap_or("").to_string();
+                        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                        let (status, body) = if path.starts_with("/_matrix/client/versions") {
+                            (
+                                "200 OK",
+                                r#"{"versions":["v1.1","v1.11"],"unstable_features":{}}"#
+                                    .to_string(),
+                            )
+                        } else if path.starts_with("/_matrix/client/v3/sync") {
+                            let mut s = st.lock().unwrap();
+                            s.syncs += 1;
+                            let (n, batch) = (s.otks.len(), s.syncs);
+                            drop(s);
+                            (
+                                "200 OK",
+                                format!(
+                                    r#"{{"next_batch":"s_{batch}","device_one_time_keys_count":{{"signed_curve25519":{n}}}}}"#
+                                ),
+                            )
+                        } else if path.starts_with("/_matrix/client/v3/keys/upload") {
+                            let v: serde_json::Value =
+                                serde_json::from_slice(&req_body).unwrap_or_default();
+                            let mut s = st.lock().unwrap();
+                            s.uploads += 1;
+                            let mut clash = None;
+                            if let Some(map) = v.get("one_time_keys").and_then(|m| m.as_object()) {
+                                for (id, k) in map {
+                                    let key = k
+                                        .get("key")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    match s.otks.get(id) {
+                                        Some(old) if *old != key => clash = Some(id.clone()),
+                                        Some(_) => {}
+                                        None => {
+                                            s.otks.insert(id.clone(), key);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(id) = clash {
+                                s.collisions.push(id.clone());
+                                (
+                                    "400 Bad Request",
+                                    format!(
+                                        r#"{{"errcode":"M_UNKNOWN","error":"One time key {id} already exists."}}"#
+                                    ),
+                                )
+                            } else {
+                                let n = s.otks.len();
+                                (
+                                    "200 OK",
+                                    format!(
+                                        r#"{{"one_time_key_counts":{{"signed_curve25519":{n}}}}}"#
+                                    ),
+                                )
+                            }
+                        } else if path.starts_with("/_matrix/client/v3/keys/query") {
+                            ("200 OK", r#"{"device_keys":{},"failures":{}}"#.to_string())
+                        } else {
+                            ("200 OK", "{}".to_string())
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, state)
+    }
+
+    fn temp_store(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "aqua-stale-olm-{tag}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A peer claims one of our OTKs (Synapse deletes it), so the next sync
+    /// reports a count below target and the syncing Olm account mints a
+    /// replacement under its NEXT key id.
+    fn claim_one(state: &Arc<Mutex<KeyServer>>) {
+        let mut s = state.lock().unwrap();
+        let id = s.otks.keys().min().cloned().expect("an OTK to claim");
+        s.otks.remove(&id);
+    }
+
+    /// The prod sequence: A is live and has published its OTKs; a refresh
+    /// builds B over the same store; a peer claims a key and B replenishes it;
+    /// B is dropped and A (whose in-memory account never saw B's new key id)
+    /// syncs again after another claim.
+    async fn run(tag: &str, reload: bool) -> (usize, Vec<String>) {
+        let (url, state) = fake_homeserver().await;
+        let store = temp_store(tag);
+        let user: OwnedUserId = "@scribe:localhost".try_into().unwrap();
+        let device: OwnedDeviceId = "STALEOLMDEV".into();
+        let sync = |c: Client| async move {
+            let r = if reload {
+                sync_once_fresh(&c, catch_up_sync_settings()).await
+            } else {
+                c.sync_once(catch_up_sync_settings()).await.map(|_| ())
+            };
+            r.expect("sync against the fake homeserver");
+        };
+        let a = build_and_restore(&url, &store, &user, &device, "tok")
+            .await
+            .expect("client A");
+        sync(a.clone()).await;
+        let b = build_and_restore(&url, &store, &user, &device, "tok")
+            .await
+            .expect("client B");
+        claim_one(&state);
+        sync(b.clone()).await;
+        drop(b);
+        claim_one(&state);
+        sync(a.clone()).await;
+        drop(a);
+        let s = state.lock().unwrap();
+        let out = (s.uploads, s.collisions.clone());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&store);
+        out
+    }
+
+    /// Control: WITHOUT the reload the stale Client re-mints the same OTK ids
+    /// with new key material, i.e. the fake reproduces the prod 400. If this
+    /// ever stops failing, the fixture (or matrix-sdk) changed and the test
+    /// below no longer proves anything.
+    #[tokio::test]
+    async fn stale_client_without_reload_reuploads_colliding_otks() {
+        let (uploads, collisions) = run("control", false).await;
+        assert!(
+            uploads >= 3,
+            "A, B and A again should each have uploaded, saw {uploads}"
+        );
+        assert!(
+            !collisions.is_empty(),
+            "expected the stale Client to collide on an OTK id (fixture no longer reproduces the bug)"
+        );
+    }
+
+    /// The fix: the stale Client reloads its OlmMachine before syncing, sees
+    /// B's already-published account, and uploads nothing that collides.
+    #[tokio::test]
+    async fn stale_client_reloads_and_never_collides() {
+        let (uploads, collisions) = run("fixed", true).await;
+        assert!(
+            uploads >= 3,
+            "A, B and A again should each have uploaded, saw {uploads}"
+        );
+        assert!(
+            collisions.is_empty(),
+            "stale Client re-uploaded colliding OTK ids: {collisions:?}"
+        );
+    }
+
+    /// Holder names must differ per Client: with a shared name both Clients
+    /// "own" the lock and neither ever reloads.
+    #[test]
+    fn lock_holder_is_unique_per_client() {
+        let a = crypto_store_lock_holder();
+        let b = crypto_store_lock_holder();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("aqua-{}-", std::process::id())));
     }
 }
