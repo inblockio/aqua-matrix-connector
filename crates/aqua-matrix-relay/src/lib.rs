@@ -5,9 +5,10 @@
 //! deduplicate inbound messages by a timestamp watermark that persists across
 //! rotations AND process restarts (so a DM arriving in the rotation gap, or
 //! while the daemon was down, isn't lost), shut down
-//! cleanly on SIGTERM/SIGINT, and exit cleanly after repeated connect failures
-//! so systemd can self-heal. It knows nothing about *what an agent does* with a
-//! message.
+//! cleanly on SIGTERM/SIGINT, wait out network outages in-process (capped
+//! exponential backoff, see `aqua_matrix_agent::net_retry`), and exit after
+//! repeated NON-transient connect failures so podman/systemd see a real crash
+//! loop. It knows nothing about *what an agent does* with a message.
 //!
 //! To build a new agent you implement [`MessageHandler`] and call
 //! [`run_daemon`]. That's the whole surface — no Matrix types appear in the
@@ -68,7 +69,8 @@ use matrix_sdk::{
 // MediaHandle / MediaKind ride on [`InboundMedia`] so a handler can name an
 // attachment's kind and download it without touching matrix-sdk.
 pub use aqua_matrix_agent::{
-    is_unknown_token, load_dotenv, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
+    classify_connect_error, connect_with_outage_retry, is_transient_network_error,
+    is_unknown_token, load_dotenv, ConnectErrorClass, ConnectOutcome, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
     TypingGuard, WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
@@ -82,11 +84,14 @@ const REFRESH_GUARD_SECS: u64 = 30;
 /// Minimum sleep between rotations, so a token that arrived near expiry still
 /// gets one full cycle instead of hammering siwx-oidc.
 const MIN_CYCLE_SECS: u64 = 15;
-/// After this many consecutive [`AgentClient::connect`] failures, exit so
-/// systemd's `Restart=always` brings up a fresh process. The connect path can
-/// accumulate matrix-sdk / SQLite resources on partial failures; a fresh
-/// process resets that. `StartLimitBurst` still guards against runaway
-/// restarts.
+/// After this many consecutive NON-transient [`AgentClient::connect`] failures
+/// (auth rejected, store/crypto error, fd exhaustion, anything unrecognised),
+/// exit so podman/systemd bring up a fresh process and the crash-loop watcher
+/// sees it. Network failures (DNS, refused/timed-out connections, TLS
+/// handshake, 502/503/504) never count: they are waited out in-process by
+/// [`connect_with_outage_retry`], because a restart cannot fix the network and
+/// podman's `on-failure` policy has given up mid-outage before (2026-08-08:
+/// 78 h dead; 2026-09-24..27: 3,537 exits in three nightly outages).
 const MAX_CONNECT_FAILURES: u32 = 3;
 
 /// Events per `/messages` page when [`backfill_missed`] catches up. One page
@@ -428,9 +433,10 @@ pub fn validate_target(target: &str, role: &str) -> bool {
     true
 }
 
-/// Run the agent daemon forever: connect, serve, rotate, repeat. Only returns
-/// by `std::process::exit` after [`MAX_CONNECT_FAILURES`] consecutive connect
-/// failures (so systemd restarts a clean process).
+/// Run the agent daemon forever: connect, serve, rotate, repeat. Returns on
+/// SIGTERM/SIGINT; otherwise only ends by `std::process::exit` after
+/// [`MAX_CONNECT_FAILURES`] consecutive NON-transient connect failures (so the
+/// supervisor restarts a clean process). Network outages are waited out.
 pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, handler: H) {
     let handler = Arc::new(handler);
     let target = Arc::new(target.to_string());
@@ -458,7 +464,7 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // rotation gap every cycle, and the whole of any downtime.
     //
     // The cross-restart persistence extends the same guarantee to process
-    // restarts (crash-exit after MAX_CONNECT_FAILURES, `systemctl restart`,
+    // restarts (fatal exit after MAX_CONNECT_FAILURES, `systemctl restart`,
     // host reboot): the next process resumes from the last processed message
     // instead of re-seeding to "now" and silently skipping everything that
     // was delivered while the daemon was down.
@@ -486,28 +492,33 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     spawn_shutdown_listener(shutdown.clone());
 
     let mut first_cycle = true;
-    let mut consecutive_failures: u32 = 0;
     loop {
-        let mut agent = match AgentClient::connect(config.clone()).await {
-            Ok(a) => {
-                consecutive_failures = 0;
-                a
+        // Every (re)connect, including the scheduled token rotation, goes
+        // through the outage-aware loop. A network failure waits in-process
+        // (one WARN on entry, a reminder every 5 min, one INFO on recovery);
+        // a failed attempt builds no long-lived Client (no handlers are
+        // registered before `run_cycle`), so waiting accumulates no fds.
+        // `shutdown.notified()` is raced against every attempt and backoff
+        // sleep; a permit stored by `notify_one` is observed on first poll.
+        let mut agent = match connect_with_outage_retry(
+            &config,
+            handler.role(),
+            MAX_CONNECT_FAILURES,
+            shutdown.notified(),
+        )
+        .await
+        {
+            ConnectOutcome::Connected(a) => a,
+            ConnectOutcome::Shutdown => {
+                tracing::info!("{}: received SIGTERM while connecting; shutting down", handler.role());
+                return;
             }
-            Err(e) => {
-                consecutive_failures += 1;
+            ConnectOutcome::Fatal(_) => {
                 tracing::error!(
-                    "{}: AgentClient::connect failed ({consecutive_failures}/{MAX_CONNECT_FAILURES}): {e:#}",
+                    "{}: {MAX_CONNECT_FAILURES} consecutive connect failures (non-transient); exiting so the supervisor restarts a clean process",
                     handler.role(),
                 );
-                if consecutive_failures >= MAX_CONNECT_FAILURES {
-                    tracing::error!(
-                        "{}: {MAX_CONNECT_FAILURES} consecutive connect failures; exiting for systemd Restart=always (avoids in-process resource accumulation)",
-                        handler.role(),
-                    );
-                    std::process::exit(1);
-                }
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                continue;
+                std::process::exit(1);
             }
         };
 

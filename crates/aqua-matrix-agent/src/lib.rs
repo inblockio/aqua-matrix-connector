@@ -7,12 +7,17 @@
 mod call;
 mod durable;
 mod media;
+pub mod net_retry;
 mod recovery;
 mod registry;
 mod rtc_keys;
 
 pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
+pub use net_retry::{
+    classify_connect_error, connect_with_outage_retry, is_transient_network_error,
+    ConnectErrorClass, ConnectOutcome,
+};
 pub use rtc_keys::{
     CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };
@@ -631,6 +636,14 @@ async fn acquire_session(
                     );
                     None
                 }
+                // A NETWORK failure says nothing about the token: stop here
+                // instead of falling through to a fresh did:key auth, which
+                // would mint (and, if Matrix is the part that is down, throw
+                // away) a new siwx-oidc grant on every outage retry. The
+                // caller's outage loop retries this same cached token.
+                Err(e) if net_retry::is_transient_network_error(&e) => {
+                    return Err(e.context("cached session whoami failed (network)"));
+                }
                 Err(e) => {
                     tracing::warn!("cached session whoami failed: {e:#}; falling through");
                     None
@@ -674,6 +687,13 @@ async fn acquire_session(
                         refreshed.device_id,
                         refreshed.expires_at_unix,
                     ))
+                }
+                // Offline (or siwx-oidc behind a 502): the grant was never
+                // judged, so keep it for the next attempt rather than falling
+                // through to a fresh did:key auth. Only a definitive rejection
+                // (e.g. 400 invalid_grant) escalates to re-authentication.
+                Err(e) if net_retry::is_transient_network_error(&e) => {
+                    return Err(e.context("refresh grant failed (network); refresh token kept"));
                 }
                 Err(e) => {
                     tracing::warn!("refresh grant failed: {e:#}; falling through to fresh auth");

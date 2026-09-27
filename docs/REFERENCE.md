@@ -155,10 +155,24 @@ Per client cycle it:
 5. streams sync + an optional periodic tick until ~30 s before the access token
    expires, then drops the client and loops to rotate it.
 
-After `MAX_CONNECT_FAILURES` (3) consecutive connect failures it
-`std::process::exit(1)` so systemd's `Restart=always` brings up a clean process
-(matrix-sdk has no public hook to swap a token in place; rotating the whole
-client is what avoids the `M_UNKNOWN_TOKEN` sync wedge).
+Every (re)connect goes through `aqua_matrix_agent::connect_with_outage_retry`.
+A **network** failure (DNS, refused/reset/timed-out connection, TLS handshake,
+HTTP 502/503/504/429; see `net_retry::classify_connect_error`) is waited out
+in-process with capped exponential backoff (2 s doubling to 60 s, jittered),
+logging one `WARN ... network outage: waiting for connectivity`, a
+`... network outage: still waiting for connectivity after <N>s (<M> attempts ...)`
+reminder at most every 5 min, and one `INFO ... network restored after <N>s
+(<M> attempts)`. While offline the session logic never falls through to a fresh
+did:key auth and never presents the refresh token, so no grant is burned.
+SIGTERM interrupts the wait immediately.
+
+After `MAX_CONNECT_FAILURES` (3) consecutive **non-transient** connect failures
+(auth rejected, store/crypto error, fd exhaustion, anything unrecognised) it
+logs `3 consecutive connect failures (non-transient); exiting ...` and
+`std::process::exit(1)`s, so podman/systemd restart a clean process and the
+crash-loop watcher sees it. (matrix-sdk has no public hook to swap a token in
+place; rotating the whole client is what avoids the `M_UNKNOWN_TOKEN` sync
+wedge.)
 
 ## Minimal agent (the whole contract)
 
