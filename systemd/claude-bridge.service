@@ -3,8 +3,13 @@ Description=Persistent claude-ws session in tmux (LLM-Claude-Agent-Bridge)
 Documentation=https://github.com/inblockio/aqua-matrix-agent
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# Start limit DISABLED (2026-09-27). The old 10-starts-in-300s limit was a
+# trap, not a guard: ten 5s restarts fit inside 300s, so a network outage of a
+# few minutes left the unit dead for good ("Start request repeated too
+# quickly"). The crash-loop guard is now the progressive backoff in [Service]
+# (RestartSteps/RestartMaxDelaySec). Kept in [Unit], where modern systemd reads
+# it; [Service] placement is silently ignored.
+StartLimitIntervalSec=0
 
 [Service]
 # Run a supervisor loop as the unit's main process. The loop keeps a tmux
@@ -21,7 +26,12 @@ WorkingDirectory=%h/aqua-matrix-agent
 ExecStart=/bin/bash -c 'while true; do if ! /usr/bin/tmux has-session -t claude-bridge 2>/dev/null; then /usr/bin/tmux new-session -d -s claude-bridge -- "$HOME/.local/bin/claude" --dangerously-skip-permissions && echo "[claude-bridge supervisor] spawned tmux session" || echo "[claude-bridge supervisor] spawn failed"; fi; sleep 10; done'
 ExecStop=/usr/bin/tmux kill-session -t claude-bridge
 Restart=always
+# Progressive backoff (2026-09-27, systemd >= 254): 5s -> 60s over 8 steps, so a
+# one-off crash comes back in 5s while a sustained failure (outage, bad
+# deploy) settles at one attempt per minute, forever.
 RestartSec=5s
+RestartSteps=8
+RestartMaxDelaySec=60s
 
 [Install]
 WantedBy=default.target
