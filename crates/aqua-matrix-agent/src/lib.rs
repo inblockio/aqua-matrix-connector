@@ -701,7 +701,7 @@ async fn acquire_session(
     // never deletes) that exact Synapse device instead of minting a fresh
     // `SIWX_<uuid>`. Re-provisioning the same id preserves the device's E2EE
     // keys, so the agent keeps one stable device across every login.
-    let tokens = siwx_oidc_auth::authenticate_with_device(
+    let tokens = match siwx_oidc_auth::authenticate_with_device(
         &config.siwx_url,
         client_id,
         redirect_uri,
@@ -709,7 +709,48 @@ async fn acquire_session(
         Some(&effective_device_id),
     )
     .await
-    .context("siwx-oidc authentication failed")?;
+    {
+        Ok(tokens) => tokens,
+        // STALE CLIENT SELF-HEAL. siwx-oidc stores a dynamic registration with a
+        // 30-day TTL (`CLIENT_LIFETIME`) that nothing ever extends, while the
+        // refresh grant never looks the client up. So an agent that auto-registered
+        // once and has lived on refresh rotation ever since keeps working until its
+        // first fresh login after day 30, which then gets `/authorize` 401
+        // "Unrecognised client id." forever (every fresh login across the fleet,
+        // 2026-09-22..26). The registration is ours (auto-registered and cached in
+        // config.toml), so re-register once, persist it, and retry. An operator
+        // supplied client id is left alone: it is not ours to replace.
+        Err(e)
+            if is_unregistered_client(&e)
+                && config.client_id.is_none()
+                && config.redirect_uri.is_none() =>
+        {
+            tracing::warn!(
+                "siwx-oidc no longer recognises the cached OIDC client {client_id} \
+                 (dynamic registrations expire server-side); re-registering and retrying the fresh login"
+            );
+            let (cid, ruri) = register_oidc_client(&config.siwx_url).await.context(
+                "siwx-oidc authentication failed: re-registering the expired OIDC client",
+            )?;
+            config_file.oidc.client_id = Some(cid.clone());
+            config_file.oidc.redirect_uri = Some(ruri.clone());
+            if let Err(e) = config_file.save(config_path) {
+                tracing::warn!(
+                    "failed to persist re-registered OIDC client: {e:#} (continuing anyway)"
+                );
+            }
+            siwx_oidc_auth::authenticate_with_device(
+                &config.siwx_url,
+                &cid,
+                &ruri,
+                key,
+                Some(&effective_device_id),
+            )
+            .await
+            .context("siwx-oidc authentication failed after re-registering the OIDC client")?
+        }
+        Err(e) => return Err(e.context("siwx-oidc authentication failed")),
+    };
     let expires_in = tokens.expires_in.unwrap_or(300);
     tracing::info!(
         "access token acquired (expires in {}s, refresh_token: {})",
@@ -778,6 +819,16 @@ pub fn is_unknown_token(err: &anyhow::Error) -> bool {
     chain.contains("M_UNKNOWN_TOKEN")
         || chain.contains("UnknownToken")
         || chain.contains("Token is not active")
+}
+
+/// True if a fresh siwx-oidc login failed because the server does not know the
+/// OIDC `client_id`. siwx-oidc's `/authorize` answers 401 for exactly one reason,
+/// "Unrecognised client id." (an unregistered or TTL-expired dynamic
+/// registration); every other refusal there is a redirect. String-matched on the
+/// `siwx_oidc_auth` error, same approach as `is_store_mismatch`.
+fn is_unregistered_client(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.to_string().starts_with("/authorize returned 401"))
 }
 
 /// True if `err` is a homeserver-side `5xx` / `M_UNKNOWN Internal server error`.
@@ -3112,5 +3163,233 @@ mod catch_up_sync_tests {
             .parse()
             .unwrap();
         assert!(t >= 1000, "default sync should long-poll, sent timeout={t}");
+    }
+}
+
+#[cfg(test)]
+mod stale_client_tests {
+    //! A fresh login with a cached OIDC client that siwx-oidc has forgotten
+    //! (2026-09-27 RCA: dynamic registrations expire after 30 days, refresh
+    //! never notices, the next fresh login gets `/authorize` 401 forever). A
+    //! tiny local responder plays siwx-oidc plus the homeserver's whoami and
+    //! knows exactly ONE client, the one its `/register` hands out.
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const FRESH: &str = "fresh-client";
+
+    /// Returns the base URL and the request line of every request served.
+    async fn fake_siwx(device_id: String) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                let device_id = device_id.clone();
+                tokio::spawn(async move {
+                    // One request per connection (`connection: close`), body ignored.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    seen.lock().unwrap().push(line.clone());
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let (status, headers, body) = if path.starts_with("/authorize") {
+                        if path.contains(&format!("client_id={FRESH}&")) {
+                            (
+                                "303 See Other",
+                                format!(
+                                    "set-cookie: session=s1; Path=/\r\nlocation: /?nonce=n0nce&state=headless\
+                                     &redirect_uri=http%3A%2F%2Flocalhost%3A0%2Fcallback&client_id={FRESH}\r\n"
+                                ),
+                                String::new(),
+                            )
+                        } else {
+                            (
+                                "401 Unauthorized",
+                                String::new(),
+                                "Unrecognised client id.".into(),
+                            )
+                        }
+                    } else if path.starts_with("/register") {
+                        (
+                            "201 Created",
+                            String::new(),
+                            format!(r#"{{"client_id":"{FRESH}"}}"#),
+                        )
+                    } else if path.starts_with("/sign_in") {
+                        (
+                            "303 See Other",
+                            "location: http://localhost:0/callback?code=c0de&state=headless\r\n"
+                                .into(),
+                            String::new(),
+                        )
+                    } else if path.starts_with("/token") {
+                        (
+                            "200 OK",
+                            String::new(),
+                            r#"{"access_token":"at","token_type":"Bearer","expires_in":300,"refresh_token":"rt"}"#
+                                .into(),
+                        )
+                    } else if path.starts_with("/_matrix/client/v3/account/whoami") {
+                        (
+                            "200 OK",
+                            String::new(),
+                            format!(
+                                r#"{{"user_id":"@agent:localhost","device_id":"{device_id}"}}"#
+                            ),
+                        )
+                    } else {
+                        ("404 Not Found", String::new(), String::new())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\n{headers}content-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (url, log)
+    }
+
+    fn temp_store(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aqua-stale-client-{tag}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn count(log: &Arc<Mutex<Vec<String>>>, prefix: &str) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .starts_with(prefix)
+            })
+            .count()
+    }
+
+    /// Cached (auto-registered) client, config.toml as a long-lived agent has it.
+    async fn setup(
+        tag: &str,
+        explicit_client: bool,
+    ) -> (
+        AgentConfig,
+        SiwxKey,
+        ConfigFile,
+        PathBuf,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let key = SiwxKey::generate_ed25519();
+        let device = resolve_effective_device_id(None, &key.did()).unwrap();
+        let (url, log) = fake_siwx(device).await;
+        let store_dir = temp_store(tag);
+        let config_path = store_dir.join("config.toml");
+        let mut config_file = ConfigFile::default();
+        config_file.oidc.client_id = Some("expired-client".into());
+        config_file.oidc.redirect_uri = Some(DEFAULT_REDIRECT_URI.into());
+        config_file.save(&config_path).unwrap();
+        let config = AgentConfig {
+            key_file: store_dir.join("agent.pem"),
+            siwx_url: url.clone(),
+            matrix_url: url,
+            client_id: explicit_client.then(|| "expired-client".to_string()),
+            redirect_uri: None,
+            store_dir,
+            device_id: None,
+        };
+        (config, key, config_file, config_path, log)
+    }
+
+    #[tokio::test]
+    async fn expired_cached_client_is_re_registered_and_fresh_login_succeeds() {
+        let (config, key, mut config_file, config_path, log) = setup("heal", false).await;
+        let (cid, ruri) = resolve_oidc_client(&config, &mut config_file, &config_path)
+            .await
+            .unwrap();
+        assert_eq!(cid, "expired-client", "the cached client is used first");
+
+        let (access, _user, _device, _exp) = acquire_session(
+            &config,
+            &key,
+            &cid,
+            &ruri,
+            &mut config_file,
+            &config_path,
+            false,
+        )
+        .await
+        .expect("fresh login must heal an expired OIDC client registration");
+
+        assert_eq!(access, "at");
+        assert_eq!(count(&log, "/authorize"), 2, "one 401, one retry");
+        assert_eq!(count(&log, "/register"), 1, "re-register exactly once");
+        assert_eq!(config_file.oidc.client_id.as_deref(), Some(FRESH));
+        let persisted = ConfigFile::load(&config_path).unwrap();
+        assert_eq!(
+            persisted.oidc.client_id.as_deref(),
+            Some(FRESH),
+            "the new registration must be persisted, else every restart re-registers"
+        );
+        assert!(persisted.session.is_some());
+        let _ = std::fs::remove_dir_all(&config.store_dir);
+    }
+
+    #[tokio::test]
+    async fn operator_supplied_client_is_never_replaced() {
+        let (config, key, mut config_file, config_path, log) = setup("explicit", true).await;
+        let err = acquire_session(
+            &config,
+            &key,
+            "expired-client",
+            DEFAULT_REDIRECT_URI,
+            &mut config_file,
+            &config_path,
+            false,
+        )
+        .await
+        .expect_err("an operator-supplied unknown client must fail loudly");
+        assert!(is_unregistered_client(&err), "got: {err:#}");
+        assert_eq!(count(&log, "/register"), 0);
+        assert_eq!(
+            config_file.oidc.client_id.as_deref(),
+            Some("expired-client")
+        );
+        let _ = std::fs::remove_dir_all(&config.store_dir);
+    }
+
+    #[test]
+    fn only_the_authorize_401_counts_as_an_unregistered_client() {
+        let yes = anyhow!("/authorize returned 401 Unauthorized instead of 303")
+            .context("siwx-oidc authentication failed");
+        assert!(is_unregistered_client(&yes));
+        for no in [
+            "/authorize returned 500 Internal Server Error instead of 303",
+            "/sign_in returned 401 Unauthorized: bad signature",
+            "/token returned 401 Unauthorized: Unrecognised client id.",
+        ] {
+            assert!(!is_unregistered_client(&anyhow!(no.to_string())), "{no}");
+        }
     }
 }
