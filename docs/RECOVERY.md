@@ -23,9 +23,9 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 
 | Scenario | Why | What to do |
 |---|---|---|
-| Restart-loop guard exceeded (`StartLimitBurst=10` in `StartLimitIntervalSec=300`) | Daemon failed >10 times in 5 minutes — usually means a real upstream problem | Fix root cause, then `systemctl --user reset-failed <unit>` to re-enable restarts |
+| Daemon keeps failing (unit cycling `activating (auto-restart)`) | Real upstream problem (siwx-oidc down, bad deploy). The units never give up (`StartLimitIntervalSec=0`); they back off to one attempt per minute | Fix root cause; the unit recovers on its own at the next attempt. `systemctl --user restart <unit>` skips the remaining backoff |
 | Refresh token expired (>24h since last refresh-grant) | Standalone siwx-oidc TTL boundary | Nothing — next start does a fresh OAuth code flow, mints a new `device_id`, and the in-code store-mismatch handler wipes + rebuilds the SQLite crypto store. Tim sees one cross-signing rebootstrap. |
-| siwx-oidc server permanently down | Cannot authenticate at all | Fix siwx-oidc, then `systemctl --user reset-failed` if guard tripped |
+| siwx-oidc server permanently down | Cannot authenticate at all | Fix siwx-oidc; the unit reconnects at its next backoff attempt (≤60s) |
 | Disk full | SQLite writes fail | Free space, then `systemctl --user restart <unit>` |
 | All `.pem` files lost | Identities derive from these | Accept the new identity (binary auto-generates), notify counterparties (they see a new Matrix user) |
 | Crypto store AND `recovery.key` both lost | SSSS has nothing to restore from | A brand-new cross-signing identity is bootstrapped; Tim sees one re-verification. Back up `recovery.key` to avoid this. |
@@ -34,7 +34,7 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 
 ### `aqua-matrix-heartbeat.service`
 
-- `Restart=always`, `RestartSec=5s`, crash-loop guard `StartLimitBurst=10 / IntervalSec=300` (in `[Unit]`, not `[Service]`)
+- `Restart=always` with progressive backoff `RestartSec=5s` → `RestartMaxDelaySec=60s` over `RestartSteps=8`; start limit disabled (`StartLimitIntervalSec=0` in `[Unit]`)
 - **Outer loop owns AgentClient lifecycle.** Each iteration:
   1. `AgentClient::connect()` runs the three-tier session resolution (see below)
   2. Inner cycle (`run_cycle`) registers the message handler, spawns `client.sync()`, runs heartbeat ticks. Returns when **either** the refresh deadline (`expires_at_unix − REFRESH_GUARD_SECS`) is reached **or** the sync future ends (network blip, fatal error)
@@ -69,21 +69,44 @@ Differences in failure modes specific to claude-channel:
 
 ## Crash-loop guard explained
 
-Each unit declares:
+Each unit declares (2026-09-27, systemd >= 254):
 
 ```
-StartLimitIntervalSec=300
-StartLimitBurst=10
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=5s
+RestartSteps=8
+RestartMaxDelaySec=60s
 ```
 
-systemd refuses to restart the unit if it has already restarted 10 times in the last 300 seconds. The unit transitions to `failed`. This prevents log spam / CPU burn when a daemon is fundamentally broken (siwx-oidc unreachable, disk full, etc.).
+The guard is the **progressive backoff**, not a start limit: the delay grows
+from 5s to 60s over 8 restarts (~5, 7, 9, 13, 17, 24, 32, 44, then 60s) and
+stays at one attempt per minute for as long as the failure lasts. That caps
+log spam / CPU burn when a daemon is fundamentally broken while never giving
+up.
 
-To re-enable restarts after fixing the root cause:
+**Why no start limit.** The previous `StartLimitBurst=10` in
+`StartLimitIntervalSec=300` was a trap: ten 5s (or 10s) restarts fit inside
+300s, so any network outage longer than a couple of minutes (the host saw
+three nightly ISP outages of 1.5-3.5 h in one week of September 2026) left
+the unit `failed` ("Start request repeated too quickly") until a human ran
+`reset-failed`. An outage lasts as long as it lasts; no burst count fits it.
+
+The per-consultant `aqua-activity-watch-<label>.service` units rendered by
+`Skills/consultant-deploy/spawn-consultant.sh` follow the same scheme with a
+10s base and a 120s cap (`RestartSteps=6`).
+
+To skip the remaining backoff after fixing a root cause:
 
 ```bash
-systemctl --user reset-failed aqua-matrix-heartbeat
-systemctl --user start aqua-matrix-heartbeat
+systemctl --user restart aqua-matrix-heartbeat
 ```
+
+On a unit still carrying the old limit, `systemctl --user reset-failed <unit>`
+is needed first.
 
 ## Identity / device_id state recovery
 

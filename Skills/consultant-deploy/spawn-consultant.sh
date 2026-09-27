@@ -390,8 +390,11 @@ Description=Aqua activity watcher, ${DISPLAY_NAME} (DMs Tim on first message + e
 Documentation=https://github.com/inblockio/aqua-matrix-agent
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# Start limit DISABLED (2026-09-27). The old 10-starts-in-300s limit was a
+# trap: ten 10s restarts fit inside 300s, so any network outage longer than
+# ~2 min (three nightly ISP outages of 1.5-3.5 h in one week) left the watcher
+# dead for good. The crash-loop guard is the progressive backoff in [Service].
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -403,7 +406,11 @@ ExecStart=%h/aqua-matrix-agent/target/debug/aqua-activity-watch \\
   --display-label "${DISPLAY_NAME}" \\
   --milestone 10
 Restart=always
+# Progressive backoff (systemd >= 254): 10s -> 120s over 6 steps (~10, 15, 23,
+# 35, 52, 79, then 120s), retrying forever instead of hitting a start limit.
 RestartSec=10s
+RestartSteps=6
+RestartMaxDelaySec=120s
 StandardOutput=journal
 StandardError=journal
 

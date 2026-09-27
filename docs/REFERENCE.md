@@ -220,7 +220,9 @@ call `run_daemon`. No auth code, no sync loop, no matrix-sdk.
    `--key-file` and `--store-dir` — **one identity per surface**, never
    multiplex onto an existing `.pem`.
 4. **Ship a systemd user unit** (copy one from `systemd/`): `Restart=always`,
-   `RestartSec=5s`, `StartLimitBurst` for the crash-loop guard, `WorkingDirectory`
+   `RestartSec=5s` + `RestartSteps`/`RestartMaxDelaySec` progressive backoff as the
+   crash-loop guard and `StartLimitIntervalSec=0` (never a burst limit, see
+   RECOVERY.md), `WorkingDirectory`
    at the repo root, `ExecStart` pointing at `target/debug/<your-bin>`.
 5. **Build & cut over:** `cargo build`, then `systemctl --user daemon-reload &&
    systemctl --user restart <unit>`; confirm `connected` + `client cycle
