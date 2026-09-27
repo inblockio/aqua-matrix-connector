@@ -91,6 +91,8 @@ Detailed in [`ARCHITECTURE.md` § "Identity and device-id persistence"](ARCHITEC
 
 `<store_dir>/config.toml` persists `access_token`, `refresh_token`, `did`, `user_id`, `device_id`, and `expires_at_unix`. On startup the daemon picks the cheapest valid tier (cached access token → refresh grant → fresh OAuth). The first two tiers preserve `device_id` and therefore the SQLite crypto store. Tier three is the only path that triggers a crypto-store wipe + cross-signing rebootstrap. This means the only restart that causes visible disruption to your Element timeline is one that happens >24h after the last successful refresh.
 
+The cached OIDC `client_id` (auto-registered) is NOT kept alive by the first two tiers: siwx-oidc expires a dynamic registration 30 days after `/register` and the refresh grant never looks it up, so a long-lived agent's first fresh OAuth after day 30 gets `/authorize returned 401` (server log: `Unrecognised client id.`). The connector heals this itself (re-registers once, persists the new `client_id`, retries). An operator-supplied `OIDC_CLIENT_ID` is never replaced; re-register it by hand.
+
 ## Secure Secret Storage (SSSS) — surviving a crypto-store wipe
 
 Cross-signing normally persists across **ordinary** restarts via the SQLite
