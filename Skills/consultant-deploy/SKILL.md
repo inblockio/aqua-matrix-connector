@@ -71,23 +71,37 @@ existing configs, so already-deployed consultants are unaffected until re-render
 ```bash
 bash ~/spawn-consultant.sh \
   --label gawain \
-  --target '@did-key-…:matrix.inblock.io' \
+  --target 'did:key:z6Mk…' \
   --display 'Aqua Consultant (Gawain)' \
   --name Gawain \
   --onboard
 ```
 
-**Before spawning, ALWAYS diff the new `--target` against existing configs** — a did:key Tim gives
+**MXIDs are never derived from DIDs (2026-09-27).** siwx-oidc gives every NEW DID an opaque
+localpart (16 base36 chars, e.g. `@1vo8g4vofiha69ua:matrix.inblock.io`) and keeps existing
+accounts on their legacy `@did-key-…` / `@did-pkh-…` localpart forever, so only the server knows
+which applies. `--target` therefore takes either the peer's **MXID** (from their profile) or
+their **DID**, which spawn resolves via siwx-oidc `GET /resolve?did=` and prints
+(`>> --target did:… resolved via …/resolve -> @…`). If the lookup is unavailable (prod siwx-oidc
+older than c5ed83b answers 404) the spawn **fails** rather than guessing the legacy form: pass the
+MXID instead. The agent's OWN MXID is read back from its persisted session after first login
+(`>> agent MXID (from its persisted session): @…`), or later with
+`bash ~/spawn-consultant.sh --print-mxid --label <label>`. For a dev deployment add
+`--siwx-url https://dev.siwx.inblock.io --matrix-url https://dev.matrix.inblock.io`.
+
+**Before spawning, ALWAYS diff the peer's MXID against existing configs** — a DID Tim gives
 with a fresh human name may already have a consultant (this is exactly how "Aubert" turned out to be
-the existing `zdnaez` peer):
+the existing `zdnaez` peer). Diff the resolved MXID, not a DID fragment: an opaque MXID contains
+nothing of the DID.
 
 ```bash
-grep -l 'THE_DID_KEY_LOCALPART' ~/.aqua-matrix-test/*-config.json   # any hit = already deployed
+grep -l 'THE_PEER_MXID_LOCALPART' ~/.aqua-matrix-test/*-config.json   # any hit = already deployed
 ```
 
-Then add the consultant to the live registry so the fleet roller includes it:
+Then add the consultant to the live registry so the fleet roller includes it (the peer MXID
+exactly as spawn printed it):
 ```bash
-printf 'gawain\t@did-key-…:matrix.inblock.io\tAqua Consultant (Gawain)\n' >> ~/.aqua-matrix-test/consultants.registry
+printf 'gawain\t@<peer-localpart>:matrix.inblock.io\tAqua Consultant (Gawain)\n' >> ~/.aqua-matrix-test/consultants.registry
 ```
 
 ## Relabel / re-point an existing consultant
@@ -99,7 +113,7 @@ id/target/display). Uses `--replace` (rm -f + re-run; DID survives via the persi
 ```bash
 bash ~/spawn-consultant.sh --replace \
   --label zdnaez \
-  --target '@did-key-…:matrix.inblock.io' \
+  --target '@<peer-localpart>:matrix.inblock.io' \
   --display 'Aqua Consultant (Aubert)'
 ```
 
@@ -293,8 +307,11 @@ podman inspect aqua-agent-<label>-aqua-consultant-1 \
 For the generic consultant the container name is plain `aqua-agent-aqua-consultant-1` (no label).
 
 Healthy = `daemon starting (target: <the one peer>)`, `connected store_wiped=false` (for `--replace`),
-and `display name set to "<your display>"`. Then the peer DMs the agent's `@did-key-…:matrix.inblock.io`
-MXID (shown in the onboarding message / derivable from the `agent DID:` log line, lowercased).
+and `display name set to "<your display>"`. The consultant invites the peer itself
+(`initiate_dm`); its own MXID is printed by spawn and by
+`bash ~/spawn-consultant.sh --print-mxid --label <label>` (read from `[session] user_id` in
+`<persist>/store/config.toml`, never derived from the `agent DID:` log line: a new agent's
+localpart is opaque).
 
 ## Related
 

@@ -333,7 +333,10 @@ pub trait MessageHandler: Send + Sync + 'static {
 /// **Why ASCII-case-insensitive is CORRECT.** Our peers' MXID localparts encode
 /// `did:key` / `did:pkh` identifiers whose base58/hex payload is case-significant
 /// at the DID layer, so a configured `target` derived from a mixed-case DID can
-/// carry uppercase letters (e.g. `@did-key-zDnaef1WiYi9AX…`). But Synapse
+/// carry uppercase letters (e.g. `@did-key-zDnaef1WiYi9AX…`). (That is the LEGACY,
+/// pre-2026-09 localpart; accounts created since get an opaque, already-lowercase
+/// base36 localpart from siwx-oidc, for which the fold is a no-op. Nothing here
+/// derives an MXID from a DID: `target` is configured, `sender` is delivered.) But Synapse
 /// **canonicalises every MXID localpart to lowercase**: it is what lands in the
 /// `sender` / `state_key` of every event the relay sees (verified against the
 /// live agents' state stores — every `sender` field is lowercase, including each

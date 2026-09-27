@@ -69,6 +69,23 @@
 #      A config with voice on but no key still launches (loud warning; the agent disables
 #      voice at runtime and logs it).
 #
+# Matrix IDs (2026-09-27): NEVER derive an MXID from a DID by string surgery. siwx-oidc gives
+# every NEW DID an opaque localpart (16 base36 chars, e.g. @1vo8g4vofiha69ua:matrix.inblock.io)
+# and keeps existing accounts on their legacy `did-...` localpart forever, so only the server
+# knows which applies.
+#   - Peer: --target takes the peer's MXID, OR their DID (`did:key:...` / `did:pkh:...`), which
+#     is resolved through siwx-oidc's public `GET /resolve?did=` (grandfathering honoured). If
+#     the lookup is unavailable (e.g. a siwx-oidc older than c5ed83b answers 404) the spawn
+#     FAILS; it never guesses the legacy form. Pass the MXID from the peer's profile instead.
+#   - Agent: a new agent's MXID is unknown until its first login. The script reads it back
+#     from the agent's persisted session (`<persist>/store/config.toml`, [session] user_id, the
+#     whoami answer) and prints THAT; --print-mxid prints it for an existing consultant.
+#   - --siwx-url / --matrix-url point the agent (and the DID lookup) at another deployment,
+#     e.g. dev; unset = the image defaults (prod), with no extra -e flags in the argv.
+#
+# --print-mxid: print the consultant's own MXID from its persisted session and exit (0 = found,
+# 1 = no session yet). Reads only `[session] user_id`; no container, token or target needed.
+#
 # --print-run: assemble everything, print the `podman run` argument vector one arg per line,
 # exit 0. Stops BEFORE any container, systemd unit, DM, --replace removal or --fresh wipe,
 # and implies --no-refresh-refs (presence of every refs repo is still checked). It DOES
@@ -86,13 +103,19 @@
 # Examples:
 #   # new consultant (fresh identity) with a female persona; DM Tim a forward-ready intro:
 #   bash ~/spawn-consultant.sh --label gawain \
-#        --target '@did-key-…:matrix.inblock.io' \
+#        --target '@<peer-localpart>:matrix.inblock.io' \
 #        --persona Talia --name Gawain --onboard
+#
+#   # same, but the peer is known by DID only (resolved via siwx-oidc /resolve, never derived):
+#   bash ~/spawn-consultant.sh --label gawain --target 'did:key:z6Mk…' --persona Talia --name Gawain
+#
+#   # which MXID does an existing consultant have?
+#   bash ~/spawn-consultant.sh --print-mxid --label gawain
 #
 #   # relabel / re-point an EXISTING consultant (DID + memory + bespoke config preserved -
 #   # the render MERGES onto the existing config, overriding target + the persona surface):
 #   bash ~/spawn-consultant.sh --replace --label zdnaez \
-#        --target '@did-key-…:matrix.inblock.io' --persona Coralie --name Aubert
+#        --target '@<peer-localpart>:matrix.inblock.io' --persona Coralie --name Aubert
 #
 #   # image roll (config used VERBATIM, nothing re-rendered), used by roll-consultant-fleet.sh:
 #   bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez
@@ -126,6 +149,9 @@ REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mount
 AVATAR=""             # explicit avatar image path; default = <test-dir>/<key>-avatar.jpg (key = label, or "generic")
 VOICE=""              # --voice on|off: patch voice.enabled in the config; empty = leave the config untouched
 PRINT_RUN=0           # --print-run: print the podman run argument vector and exit 0 before any side effect
+PRINT_MXID=0          # --print-mxid: print the consultant's own MXID from its persisted session, exit
+SIWX_URL_ARG=""       # --siwx-url: siwx-oidc base URL for the agent + DID lookup; empty = image default (prod)
+MATRIX_URL_ARG=""     # --matrix-url: homeserver base URL for the agent; empty = image default (prod)
 # Host state dir: per-instance configs, persist volumes, avatars, and the config template.
 # Overridable so the arg-rendering tests can run in a sandbox without touching live state.
 TEST_DIR="${CONSULTANT_TEST_DIR:-/home/waldknoten-01/.aqua-matrix-test}"
@@ -163,6 +189,9 @@ while [ $# -gt 0 ]; do
     --refresh-prompt) REFRESH_PROMPT=1; shift ;;
     --voice)   VOICE="$2"; shift 2 ;;
     --print-run) PRINT_RUN=1; shift ;;
+    --print-mxid) PRINT_MXID=1; shift ;;
+    --siwx-url) SIWX_URL_ARG="$2"; shift 2 ;;
+    --matrix-url) MATRIX_URL_ARG="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "!! unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -177,6 +206,10 @@ case "$VOICE" in
   ""|on|off) : ;;
   *) echo "!! --voice takes exactly 'on' or 'off' (got '$VOICE')" >&2; exit 2 ;;
 esac
+# The siwx-oidc the DID lookup asks: the one the agent will sign in with. Default = the image's
+# own default (prod). CONSULTANT_SIWX_URL overrides for tests.
+LOOKUP_SIWX_URL="${SIWX_URL_ARG:-${CONSULTANT_SIWX_URL:-https://siwx-oidc.inblock.io}}"
+LOOKUP_SIWX_URL="${LOOKUP_SIWX_URL%/}"
 # --print-run must not fetch/pull anything; presence of the refs repos is still enforced.
 [ "$PRINT_RUN" -eq 1 ] && REFRESH_REFS=0
 
@@ -203,6 +236,34 @@ PERSIST="$TEST_DIR/${STEM}-persist"
 STORE="$PERSIST/store"
 MEM="$PERSIST/memory"
 
+# ---------------------------------------------------------------- agent MXID (read back, never derived)
+# The agent's MXID is whatever siwx-oidc assigned at its first login (opaque for a new DID,
+# legacy for a grandfathered one); the agent persists the whoami answer as [session] user_id
+# in store/config.toml. Only that one key is read: the same file holds live tokens, so it is
+# never printed, copied or grepped wholesale.
+agent_mxid_from_store() {
+  python3 - "$STORE/config.toml" <<'PY'
+import sys, tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        d = tomllib.load(f)
+except (OSError, tomllib.TOMLDecodeError):
+    sys.exit(1)
+u = (d.get("session") or {}).get("user_id") or ""
+if not (u.startswith("@") and ":" in u):
+    sys.exit(1)
+print(u)
+PY
+}
+
+if [ "$PRINT_MXID" -eq 1 ]; then
+  if MXID_NOW="$(agent_mxid_from_store)"; then
+    printf '%s\n' "$MXID_NOW"; exit 0
+  fi
+  echo "!! no persisted session in $STORE/config.toml yet (agent never logged in?)" >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------- resolve id/target/display
 if [ "$KEEP_CONFIG" -eq 1 ]; then
   # Image-roll path: the EXISTING config is authoritative. Derive id/target/display from it
@@ -221,7 +282,7 @@ PY
   [ -n "$DISPLAY_NAME" ] && [ "$DISPLAY_NAME" != "$CFG_DISPLAY" ] && echo "!! warn: --display '$DISPLAY_NAME' != config '$CFG_DISPLAY', using config" >&2
   ID="$CFG_ID"; TARGET="$CFG_TARGET"; DISPLAY_NAME="$CFG_DISPLAY"
 else
-  [ -n "$TARGET" ] || { echo "!! --target is required (peer MXID)" >&2; exit 2; }
+  [ -n "$TARGET" ] || { echo "!! --target is required (peer MXID, or peer DID to resolve)" >&2; exit 2; }
   # Persona-aware: --persona <Name> derives the Matrix display alias "<Name> (Aqua
   # Consultant)" when --display is not given explicitly (--display still overrides).
   if [ -z "$DISPLAY_NAME" ] && [ -n "$PERSONA" ]; then
@@ -238,6 +299,52 @@ fi
 # to the display name as before; in persona mode it stays exactly what --name gave, empty
 # means a pseudonymous peer, which the persona render greets without a name.
 [ -n "$PERSONA" ] || : "${HUMAN_NAME:=$DISPLAY_NAME}"
+
+# ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
+# `--target did:...` is resolved through siwx-oidc's public GET /resolve?did=, which applies
+# the server's own grandfathering rule. Any failure is FATAL: a guessed legacy MXID for a DID
+# that is actually new would bind the consultant to an account that is not the peer's.
+resolve_did_to_mxid() {  # resolve_did_to_mxid <did> -> prints the MXID; diagnostics on stderr
+  python3 - "$LOOKUP_SIWX_URL" "$1" <<'PY'
+import json, sys, urllib.error, urllib.parse, urllib.request
+base, did = sys.argv[1], sys.argv[2]
+url = f"{base}/resolve?" + urllib.parse.urlencode({"did": did})
+def die(msg):
+    print(f"!! cannot resolve {did} via {url}: {msg}", file=sys.stderr)
+    print("   NOT falling back to the legacy did-... form (a new DID gets an opaque MXID).", file=sys.stderr)
+    print("   Pass the peer's MXID directly (--target '@localpart:server', from their profile).", file=sys.stderr)
+    sys.exit(1)
+try:
+    with urllib.request.urlopen(url, timeout=20) as r:
+        body = json.load(r)
+except urllib.error.HTTPError as e:
+    if e.code == 404:
+        die("HTTP 404, this siwx-oidc has no /resolve route (older than c5ed83b)")
+    try:
+        detail = json.load(e).get("message", "")
+    except Exception:
+        detail = ""
+    die(f"HTTP {e.code} {detail}".strip())
+except Exception as e:
+    die(f"{type(e).__name__}: {e}")
+mxid = body.get("mxid") if isinstance(body, dict) else None
+if not (isinstance(mxid, str) and mxid.startswith("@") and ":" in mxid):
+    die(f"no mxid in the answer: {body!r}")
+if not body.get("exists"):
+    print(f"!! warn: {did} has NO account yet; {mxid} is the MXID siwx-oidc will assign on their "
+          "first sign-in. The consultant cannot invite them until then.", file=sys.stderr)
+print(f">> --target {did} resolved via {base}/resolve -> {mxid} "
+      f"(exists={str(bool(body.get('exists'))).lower()}, attested={str(bool(body.get('attested'))).lower()})",
+      file=sys.stderr)
+print(mxid)
+PY
+}
+case "$TARGET" in
+  did:*)
+    PEER_DID="$TARGET"
+    TARGET="$(resolve_did_to_mxid "$PEER_DID")" || { echo "!! aborting: peer DID could not be resolved" >&2; exit 1; }
+    ;;
+esac
 
 # GUARD: refuse a misbound instance. Anchored to the template sentinel (not an uppercase
 # substring blocklist) so legit human localparts are never false-rejected.
@@ -426,17 +533,6 @@ EOF
   fi
 }
 
-# ---------------------------------------------------------------- derive agent MXID
-# The agent's Matrix localpart is `did-key-<multibase>` lowercased (Synapse lowercases
-# localparts). We read the self-minted DID from the container logs and derive the MXID
-# the peer must DM. Verified against zdnaez: did:key:z6MkswJK… → @did-key-z6mkswjk…
-agent_mxid_from_logs() {
-  local did
-  did="$(podman logs "$NAME" 2>&1 | grep -oE 'agent DID: did:key:[1-9A-HJ-NP-Za-km-z]+' | tail -n1 | sed 's/^agent DID: did:key://')"
-  [ -n "$did" ] || return 1
-  printf '@did-key-%s:matrix.inblock.io' "$(printf '%s' "$did" | tr '[:upper:]' '[:lower:]')"
-}
-
 # ---------------------------------------------------------------- render config
 mkdir -p "$STORE" "$MEM"
 if [ "$KEEP_CONFIG" -eq 1 ]; then
@@ -528,6 +624,11 @@ then
   echo "!! voice: enabled in config but DEEPGRAM_API_KEY is not available (no readable $DEEPGRAM_ENV_FILE?); launching anyway, the agent will disable voice at runtime" >&2
 fi
 
+# Deployment URLs, only when overridden, so the fleet's argv is unchanged. Not secrets.
+URL_ENV_ARGS=()
+[ -n "$SIWX_URL_ARG" ] && URL_ENV_ARGS+=( -e "SIWX_URL=$SIWX_URL_ARG" )
+[ -n "$MATRIX_URL_ARG" ] && URL_ENV_ARGS+=( -e "MATRIX_URL=$MATRIX_URL_ARG" )
+
 # ---------------------------------------------------------------- assemble the run
 # ONE argument vector feeds both --print-run and the real `podman run`, so what is printed
 # is exactly what runs. Secrets are bare `-e NAME` (inherited), never `-e NAME=value`. The
@@ -541,6 +642,7 @@ RUN_ARGS=( \
   --tmpfs /tmp \
   -e AGENT_TARGET="$TARGET" \
   -e AGENT_CONFIG_FILE=/agent/config.json \
+  "${URL_ENV_ARGS[@]}" \
   -e CLAUDE_CODE_OAUTH_TOKEN \
   "${DEEPGRAM_ENV_ARGS[@]}" \
   -v "$CFG:/agent/config.json:ro" \
@@ -609,17 +711,26 @@ notify -s INFO -t "channel up: $NAME" \
 
 ensure_activity_watch || true
 
+# ---------------------------------------------------------------- read back the agent's MXID
+# A preserved identity already has a session; a fresh one gets it on first login, so wait
+# (bounded) for the agent to persist it. Never derived from the DID.
+if [ "$GENERIC" -eq 1 ]; then MXID_SEL="--generic"; else MXID_SEL="--label $LABEL"; fi
+MXID=""
+for _ in $(seq 1 60); do
+  if MXID="$(agent_mxid_from_store)" && [ -n "$MXID" ]; then break; fi
+  MXID=""
+  sleep 2
+done
+if [ -n "$MXID" ]; then
+  echo ">> agent MXID (from its persisted session): $MXID"
+else
+  echo "!! agent has not completed its first login within 120s; its MXID is not known yet." >&2
+  echo "   read it later with: bash ~/spawn-consultant.sh --print-mxid $MXID_SEL" >&2
+fi
+
 # ---------------------------------------------------------------- onboarding DM
 if [ "$ONBOARD" -eq 1 ]; then
-  echo ">> --onboard: waiting for agent to self-mint its DID (for the forward-ready MXID)…"
-  MXID=""
-  for _ in $(seq 1 60); do
-    if MXID="$(agent_mxid_from_logs)" && [ -n "$MXID" ]; then break; fi
-    MXID=""
-    sleep 2
-  done
   if [ -n "$MXID" ]; then
-    echo ">> agent MXID: $MXID"
     onboard_hi="${HUMAN_NAME:-there}"
     onboard_for="${HUMAN_NAME:-them}"
     if [ -n "$PERSONA" ]; then
@@ -656,9 +767,9 @@ EOF
     notify -s INFO -t "onboarding: ${HUMAN_NAME:-$PERSONA} (${NAME})" "$ONBOARD_MSG"
     echo ">> onboarding message DM'd to Tim (forward-ready, carries $MXID)"
   else
-    echo "!! could not read agent MXID from logs within timeout, onboarding DM skipped." >&2
+    echo "!! could not read the agent's MXID from its session within the timeout, onboarding DM skipped." >&2
     notify -s WARN -t "onboarding pending: ${NAME}" \
-      "Spawned '${NAME}' for ${HUMAN_NAME} but could not read its self-minted MXID from logs yet. Re-derive with: podman logs ${NAME} | grep 'agent DID'"
+      "Spawned '${NAME}' for ${HUMAN_NAME} but its first login has not completed yet, so its MXID is unknown. Read it with: bash ~/spawn-consultant.sh --print-mxid ${MXID_SEL}"
   fi
 fi
 
@@ -666,4 +777,8 @@ echo
 echo ">> container started: $CID_SHORT"
 echo ">> done. verify with:"
 echo "   podman logs -f $NAME    # watch it connect + self-mint its DID + set display name"
-echo "   # then have the peer DM the agent's @did-key-…:matrix.inblock.io MXID (shown above / in the logs)"
+if [ -n "$MXID" ]; then
+  echo "   # the consultant invites the peer itself; its MXID is $MXID"
+else
+  echo "   # its MXID, once logged in:  bash ~/spawn-consultant.sh --print-mxid $MXID_SEL"
+fi

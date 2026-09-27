@@ -11,6 +11,8 @@
 #             (aqua-agent-aqua-consultant-1) and rolls via --generic instead of --label.
 # - target  : the peer MXID this consultant answers (doc-only here; the roll uses
 #             --keep-config and reads the authoritative target from the on-disk config).
+#             Pre-2026-09 accounts have legacy `did-key-…` / `did-pkh-…` localparts; NEW ones
+#             are opaque (16 base36 chars). Copy the MXID spawn printed, never derive one.
 # - display : human label, documentation only.
 # Lines that are blank or whose first non-whitespace char is '#' are ignored.
 #
@@ -24,3 +26,4 @@ zdnaef	@did-key-zDnaef...:matrix.inblock.io	Aqua Consultant (zDnaef…)
 zdnaez	@did-key-zdnaezp...:matrix.inblock.io	Aqua Consultant (Aubert)
 gawain	@did-key-zdnaenq...:matrix.inblock.io	Aqua Consultant (Gawain)
 generic	@did-pkh-eip155-1-0x...:matrix.inblock.io	Aqua Consultant (operator's own, un-labeled)
+newpeer	@0a1b2c3d4e5f6g7h:matrix.inblock.io	Aqua Consultant (a post-2026-09 peer, opaque MXID)

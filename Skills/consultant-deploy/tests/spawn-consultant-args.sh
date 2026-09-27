@@ -19,6 +19,11 @@
 #   - REFS_REPOS lists inblockio.github.io and the argv mounts it :ro (all six refs :ro)
 #   - model pin: the template carries model, a fresh render inherits it, a persona re-render and
 #     --refresh-prompt keep an existing config's model and never inject one
+#   - MXID resolution (case H): --target did:... resolves through a mock siwx-oidc /resolve
+#     (opaque answer used verbatim; no-account warning; 404 old server, 502 and a dead port all
+#     FAIL with no legacy-form fallback), --siwx-url/--matrix-url reach the argv only when set,
+#     --print-mxid reads [session] user_id and nothing else, and the script holds no DID->MXID
+#     string derivation
 #   - the podman/systemctl shims were never called
 #
 # Usage:  bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
@@ -247,6 +252,105 @@ echo "== case F: --generic"
 rc=0; run f --generic --target "$TARGET" --persona Sabrina --name Operator || rc=$?
 check "exit 0" [ "$rc" -eq 0 ]
 check "generic container name" argv_has_line f "aqua-agent-aqua-consultant-1"
+
+echo "== case H: MXID resolution (never derived)"
+MOCK_PORT_FILE="$SB/mock.port"
+python3 - "$MOCK_PORT_FILE" > "$SB/mock.log" 2>&1 <<'MOCK' &
+import json, sys, urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+ANSWERS = {
+    "did:key:zNewPeer": {"did": "did:key:zNewPeer", "mxid": "@0a1b2c3d4e5f6g7h:matrix.inblock.io",
+                         "exists": True, "attested": True},
+    "did:key:zNoAccount": {"did": "did:key:zNoAccount", "mxid": "@hhhhhhhhhhhhhhhh:matrix.inblock.io",
+                           "exists": False, "attested": False},
+}
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def send(self, code, body):
+        b = json.dumps(body).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        did = urllib.parse.parse_qs(u.query).get("did", [""])[0]
+        if u.path == "/resolve" and did in ANSWERS:
+            self.send(200, ANSWERS[did])
+        elif u.path == "/resolve":
+            self.send(502, {"error": "upstream_error", "message": "homeserver unreachable"})
+        else:
+            self.send(404, {"error": "not_found"})
+srv = HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(srv.server_address[1]))
+srv.serve_forever()
+MOCK
+MOCK_PID=$!
+trap 'kill "$MOCK_PID" 2>/dev/null; rm -rf "$SB"' EXIT
+for _ in $(seq 1 50); do [ -s "$MOCK_PORT_FILE" ] && break; sleep 0.1; done
+MOCK="http://127.0.0.1:$(cat "$MOCK_PORT_FILE")"
+OPAQUE='@0a1b2c3d4e5f6g7h:matrix.inblock.io'
+cfg_target() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["target"])' "$TEST_DIR/$1-aqua-consultant-config.json"; }
+
+RUN_ENV=( CONSULTANT_SIWX_URL="$MOCK" )
+rc=0; run h1 --label gamma --target 'did:key:zNewPeer' --persona Thalia --name Tester || rc=$?
+check "DID target: exit 0" [ "$rc" -eq 0 ]
+check "DID target: AGENT_TARGET is the server's opaque answer" argv_has_line h1 "AGENT_TARGET=$OPAQUE"
+check "DID target: config target is the server's opaque answer" [ "$(cfg_target gamma)" = "$OPAQUE" ]
+check "DID target: resolution reported on stderr" grep -qF "resolved via $MOCK/resolve -> $OPAQUE" "$SB/out/h1.err"
+check "DID target: the legacy form appears nowhere" bash -c '! grep -rqi "did-key-znewpeer" "$1" "$2"' _ "$SB/out" "$TEST_DIR"
+
+rc=0; run h2 --label delta --target 'did:key:zNoAccount' --persona Thalia || rc=$?
+check "DID with no account: exit 0" [ "$rc" -eq 0 ]
+check "DID with no account: loud warning" grep -qF "has NO account yet" "$SB/out/h2.err"
+check "DID with no account: uses the server's answer" argv_has_line h2 "AGENT_TARGET=@hhhhhhhhhhhhhhhh:matrix.inblock.io"
+
+RUN_ENV=( CONSULTANT_SIWX_URL="$MOCK/old-server" )
+rc=0; run h3 --label epsilon --target 'did:key:zNewPeer' --persona Thalia || rc=$?
+check "404 (siwx-oidc without /resolve): refused" [ "$rc" -ne 0 ]
+check "404: names the missing route" grep -qF "no /resolve route" "$SB/out/h3.err"
+check "404: says it will not fall back" grep -qF "NOT falling back" "$SB/out/h3.err"
+check "404: no argv rendered" [ ! -s "$SB/out/h3.argv" ]
+check "404: no config rendered" [ ! -e "$TEST_DIR/epsilon-aqua-consultant-config.json" ]
+
+RUN_ENV=( CONSULTANT_SIWX_URL="$MOCK" )
+rc=0; run h4 --label epsilon --target 'did:key:zUnknownUpstream' --persona Thalia || rc=$?
+check "502 from the lookup: refused" [ "$rc" -ne 0 ]
+check "502: reported" grep -qF "HTTP 502 homeserver unreachable" "$SB/out/h4.err"
+
+RUN_ENV=( CONSULTANT_SIWX_URL="http://127.0.0.1:9" )
+rc=0; run h5 --label epsilon --target 'did:pkh:eip155:1:0x4b23da593596d94035c57adf6c2454216449b1b2' --persona Thalia || rc=$?
+check "lookup down: refused" [ "$rc" -ne 0 ]
+check "lookup down: no legacy did-pkh guess anywhere" bash -c '! grep -rq "@did-pkh-eip155-1-0x4b23" "$1"' _ "$SB/out/h5.argv"
+
+RUN_ENV=()
+rc=0; run h6 --label gamma --target "$TARGET" --persona Thalia --siwx-url "$MOCK" --matrix-url https://dev.matrix.example || rc=$?
+check "--siwx-url/--matrix-url: exit 0" [ "$rc" -eq 0 ]
+check "--siwx-url reaches the argv" argv_has_line h6 "SIWX_URL=$MOCK"
+check "--matrix-url reaches the argv" argv_has_line h6 "MATRIX_URL=https://dev.matrix.example"
+check "no URL overrides in the default argv" bash -c '! grep -qE "^(SIWX|MATRIX)_URL=" "$1"' _ "$SB/out/a.argv"
+
+mkdir -p "$TEST_DIR/zeta-aqua-consultant-persist/store"
+cat > "$TEST_DIR/zeta-aqua-consultant-persist/store/config.toml" <<'TOML'
+[oidc]
+client_id = "client-FAKE-SECRET-1"
+redirect_uri = "http://localhost:0/callback"
+
+[session]
+access_token = "mat_FAKE-SECRET-2"
+user_id = "@0a1b2c3d4e5f6g7h:dev.matrix.inblock.io"
+device_id = "AQUA_x"
+expires_at_unix = 1
+refresh_token = "mcr_FAKE-SECRET-3"
+did = "did:key:z6MkFake"
+TOML
+rc=0; run h7 --print-mxid --label zeta || rc=$?
+check "--print-mxid: exit 0" [ "$rc" -eq 0 ]
+check "--print-mxid: prints exactly the session user_id" [ "$(cat "$SB/out/h7.out")" = "@0a1b2c3d4e5f6g7h:dev.matrix.inblock.io" ]
+check "--print-mxid: no token material on stdout/stderr" bash -c '! grep -q "FAKE-SECRET" "$1" "$2"' _ "$SB/out/h7.out" "$SB/out/h7.err"
+rc=0; run h8 --print-mxid --label nosession || rc=$?
+check "--print-mxid with no session: exit 1" [ "$rc" -eq 1 ]
+
+check "spawn-consultant.sh holds no DID->MXID string derivation" \
+  bash -c '! grep -nE "did-key-%s|did-pkh-%s|tr .\[:upper:\]. .\[:lower:\].|tr .:. .-." "$1"' _ "$SPAWN"
 
 echo "== side effects"
 check "podman/systemctl shims were never called" [ ! -e "$SIDE_EFFECTS" ]
