@@ -11,6 +11,7 @@ pub mod net_retry;
 mod recovery;
 mod registry;
 mod rtc_keys;
+mod rtc_member;
 
 pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
@@ -21,6 +22,7 @@ pub use net_retry::{
 pub use rtc_keys::{
     CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };
+pub use rtc_member::{RtcMemberTiming, RtcMembership};
 
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::{
