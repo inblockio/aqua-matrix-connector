@@ -445,6 +445,34 @@ fn wipe_crypto_store(store_dir: &Path) {
     }
 }
 
+/// Mint a fresh access token for this agent's pinned device (refresh grant,
+/// else fresh `did:key` auth, persisted to `config.toml`) WITHOUT building a
+/// matrix-sdk [`Client`]. This is the token half of `reauth_inner`, used alone
+/// by callers that talk to the homeserver over plain REST and must never open
+/// the SQLite crypto store (the RTC membership keeper, `rtc_member.rs`).
+///
+/// Returns `(access_token, user_id, device_id, expires_at_unix)`.
+pub(crate) async fn mint_session_token(
+    config: &AgentConfig,
+) -> Result<(String, String, String, u64)> {
+    let key = SiwxKey::from_pem_file(&config.key_file).context("reauth: failed to load key")?;
+    let config_path = config.store_dir.join("config.toml");
+    let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
+    let (client_id, redirect_uri) =
+        resolve_oidc_client(config, &mut config_file, &config_path).await?;
+    acquire_session(
+        config,
+        &key,
+        &client_id,
+        &redirect_uri,
+        &mut config_file,
+        &config_path,
+        true,
+    )
+    .await
+    .context("reauth: could not acquire a fresh session")
+}
+
 async fn build_and_restore(
     matrix_url: &str,
     store_dir: &Path,
@@ -1259,24 +1287,8 @@ impl AgentClient {
     /// sync on the same device, which would race to-device (Megolm key) delivery
     /// against the other client and silently drop room keys (H9 single-sync).
     async fn reauth_inner(&mut self, sync_after: bool) -> Result<()> {
-        let key =
-            SiwxKey::from_pem_file(&self.config.key_file).context("reauth: failed to load key")?;
-        let config_path = self.config.store_dir.join("config.toml");
-        let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
-        let (client_id, redirect_uri) =
-            resolve_oidc_client(&self.config, &mut config_file, &config_path).await?;
-
-        let (access_token, user_id_str, device_id_str, expires_at_unix) = acquire_session(
-            &self.config,
-            &key,
-            &client_id,
-            &redirect_uri,
-            &mut config_file,
-            &config_path,
-            true,
-        )
-        .await
-        .context("reauth: could not acquire a fresh session")?;
+        let (access_token, user_id_str, device_id_str, expires_at_unix) =
+            mint_session_token(&self.config).await?;
 
         let user_id: OwnedUserId = user_id_str
             .try_into()

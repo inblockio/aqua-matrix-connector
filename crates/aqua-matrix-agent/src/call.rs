@@ -119,14 +119,7 @@ impl AgentClient {
         let device_id = self
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot set RTC membership"))?;
-        // member_id = `{device_id}_m.call` (device + application), per the
-        // deployed Element Call. ruma renders the key as `_{user}_{member_id}`.
-        let member_id = format!("{device_id}_m.call");
-        Ok(CallMemberStateKey::new(
-            user_id,
-            Some(member_id),
-            underscore,
-        ))
+        Ok(rtc_member_state_key_for(user_id, &device_id, underscore))
     }
 
     /// Publish this agent's **MatrixRTC membership** (`org.matrix.msc3401.call.member`)
@@ -299,6 +292,19 @@ impl AgentClient {
         }
         Ok(None)
     }
+}
+
+/// The call-member state key for `user_id` + `device_id` (see
+/// [`AgentClient::rtc_member_state_key`] for the format and the MSC3757
+/// leading-underscore rule).
+pub(crate) fn rtc_member_state_key_for(
+    user_id: OwnedUserId,
+    device_id: &str,
+    underscore: bool,
+) -> CallMemberStateKey {
+    // member_id = `{device_id}_m.call` (device + application), per the
+    // deployed Element Call. ruma renders the key as `_{user}_{member_id}`.
+    CallMemberStateKey::new(user_id, Some(format!("{device_id}_m.call")), underscore)
 }
 
 /// The `org.matrix.msc3401.call.member` content this agent publishes: a

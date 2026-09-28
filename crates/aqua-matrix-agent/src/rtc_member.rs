@@ -48,33 +48,44 @@
 //! the monotonic [`tokio::time::Instant`], so a skewed host clock (WSL) cannot
 //! shorten or lengthen the membership.
 //!
-//! ## Tokens
+//! ## Tokens, and why there is no matrix-sdk `Client` here
 //!
-//! siwx-oidc access tokens live ~5 min and this keeper runs for hours on its
-//! own clone of the [`AgentClient`]. Before every request it rotates the token
-//! in place when it is near expiry ([`AgentClient::reauth_token_only`], the
-//! same no-sync rotation the Scribe's in-call poll client uses), and it retries
-//! once after an `M_UNKNOWN_TOKEN`. It never syncs, so it cannot consume
-//! to-device messages or touch the Olm account.
+//! siwx-oidc access tokens live ~5 min and this keeper runs for hours. It
+//! must NOT hold or build a matrix-sdk `Client`: every `Client` this crate
+//! builds opens its own OlmMachine over the agent's shared SQLite crypto
+//! store, and two OlmMachines on one store is the 2026-09-15/27 one-time-key
+//! collision (the Scribe went one-way Olm-deaf). So the keeper copies the
+//! caller's current access token into a token-only [`RestSession`] and sends
+//! plain ruma requests over reqwest; nothing it sends needs E2EE. Before
+//! every request it rotates that token when near expiry with
+//! [`mint_session_token`](crate::mint_session_token) (siwx-oidc refresh grant,
+//! persisted to `config.toml`, no `Client`), and it retries once after an
+//! `M_UNKNOWN_TOKEN`. It never syncs and never touches the Olm account.
 
 use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use std::borrow::Cow;
+
+use matrix_sdk::ruma::api::auth_scheme::{AuthScheme, SendAccessToken};
 use matrix_sdk::ruma::api::client::delayed_events::{
     delayed_state_event, update_delayed_event, DelayParameters,
 };
 use matrix_sdk::ruma::api::client::room::get_room_event;
-use matrix_sdk::ruma::api::client::state::get_state_event_for_key;
-use matrix_sdk::ruma::api::error::ErrorKind;
+use matrix_sdk::ruma::api::client::state::{get_state_event_for_key, send_state_event};
+use matrix_sdk::ruma::api::error::{Error as RumaApiError, ErrorKind, FromHttpResponseError};
+use matrix_sdk::ruma::api::path_builder::VersionHistory;
+use matrix_sdk::ruma::api::{IncomingResponse, MatrixVersion, OutgoingRequest, SupportedVersions};
 use matrix_sdk::ruma::events::call::member::{CallMemberEventContent, CallMemberStateKey};
 use matrix_sdk::ruma::events::StateEventType;
-use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, UInt};
+use matrix_sdk::ruma::exports::http;
+use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, UInt};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::call::rtc_member_content;
-use crate::{AgentClient, TOKEN_REFRESH_MARGIN};
+use crate::call::{rtc_member_content, rtc_member_state_key_for};
+use crate::{mint_session_token, unix_now, AgentClient, AgentConfig, TOKEN_REFRESH_MARGIN};
 
 /// Timings for [`AgentClient::hold_rtc_member`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,7 +660,10 @@ impl AgentClient {
     /// re-published as a new membership. See the module docs for the
     /// matrix-js-sdk behaviour this mirrors.
     ///
-    /// Runs on its own clone of this client and rotates that clone's token
+    /// The keeper does NOT use this client after the call returns: it copies
+    /// the current access token and runs on its own token-only REST session
+    /// ([`RestSession`]), never a matrix-sdk `Client`, so it cannot open a
+    /// second OlmMachine on the shared crypto store. It rotates that token
     /// itself, so the caller's client may go stale meanwhile.
     pub async fn hold_rtc_member(
         &self,
@@ -658,10 +672,178 @@ impl AgentClient {
         livekit_service_url: &str,
         timing: RtcMemberTiming,
     ) -> Result<RtcMembership> {
-        let transport =
-            LiveTransport::new(self.clone(), room_id, livekit_alias, livekit_service_url)?;
-        let keeper = Keeper::start(transport, timing, room_id.to_owned()).await?;
-        Ok(RtcMembership::spawn(keeper))
+        let session = RestSession::from_agent(self)?;
+        hold_with_session(session, room_id, livekit_alias, livekit_service_url, timing).await
+    }
+}
+
+/// [`AgentClient::hold_rtc_member`] on an explicit [`RestSession`] (the seam
+/// the socket-level test drives).
+pub(crate) async fn hold_with_session(
+    session: RestSession,
+    room_id: &str,
+    livekit_alias: &str,
+    livekit_service_url: &str,
+    timing: RtcMemberTiming,
+) -> Result<RtcMembership> {
+    let transport = LiveTransport::new(session, room_id, livekit_alias, livekit_service_url)?;
+    let keeper = Keeper::start(transport, timing, room_id.to_owned()).await?;
+    Ok(RtcMembership::spawn(keeper))
+}
+
+// ---------------------------------------------------------------------------
+// Token-only REST session (no matrix-sdk Client, no crypto store)
+// ---------------------------------------------------------------------------
+
+/// Per-request timeout of the keeper's HTTP client. Shorter than
+/// [`LEAVE_TIMEOUT`] so a hung request cannot eat the whole hang-up budget,
+/// and long enough for a slow homeserver.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The keeper's own homeserver session: a bearer token plus a plain HTTP
+/// client.
+///
+/// Deliberately NOT a matrix-sdk `Client`. Every `Client` this crate builds
+/// (`build_and_restore`) opens its own OlmMachine over the agent's shared
+/// SQLite crypto store, and two live OlmMachines on one store is how the
+/// Scribe went one-way Olm-deaf (2026-09-15, root-caused 2026-09-27: two
+/// in-memory Olm accounts minted different one-time keys under one id).
+/// `AgentClient::reauth_token_only` builds exactly such a `Client` on every
+/// rotation, and this keeper rotates for the whole length of a call. Nothing
+/// it sends needs E2EE (state events, `/event`, `/state`, and the MSC4140
+/// delayed-event endpoints are plain authenticated REST), so it mints tokens
+/// with [`mint_session_token`] (siwx-oidc only, no `Client`) and sends ruma
+/// requests over reqwest. It never syncs, so it cannot consume to-device
+/// messages either.
+pub(crate) struct RestSession {
+    http: reqwest::Client,
+    /// Homeserver base URL without a trailing slash.
+    homeserver: String,
+    access_token: String,
+    expires_at_unix: u64,
+    user_id: OwnedUserId,
+    device_id: String,
+    /// What [`mint_session_token`] needs (key file, siwx-oidc, `config.toml`).
+    config: AgentConfig,
+}
+
+impl RestSession {
+    /// Snapshot `agent`'s current token and identity.
+    fn from_agent(agent: &AgentClient) -> Result<Self> {
+        let access_token = agent
+            .client()
+            .access_token()
+            .ok_or_else(|| anyhow!("agent has no access token; cannot set RTC membership"))?;
+        let device_id = agent
+            .device_id()
+            .ok_or_else(|| anyhow!("agent has no device_id; cannot set RTC membership"))?;
+        Self::new(
+            agent.config.clone(),
+            access_token,
+            agent.expires_at_unix,
+            agent.user_id.clone(),
+            device_id,
+        )
+    }
+
+    pub(crate) fn new(
+        config: AgentConfig,
+        access_token: String,
+        expires_at_unix: u64,
+        user_id: OwnedUserId,
+        device_id: String,
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .context("failed to build the RTC membership HTTP client")?;
+        Ok(Self {
+            http,
+            homeserver: config.matrix_url.trim_end_matches('/').to_owned(),
+            access_token,
+            expires_at_unix,
+            user_id,
+            device_id,
+            config,
+        })
+    }
+
+    fn needs_rotation(&self) -> bool {
+        self.expires_at_unix.saturating_sub(unix_now()) < TOKEN_REFRESH_MARGIN
+    }
+
+    /// Mint a fresh token for the SAME user and device. A token for another
+    /// device is refused: the membership names this device, and switching
+    /// devices mid-call is the caller's decision, not the keeper's.
+    async fn rotate(&mut self) -> Result<()> {
+        let (token, user_id, device_id, expires_at_unix) = mint_session_token(&self.config).await?;
+        if user_id != self.user_id.as_str() || device_id != self.device_id {
+            return Err(anyhow!(
+                "token rotation returned {user_id}/{device_id}, expected {}/{}; keeping the old token",
+                self.user_id,
+                self.device_id
+            ));
+        }
+        self.access_token = token;
+        self.expires_at_unix = expires_at_unix;
+        tracing::debug!(
+            valid_for_s = expires_at_unix.saturating_sub(unix_now()),
+            "RTC membership keeper: access token rotated (no client rebuilt)"
+        );
+        Ok(())
+    }
+
+    fn state_key(&self, underscore: bool) -> CallMemberStateKey {
+        rtc_member_state_key_for(self.user_id.clone(), &self.device_id, underscore)
+    }
+
+    /// Send one client-server API request with the current token. The error
+    /// carries whether the server rejected the token.
+    async fn send<R>(&self, request: R) -> std::result::Result<R::IncomingResponse, (bool, OpError)>
+    where
+        R: OutgoingRequest<PathBuilder = VersionHistory, EndpointError = RumaApiError>,
+        for<'a> R::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
+    {
+        let other = |e: anyhow::Error| (false, OpError::Other(e));
+        let versions = SupportedVersions {
+            versions: [MatrixVersion::V1_1].into(),
+            features: Default::default(),
+        };
+        let http_request: http::Request<Vec<u8>> = request
+            .try_into_http_request(
+                &self.homeserver,
+                SendAccessToken::IfRequired(&self.access_token),
+                Cow::Owned(versions),
+            )
+            .map_err(|e| other(anyhow!("build request: {e}")))?;
+        let request = reqwest::Request::try_from(http_request)
+            .map_err(|e| other(anyhow!("convert request: {e}")))?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|e| other(anyhow::Error::new(e).context("homeserver request failed")))?;
+        // reqwest 0.12 and ruma share the `http` 1.x types.
+        let mut builder = http::Response::builder().status(response.status());
+        if let Some(headers) = builder.headers_mut() {
+            *headers = response.headers().clone();
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| other(anyhow::Error::new(e).context("reading response body")))?;
+        let http_response = builder
+            .body(body)
+            .map_err(|e| other(anyhow!("response: {e}")))?;
+        R::IncomingResponse::try_from_http_response(http_response).map_err(|e| match e {
+            FromHttpResponseError::Server(err) => {
+                let kind = err.error_kind();
+                let status = Some(err.status_code.as_u16());
+                let (token, class) = (is_token_rejection(kind, status), classify(kind, status));
+                (token, op_error(class, anyhow::Error::new(err)))
+            }
+            other_err => other(anyhow!("homeserver response: {other_err}")),
+        })
     }
 }
 
@@ -705,31 +887,17 @@ fn op_error(class: ErrClass, err: anyhow::Error) -> OpError {
     }
 }
 
-fn sdk_err(e: matrix_sdk::Error) -> (bool, OpError) {
-    let kind = e.client_api_error_kind();
-    let status = e.as_client_api_error().map(|c| c.status_code.as_u16());
-    let (token, class) = (is_token_rejection(kind, status), classify(kind, status));
-    (token, op_error(class, anyhow::Error::new(e)))
-}
-
-fn http_err(e: matrix_sdk::HttpError) -> (bool, OpError) {
-    let kind = e.client_api_error_kind();
-    let status = e.as_client_api_error().map(|c| c.status_code.as_u16());
-    let (token, class) = (is_token_rejection(kind, status), classify(kind, status));
-    (token, op_error(class, anyhow::Error::new(e)))
-}
-
 /// Run `$op` (an expression using `$s: &mut LiveTransport` that yields
 /// `Result<T, (bool /*token rejected*/, OpError)>`) with a proactive token
-/// rotation before and one reauth-and-retry on a token rejection.
+/// rotation before and one rotate-and-retry on a token rejection.
 macro_rules! with_token {
     ($s:ident, $op:expr) => {{
         $s.ensure_fresh().await;
         match $op {
             Ok(v) => Ok(v),
             Err((true, first)) => {
-                tracing::warn!(error = %first, "RTC membership request rejected (token); re-authenticating");
-                match $s.agent.reauth_token_only().await {
+                tracing::warn!(error = %first, "RTC membership request rejected (token); rotating");
+                match $s.session.rotate().await {
                     Ok(()) => $op.map_err(|(_, e)| e),
                     Err(e) => Err(OpError::Other(e.context("token refresh failed"))),
                 }
@@ -740,9 +908,8 @@ macro_rules! with_token {
 }
 
 pub(crate) struct LiveTransport {
-    agent: AgentClient,
+    session: RestSession,
     room_id: OwnedRoomId,
-    device_id: String,
     alias: String,
     service_url: String,
     /// Owned (MSC3757) or plain key, whichever the first send got accepted.
@@ -750,17 +917,13 @@ pub(crate) struct LiveTransport {
 }
 
 impl LiveTransport {
-    fn new(agent: AgentClient, room_id: &str, alias: &str, service_url: &str) -> Result<Self> {
+    fn new(session: RestSession, room_id: &str, alias: &str, service_url: &str) -> Result<Self> {
         let room_id: OwnedRoomId = room_id
             .try_into()
             .map_err(|e| anyhow!("invalid room_id: {e}"))?;
-        let device_id = agent
-            .device_id()
-            .ok_or_else(|| anyhow!("agent has no device_id; cannot set RTC membership"))?;
         Ok(Self {
-            agent,
+            session,
             room_id,
-            device_id,
             alias: alias.to_owned(),
             service_url: service_url.to_owned(),
             state_key: None,
@@ -768,26 +931,17 @@ impl LiveTransport {
     }
 
     async fn ensure_fresh(&mut self) {
-        if self.agent.token_seconds_left() < TOKEN_REFRESH_MARGIN {
-            if let Err(e) = self.agent.reauth_token_only().await {
+        if self.session.needs_rotation() {
+            if let Err(e) = self.session.rotate().await {
                 tracing::warn!(error = %format!("{e:#}"), "RTC membership keeper: proactive token rotation failed");
             }
         }
     }
 
-    fn room(&self) -> std::result::Result<matrix_sdk::Room, (bool, OpError)> {
-        self.agent
-            .rtc_room(self.room_id.as_str())
-            .map_err(|e| (false, OpError::Other(e)))
-    }
-
-    fn key(&self) -> std::result::Result<CallMemberStateKey, (bool, OpError)> {
+    fn key(&self) -> CallMemberStateKey {
         match &self.state_key {
-            Some(k) => Ok(k.clone()),
-            None => self
-                .agent
-                .rtc_member_state_key(true)
-                .map_err(|e| (false, OpError::Other(e))),
+            Some(k) => k.clone(),
+            None => self.session.state_key(true),
         }
     }
 
@@ -796,11 +950,9 @@ impl LiveTransport {
         key: &CallMemberStateKey,
         content: CallMemberEventContent,
     ) -> std::result::Result<OwnedEventId, (bool, OpError)> {
-        let room = self.room()?;
-        room.send_state_event_for_key(key, content)
-            .await
-            .map(|r| r.event_id)
-            .map_err(sdk_err)
+        let req = send_state_event::v3::Request::new(self.room_id.clone(), key, &content)
+            .map_err(|e| (false, OpError::Other(anyhow!("serialize call.member: {e}"))))?;
+        self.session.send(req).await.map(|r| r.event_id)
     }
 
     async fn send_member_once(
@@ -809,7 +961,7 @@ impl LiveTransport {
         expires: Duration,
     ) -> std::result::Result<OwnedEventId, (bool, OpError)> {
         let content = rtc_member_content(
-            &self.device_id,
+            &self.session.device_id,
             &self.alias,
             &self.service_url,
             created_ts,
@@ -820,7 +972,7 @@ impl LiveTransport {
         }
         // First send: prefer the MSC3757 owned key, fall back to the plain key
         // (same policy as `set_rtc_member`), and remember which one worked.
-        let owned = self.key()?;
+        let owned = self.session.state_key(true);
         match self.put_member(&owned, content.clone()).await {
             Ok(eid) => {
                 tracing::info!(
@@ -833,10 +985,7 @@ impl LiveTransport {
             Err((true, e)) => Err((true, e)),
             Err((false, e)) => {
                 tracing::warn!(error = %e, "owned RTC member state key rejected; retrying unprefixed");
-                let plain = self
-                    .agent
-                    .rtc_member_state_key(false)
-                    .map_err(|e| (false, OpError::Other(e)))?;
+                let plain = self.session.state_key(false);
                 let eid = self.put_member(&plain, content).await?;
                 tracing::info!(
                     state_key = plain.as_ref(),
@@ -853,7 +1002,7 @@ impl LiveTransport {
         event_id: &OwnedEventId,
     ) -> std::result::Result<MilliSecondsSinceUnixEpoch, (bool, OpError)> {
         let req = get_room_event::v3::Request::new(self.room_id.clone(), event_id.clone());
-        let resp = self.agent.client().send(req).await.map_err(http_err)?;
+        let resp = self.session.send(req).await?;
         let ts: Option<UInt> = resp
             .event
             .get_field("origin_server_ts")
@@ -865,22 +1014,19 @@ impl LiveTransport {
     }
 
     async fn member_is_live_once(&self) -> std::result::Result<bool, (bool, OpError)> {
-        let key = self.key()?;
         let req = get_state_event_for_key::v3::Request::new(
             self.room_id.clone(),
             StateEventType::CallMember,
-            key.as_ref().to_owned(),
+            self.key().as_ref().to_owned(),
         );
-        match self.agent.client().send(req).await {
+        match self.session.send(req).await {
             Ok(resp) => {
                 let v: serde_json::Value = serde_json::from_str(resp.event_or_content.get())
                     .map_err(|e| (false, OpError::Other(anyhow!("state JSON: {e}"))))?;
                 Ok(v.as_object().is_some_and(|o| !o.is_empty()))
             }
-            Err(e) => match http_err(e) {
-                (_, OpError::NotFound(_)) => Ok(false),
-                other => Err(other),
-            },
+            Err((_, OpError::NotFound(_))) => Ok(false),
+            Err(other) => Err(other),
         }
     }
 
@@ -888,10 +1034,9 @@ impl LiveTransport {
         &self,
         delay: Duration,
     ) -> std::result::Result<String, (bool, OpError)> {
-        let key = self.key()?;
         let req = delayed_state_event::unstable::Request::new(
             self.room_id.clone(),
-            key.as_ref().to_owned(),
+            self.key().as_ref().to_owned(),
             DelayParameters::Timeout { timeout: delay },
             &CallMemberEventContent::new_empty(None),
         )
@@ -901,12 +1046,7 @@ impl LiveTransport {
                 OpError::Other(anyhow!("serialize delayed leave: {e}")),
             )
         })?;
-        self.agent
-            .client()
-            .send(req)
-            .await
-            .map(|r| r.delay_id)
-            .map_err(http_err)
+        self.session.send(req).await.map(|r| r.delay_id)
     }
 
     async fn update_delayed_once(
@@ -915,16 +1055,11 @@ impl LiveTransport {
         action: update_delayed_event::unstable::UpdateAction,
     ) -> std::result::Result<(), (bool, OpError)> {
         let req = update_delayed_event::unstable::Request::new(delay_id.to_owned(), action);
-        self.agent
-            .client()
-            .send(req)
-            .await
-            .map(|_| ())
-            .map_err(http_err)
+        self.session.send(req).await.map(|_| ())
     }
 
     async fn clear_once(&self) -> std::result::Result<(), (bool, OpError)> {
-        let key = self.key()?;
+        let key = self.key();
         self.put_member(&key, CallMemberEventContent::new_empty(None))
             .await
             .map(|_| ())
@@ -1498,5 +1633,253 @@ mod tests {
         let res = Keeper::start(t, timing(), "!r:example.org".into()).await;
         assert!(res.is_err());
         assert_eq!(count(&state, |c| matches!(c, Call::Schedule { .. })), 0);
+    }
+
+    // ---- live transport over a real socket: no Client, no crypto store -----
+
+    /// One recorded HTTP request: (method, path with query, bearer, body).
+    type Seen = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
+    /// A minimal homeserver on 127.0.0.1 that answers the keeper's endpoints
+    /// and 404s everything else (so token rotation against it fails).
+    async fn fake_homeserver() -> (String, Seen) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let header = |name: &str| {
+                        head.lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+                            })
+                            .unwrap_or_default()
+                    };
+                    let len: usize = header("content-length").parse().unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+                    let mut first = head.lines().next().unwrap_or("").split(' ');
+                    let method = first.next().unwrap_or("").to_owned();
+                    let path = first.next().unwrap_or("").to_owned();
+                    let bearer = header("authorization");
+                    log.lock()
+                        .unwrap()
+                        .push((method.clone(), path.clone(), bearer, body.clone()));
+                    let (status, json) = if method == "PUT"
+                        && path.contains("/state/org.matrix.msc3401.call.member/")
+                    {
+                        if path.contains("org.matrix.msc4140.delay=") {
+                            ("200 OK", r#"{"delay_id":"syd_1"}"#.to_owned())
+                        } else {
+                            ("200 OK", r#"{"event_id":"$join:example.org"}"#.to_owned())
+                        }
+                    } else if method == "GET" && path.contains("/event/") {
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"event_id":"$join:example.org","type":"org.matrix.msc3401.call.member","origin_server_ts":{SERVER_EPOCH_MS},"sender":"@a:example.org","room_id":"!r:example.org","content":{{}}}}"#
+                            ),
+                        )
+                    } else if method == "POST"
+                        && path.contains("/org.matrix.msc4140/delayed_events/")
+                    {
+                        ("200 OK", "{}".to_owned())
+                    } else {
+                        (
+                            "404 Not Found",
+                            r#"{"errcode":"M_UNRECOGNIZED","error":"fake"}"#.to_owned(),
+                        )
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// The gate for the 2026-09-27 OTK incident class: the keeper talks to the
+    /// homeserver over plain REST and, even while it keeps trying to rotate
+    /// its token, never creates or opens the agent's crypto store.
+    #[tokio::test]
+    async fn live_keeper_uses_plain_rest_and_never_opens_the_crypto_store() {
+        let (base, seen) = fake_homeserver().await;
+        let store_dir = std::env::temp_dir().join(format!(
+            "aqua-rtc-member-test-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let key_file = store_dir.join("agent.pem");
+        std::fs::write(
+            &key_file,
+            siwx_oidc_auth::SiwxKey::generate_ed25519()
+                .to_pem()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = AgentConfig {
+            key_file,
+            siwx_url: base.clone(),
+            matrix_url: format!("{base}/"),
+            client_id: None,
+            redirect_uri: None,
+            store_dir: store_dir.clone(),
+            device_id: Some("AQUA_test".into()),
+        };
+        // Near expiry: every request first tries a rotation (which goes to
+        // the fake siwx-oidc and fails), exercising the token path too.
+        let session = RestSession::new(
+            config,
+            "tok0".into(),
+            unix_now() + 5,
+            "@agent:example.org".try_into().unwrap(),
+            "AQUA_test".into(),
+        )
+        .unwrap();
+        let fast = RtcMemberTiming {
+            expiry: Duration::from_secs(4),
+            refresh_every: Duration::from_millis(900),
+            leave_delay: Duration::from_secs(2),
+            leave_restart_every: Duration::from_millis(250),
+            retry_after_error: Duration::from_millis(200),
+        };
+        let m = hold_with_session(
+            session,
+            "!r:example.org",
+            "!r:example.org",
+            "https://lk.example.org",
+            fast,
+        )
+        .await
+        .expect("join over plain REST");
+        assert!(m.has_dead_man_switch());
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        m.leave().await.expect("leave");
+
+        let seen = seen.lock().unwrap().clone();
+        let matrix: Vec<_> = seen
+            .iter()
+            .filter(|(_, p, _, _)| p.starts_with("/_matrix/"))
+            .collect();
+        assert!(
+            matrix.iter().all(|(_, _, b, _)| b == "Bearer tok0"),
+            "every homeserver request carries the session token: {matrix:?}"
+        );
+        let member_puts: Vec<_> = matrix
+            .iter()
+            .filter(|(m, p, _, _)| m == "PUT" && !p.contains("msc4140.delay"))
+            .collect();
+        assert!(member_puts.len() >= 2, "join + refresh: {member_puts:?}");
+        assert!(
+            member_puts[0].1.contains(
+                "/_matrix/client/v3/rooms/!r:example.org/state/org.matrix.msc3401.call.member/_@agent:example.org_AQUA_test_m.call"
+            ),
+            "owned state key on the stable v3 path: {}",
+            member_puts[0].1
+        );
+        assert!(
+            !member_puts[0].3.contains("created_ts"),
+            "join starts a chain"
+        );
+        assert!(
+            member_puts[1]
+                .3
+                .contains(&format!("\"created_ts\":{SERVER_EPOCH_MS}")),
+            "refresh keeps the server created_ts: {}",
+            member_puts[1].3
+        );
+        assert!(matrix.iter().any(|(m, p, _, b)| m == "PUT"
+            && p.contains("org.matrix.msc4140.delay=2000")
+            && b == "{}"));
+        let restarts = matrix
+            .iter()
+            .filter(|(_, p, _, b)| p.contains("/delayed_events/syd_1") && b.contains("restart"))
+            .count();
+        assert!(restarts >= 3, "restarts every 250 ms: {restarts}");
+        let last = matrix.last().unwrap();
+        assert!(
+            last.1.contains("/delayed_events/syd_1") && last.3.contains("\"send\""),
+            "leave sends the delayed leave now: {last:?}"
+        );
+        assert!(
+            seen.iter().any(|(_, p, _, _)| !p.starts_with("/_matrix/")),
+            "rotation was attempted against siwx-oidc"
+        );
+
+        let names: Vec<String> = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = std::fs::remove_dir_all(&store_dir);
+        assert!(
+            names.iter().all(|n| !n.starts_with("matrix-sdk-")),
+            "the membership keeper opened a matrix-sdk store: {names:?}"
+        );
+        assert_eq!(names, vec!["agent.pem".to_owned()], "nothing but the key");
+    }
+
+    /// Source guard: the non-test part of this module must never build a
+    /// matrix-sdk Client or reach the Client-building token rotation, the
+    /// pattern that put two OlmMachines on one crypto store (2026-09-27).
+    #[test]
+    fn keeper_code_never_builds_a_matrix_client() {
+        let src = include_str!("rtc_member.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            // The keeper's own plain HTTP client is the point, not a violation.
+            .replace("reqwest::Client::builder", "");
+        for forbidden in [
+            "build_and_restore",
+            "reauth_token_only",
+            "reauth_inner",
+            "reauth(",
+            "sqlite_store",
+            "Client::builder",
+            "::connect(",
+            "self.clone()",
+            "matrix_sdk::Client",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "rtc_member.rs production code uses `{forbidden}`"
+            );
+        }
+        assert!(code.contains("mint_session_token("));
     }
 }
