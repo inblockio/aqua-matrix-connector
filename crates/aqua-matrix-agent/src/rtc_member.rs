@@ -60,7 +60,10 @@
 //! every request it rotates that token when near expiry with
 //! [`mint_session_token`](crate::mint_session_token) (siwx-oidc refresh grant,
 //! persisted to `config.toml`, no `Client`), and it retries once after an
-//! `M_UNKNOWN_TOKEN`. It never syncs and never touches the Olm account.
+//! `M_UNKNOWN_TOKEN`. It never syncs and never touches the Olm account. A
+//! rotation is bounded in time, never persists a session for another user or
+//! device, and after such a mismatch the keeper stops instead of logging in
+//! afresh.
 
 use std::future::Future;
 use std::time::Duration;
@@ -81,11 +84,16 @@ use matrix_sdk::ruma::events::call::member::{CallMemberEventContent, CallMemberS
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::exports::http;
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, UInt};
-use tokio::sync::oneshot;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::call::{rtc_member_content, rtc_member_state_key_for};
-use crate::{mint_session_token, unix_now, AgentClient, AgentConfig, TOKEN_REFRESH_MARGIN};
+use crate::{
+    mint_session_token, unix_now, AgentClient, AgentConfig, SessionIdentityMismatch,
+    TOKEN_REFRESH_MARGIN,
+};
 
 /// Timings for [`AgentClient::hold_rtc_member`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +240,6 @@ impl Schedule {
     }
 
     /// Until when the currently published membership is valid.
-    #[cfg(test)]
     pub(crate) fn valid_until(&self) -> Duration {
         self.valid_until
     }
@@ -242,8 +249,10 @@ impl Schedule {
         self.next_refresh = now + self.timing.refresh_every;
     }
 
-    pub(crate) fn refresh_failed(&mut self, now: Duration) {
-        self.next_refresh = now + self.timing.retry_after_error;
+    /// A refresh (or rejoin) failed; retry after the back-off, or after the
+    /// server's `retry_after` if that is longer.
+    pub(crate) fn refresh_failed(&mut self, now: Duration, retry_after: Option<Duration>) {
+        self.next_refresh = now + back_off(self.timing.retry_after_error, retry_after);
     }
 
     /// A new chain (fresh `created_ts`) was started at `now`.
@@ -259,19 +268,19 @@ impl Schedule {
         };
     }
 
-    pub(crate) fn leave_arm_failed(&mut self, now: Duration) {
+    pub(crate) fn leave_arm_failed(&mut self, now: Duration, retry_after: Option<Duration>) {
         self.leave = LeaveState::Unarmed {
-            retry_at: now + self.timing.retry_after_error,
+            retry_at: now + back_off(self.timing.retry_after_error, retry_after),
         };
     }
 
-    pub(crate) fn leave_restart_failed(&mut self, now: Duration) {
+    pub(crate) fn leave_restart_failed(&mut self, now: Duration, retry_after: Option<Duration>) {
         let wait = self
             .timing
             .retry_after_error
             .min(self.timing.leave_restart_every);
         self.leave = LeaveState::Armed {
-            next_restart: now + wait,
+            next_restart: now + back_off(wait, retry_after),
         };
     }
 
@@ -289,6 +298,14 @@ impl Schedule {
     }
 }
 
+/// The wait after a failure: our own back-off, or the homeserver's
+/// `retry_after` (429 `M_LIMIT_EXCEEDED`) when that is longer. Honouring it
+/// can push a dead-man restart past `leave_delay`; hammering a rate-limited
+/// server would not get the restart through any sooner.
+fn back_off(ours: Duration, retry_after: Option<Duration>) -> Duration {
+    retry_after.map_or(ours, |r| ours.max(r))
+}
+
 // ---------------------------------------------------------------------------
 // Transport seam (live homeserver vs. test fake)
 // ---------------------------------------------------------------------------
@@ -300,15 +317,48 @@ pub(crate) enum OpError {
     NotFound(anyhow::Error),
     /// The server does not support / allow this (MSC4140 off, delay too large).
     Unsupported(anyhow::Error),
-    /// Anything else (network, 5xx, rate limit, token): retry later.
+    /// 429 / `M_LIMIT_EXCEEDED`: retry, but not before `retry_after`.
+    RateLimited {
+        err: anyhow::Error,
+        retry_after: Option<Duration>,
+    },
+    /// Anything else (network, 5xx, token): retry later.
     Other(anyhow::Error),
 }
 
 impl OpError {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
-            OpError::NotFound(e) | OpError::Unsupported(e) | OpError::Other(e) => e,
+            OpError::NotFound(e)
+            | OpError::Unsupported(e)
+            | OpError::Other(e)
+            | OpError::RateLimited { err: e, .. } => e,
         }
+    }
+
+    fn inner(&self) -> &anyhow::Error {
+        match self {
+            OpError::NotFound(e)
+            | OpError::Unsupported(e)
+            | OpError::Other(e)
+            | OpError::RateLimited { err: e, .. } => e,
+        }
+    }
+
+    /// How long the server asked us to wait, if it did.
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            OpError::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Whether the homeserver answered `M_FORBIDDEN`.
+    fn is_forbidden(&self) -> bool {
+        self.inner()
+            .downcast_ref::<RumaApiError>()
+            .and_then(RumaApiError::error_kind)
+            .is_some_and(|k| matches!(k, ErrorKind::Forbidden))
     }
 }
 
@@ -317,6 +367,9 @@ impl std::fmt::Display for OpError {
         match self {
             OpError::NotFound(e) => write!(f, "not found: {e:#}"),
             OpError::Unsupported(e) => write!(f, "unsupported: {e:#}"),
+            OpError::RateLimited { err, retry_after } => {
+                write!(f, "rate limited (retry after {retry_after:?}): {err:#}")
+            }
             OpError::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -347,11 +400,35 @@ pub(crate) trait MemberTransport: Send + 'static {
     fn send_leave_now(&mut self, delay_id: &str) -> impl Future<Output = OpResult<()>> + Send;
     /// Send the empty `call.member` ourselves (fallback leave).
     fn clear_member(&mut self) -> impl Future<Output = OpResult<()>> + Send;
+    /// Delete a scheduled delayed leave without sending it (hand-over).
+    fn cancel_leave(&mut self, delay_id: &str) -> impl Future<Output = OpResult<()>> + Send;
+    /// A condition under which the keeper must stop instead of retrying
+    /// (the session can no longer be renewed for this identity).
+    fn fatal(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Keeper: drives a transport according to the schedule
 // ---------------------------------------------------------------------------
+
+/// After the first failure of a streak, warn only every this many failures
+/// (debug in between): an hours-long outage retries every 10 s.
+const WARN_EVERY: u32 = 30;
+
+/// What the handle (or a newer hold) asks the keeper to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cmd {
+    /// Keep the membership alive.
+    Hold,
+    /// Leave the call (delayed leave sent now, else clear).
+    Leave,
+    /// A newer hold for the same room and device takes over: cancel our
+    /// delayed leave and stop WITHOUT touching the membership, which the new
+    /// hold is about to (re)publish.
+    HandOver,
+}
 
 pub(crate) struct Keeper<T: MemberTransport> {
     transport: T,
@@ -360,9 +437,15 @@ pub(crate) struct Keeper<T: MemberTransport> {
     /// `origin_server_ts` of the event that started the current chain.
     created_ts: Option<MilliSecondsSinceUnixEpoch>,
     /// The event that started the current chain (to fetch `created_ts` late).
-    chain_event: OwnedEventId,
-    delay_id: Option<String>,
+    /// `None` = no chain on the server we may continue: the next refresh
+    /// must be a rejoin (new `created_ts`), e.g. after a failed rejoin.
+    chain_event: Option<OwnedEventId>,
+    /// The scheduled delayed leave, shared with the hold registry so a newer
+    /// hold can cancel it if this keeper cannot.
+    delay_id: Arc<StdMutex<Option<String>>>,
     room_id: String,
+    /// Consecutive failed operations (log rate limiting).
+    failures: u32,
 }
 
 impl<T: MemberTransport> Keeper<T> {
@@ -370,13 +453,73 @@ impl<T: MemberTransport> Keeper<T> {
         self.origin.elapsed()
     }
 
+    fn delay_id(&self) -> Option<String> {
+        self.delay_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn set_delay_id(&self, id: Option<String>) {
+        *self.delay_id.lock().unwrap_or_else(|p| p.into_inner()) = id;
+    }
+
+    fn take_delay_id(&self) -> Option<String> {
+        self.delay_id
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
+    /// Log a failed operation: the first of a streak and every
+    /// [`WARN_EVERY`]th at warn, the rest at debug.
+    fn failed(&mut self, what: &str, e: &OpError) {
+        self.failures += 1;
+        if self.failures == 1 || self.failures.is_multiple_of(WARN_EVERY) {
+            tracing::warn!(
+                room_id = %self.room_id,
+                error = %e,
+                consecutive_failures = self.failures,
+                "{what} failed; retrying"
+            );
+        } else {
+            tracing::debug!(
+                room_id = %self.room_id,
+                error = %e,
+                consecutive_failures = self.failures,
+                "{what} failed; retrying"
+            );
+        }
+    }
+
+    fn succeeded(&mut self) {
+        if self.failures > 1 {
+            tracing::info!(
+                room_id = %self.room_id,
+                failures = self.failures,
+                "RTC membership keeper recovered"
+            );
+        }
+        self.failures = 0;
+    }
+
     /// Join: publish the membership (hard error if that fails, as with
     /// `set_rtc_member`), anchor `created_ts`, then try to arm the dead-man
     /// switch (soft: the membership works without it).
+    #[cfg(test)]
     pub(crate) async fn start(
+        transport: T,
+        timing: RtcMemberTiming,
+        room_id: String,
+    ) -> Result<Self> {
+        Self::start_shared(transport, timing, room_id, Arc::default()).await
+    }
+
+    async fn start_shared(
         mut transport: T,
         timing: RtcMemberTiming,
         room_id: String,
+        delay_id: Arc<StdMutex<Option<String>>>,
     ) -> Result<Self> {
         timing.validate()?;
         let origin = Instant::now();
@@ -391,22 +534,26 @@ impl<T: MemberTransport> Keeper<T> {
             sched: Schedule::joined(timing, now),
             origin,
             created_ts: None,
-            chain_event,
-            delay_id: None,
+            chain_event: Some(chain_event),
+            delay_id,
             room_id,
+            failures: 0,
         };
         keeper.anchor_created_ts().await;
         keeper.arm_leave().await;
         tracing::info!(
             room_id = %keeper.room_id,
-            dead_man_switch = keeper.delay_id.is_some(),
+            dead_man_switch = keeper.delay_id().is_some(),
             "RTC membership held (refresh before expiry, delayed leave on crash)"
         );
         Ok(keeper)
     }
 
     async fn anchor_created_ts(&mut self) {
-        match self.transport.origin_server_ts(&self.chain_event).await {
+        let Some(event) = self.chain_event.clone() else {
+            return;
+        };
+        match self.transport.origin_server_ts(&event).await {
             Ok(ts) => self.created_ts = Some(ts),
             Err(e) => tracing::warn!(
                 room_id = %self.room_id,
@@ -420,8 +567,9 @@ impl<T: MemberTransport> Keeper<T> {
         let delay = self.sched.timing.leave_delay;
         match self.transport.schedule_leave(delay).await {
             Ok(id) => {
-                self.delay_id = Some(id);
+                self.set_delay_id(Some(id));
                 self.sched.leave_armed(self.now());
+                self.succeeded();
             }
             Err(OpError::Unsupported(e)) => {
                 tracing::info!(
@@ -432,35 +580,51 @@ impl<T: MemberTransport> Keeper<T> {
                 self.sched.leave_disabled();
             }
             Err(e) => {
-                tracing::warn!(room_id = %self.room_id, error = %e, "scheduling the delayed leave failed; retrying");
-                self.sched.leave_arm_failed(self.now());
+                self.failed("scheduling the delayed leave", &e);
+                self.sched.leave_arm_failed(self.now(), e.retry_after());
             }
         }
     }
 
     /// Start a new membership chain (fresh `created_ts`): used when our
-    /// membership was removed while we are still in the call.
+    /// membership was removed, or lapsed, while we are still in the call.
     async fn rejoin(&mut self) {
         let expiry = self.sched.timing.expiry;
+        // Until a rejoin succeeds there is no chain we may continue.
+        self.chain_event = None;
+        self.created_ts = None;
         match self.transport.send_member(None, expiry).await {
             Ok(eid) => {
-                self.chain_event = eid;
-                self.created_ts = None;
+                self.chain_event = Some(eid);
                 self.sched.rejoined(self.now());
+                self.succeeded();
                 self.anchor_created_ts().await;
                 tracing::info!(room_id = %self.room_id, "RTC membership re-published (new membership chain)");
             }
             Err(e) => {
-                tracing::warn!(room_id = %self.room_id, error = %e, "re-publishing RTC membership failed; retrying");
-                // Treat as an overdue refresh: retried after the back-off,
-                // and without an anchor that retry takes this path again.
-                self.created_ts = None;
-                self.sched.refresh_failed(self.now());
+                self.failed("re-publishing RTC membership", &e);
+                // Retried after the back-off as a refresh, which sees no
+                // chain and takes this path again.
+                self.sched.refresh_failed(self.now(), e.retry_after());
             }
         }
     }
 
     async fn refresh(&mut self, expires: Duration) {
+        if self.chain_event.is_none() {
+            self.rejoin().await;
+            return;
+        }
+        // A membership past its expiry is gone for Element, and one re-sent
+        // with its old created_ts would read as "keys already shared".
+        if self.now() >= self.sched.valid_until() {
+            tracing::warn!(
+                room_id = %self.room_id,
+                "RTC membership lapsed before a refresh landed; re-publishing as a new chain"
+            );
+            self.rejoin().await;
+            return;
+        }
         if self.created_ts.is_none() {
             self.anchor_created_ts().await;
         }
@@ -473,6 +637,7 @@ impl<T: MemberTransport> Keeper<T> {
         match self.transport.send_member(Some(created_ts), expires).await {
             Ok(_) => {
                 self.sched.refreshed(self.now(), expires);
+                self.succeeded();
                 tracing::debug!(
                     room_id = %self.room_id,
                     expires_s = expires.as_secs(),
@@ -480,24 +645,27 @@ impl<T: MemberTransport> Keeper<T> {
                 );
             }
             Err(e) => {
-                tracing::warn!(room_id = %self.room_id, error = %e, "RTC membership refresh failed; retrying");
-                self.sched.refresh_failed(self.now());
+                self.failed("RTC membership refresh", &e);
+                self.sched.refresh_failed(self.now(), e.retry_after());
             }
         }
     }
 
     async fn restart_leave(&mut self) {
-        let Some(id) = self.delay_id.clone() else {
+        let Some(id) = self.delay_id() else {
             self.sched.leave_lost(self.now());
             return;
         };
         match self.transport.restart_leave(&id).await {
-            Ok(()) => self.sched.leave_armed(self.now()),
+            Ok(()) => {
+                self.sched.leave_armed(self.now());
+                self.succeeded();
+            }
             Err(OpError::NotFound(_)) => {
                 // The delayed leave is gone: it fired (we were unreachable for
                 // longer than the delay) or the server dropped it. Re-arm
                 // first, then make sure we are still a member.
-                self.delay_id = None;
+                self.set_delay_id(None);
                 let live = self.transport.member_is_live().await;
                 tracing::warn!(
                     room_id = %self.room_id,
@@ -514,8 +682,8 @@ impl<T: MemberTransport> Keeper<T> {
                 }
             }
             Err(e) => {
-                tracing::warn!(room_id = %self.room_id, error = %e, "restarting the delayed leave failed; retrying");
-                self.sched.leave_restart_failed(self.now());
+                self.failed("restarting the delayed leave", &e);
+                self.sched.leave_restart_failed(self.now(), e.retry_after());
             }
         }
     }
@@ -531,10 +699,28 @@ impl<T: MemberTransport> Keeper<T> {
         true
     }
 
+    /// Run every due action, then sleep until the next one. Returns early
+    /// with the reason when the transport reports a fatal condition.
+    async fn tick(&mut self) -> Option<String> {
+        loop {
+            if let Some(fatal) = self.transport.fatal() {
+                return Some(fatal);
+            }
+            if !self.step().await {
+                break;
+            }
+        }
+        if let Some(fatal) = self.transport.fatal() {
+            return Some(fatal);
+        }
+        tokio::time::sleep_until(self.origin + self.sched.next_wake()).await;
+        None
+    }
+
     /// Leave the call: have the server send the delayed leave now, or send
     /// the empty membership ourselves.
     pub(crate) async fn leave(&mut self) -> Result<()> {
-        if let Some(id) = self.delay_id.take() {
+        if let Some(id) = self.take_delay_id() {
             match self.transport.send_leave_now(&id).await {
                 Ok(()) => {
                     tracing::info!(room_id = %self.room_id, "left the call (delayed leave sent now)");
@@ -556,26 +742,178 @@ impl<T: MemberTransport> Keeper<T> {
         Ok(())
     }
 
-    /// Run until `stop` fires (or its sender is dropped), then leave.
-    pub(crate) async fn run(mut self, mut stop: oneshot::Receiver<()>) -> Result<()> {
-        loop {
-            while self.step().await {}
-            let wake = self.origin + self.sched.next_wake();
-            tokio::select! {
-                _ = &mut stop => break,
-                _ = tokio::time::sleep_until(wake) => {}
+    /// Hand the membership over to a newer hold: cancel our delayed leave so
+    /// it cannot remove the new membership, and leave the state event alone.
+    /// A delayed leave we could not cancel stays in the shared slot for the
+    /// new hold to cancel.
+    async fn hand_over(&mut self) {
+        let Some(id) = self.take_delay_id() else {
+            return;
+        };
+        match self.transport.cancel_leave(&id).await {
+            Ok(()) | Err(OpError::NotFound(_)) => tracing::info!(
+                room_id = %self.room_id,
+                "RTC membership handed over to a new hold (delayed leave cancelled)"
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    room_id = %self.room_id,
+                    error = %e,
+                    "cancelling our delayed leave for the hand-over failed; the new hold retries"
+                );
+                self.set_delay_id(Some(id));
             }
         }
-        self.leave().await
+    }
+
+    /// Run until told to leave or hand over (a dropped sender counts as
+    /// leave). The command preempts any in-flight request, so a hung
+    /// homeserver or token endpoint can never keep a leave from starting.
+    pub(crate) async fn run(mut self, mut cmd: watch::Receiver<Cmd>) -> Result<()> {
+        let mut fatal = None;
+        let why = loop {
+            let current = *cmd.borrow_and_update();
+            if current != Cmd::Hold {
+                break current;
+            }
+            tokio::select! {
+                biased;
+                changed = cmd.changed() => {
+                    if changed.is_err() {
+                        break Cmd::Leave;
+                    }
+                }
+                stop = self.tick() => {
+                    if let Some(reason) = stop {
+                        fatal = Some(reason);
+                        break Cmd::Leave;
+                    }
+                }
+            }
+        };
+        if why == Cmd::HandOver {
+            self.hand_over().await;
+            return Ok(());
+        }
+        let left = self.leave().await;
+        match fatal {
+            Some(reason) => {
+                tracing::error!(
+                    room_id = %self.room_id,
+                    reason = %reason,
+                    left = left.is_ok(),
+                    "RTC membership keeper stopped: its session can no longer be renewed"
+                );
+                Err(anyhow!("RTC membership keeper stopped: {reason}"))
+            }
+            None => left,
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Public handle
+// Public handle, and one keeper per (room, user, device)
 // ---------------------------------------------------------------------------
 
-/// How long [`RtcMembership::leave`] waits for the leave request(s).
+/// How long [`RtcMembership::leave`] waits for the leave request(s), and how
+/// long a new hold waits for the previous keeper of the same membership.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ask the keeper to leave or hand over, unless it was already told to.
+fn request(cmd: &watch::Sender<Cmd>, to: Cmd) {
+    cmd.send_if_modified(|c| {
+        if *c == Cmd::Hold {
+            *c = to;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// The registry's view of a running keeper.
+struct Slot {
+    cmd: Arc<watch::Sender<Cmd>>,
+    /// Becomes `true` (or its sender drops) when the keeper task has ended.
+    done: watch::Receiver<bool>,
+    abort: tokio::task::AbortHandle,
+    delay_id: Arc<StdMutex<Option<String>>>,
+}
+
+type SlotCell = Arc<tokio::sync::Mutex<Option<Slot>>>;
+
+/// One slot per membership state key (room, user, device), process-wide. A
+/// new hold for the same key takes the slot's lock for its whole start, so
+/// two holds never run their joins concurrently.
+fn slot_for(key: &str) -> SlotCell {
+    static HOLDS: OnceLock<StdMutex<HashMap<String, SlotCell>>> = OnceLock::new();
+    HOLDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key.to_owned())
+        .or_default()
+        .clone()
+}
+
+/// Make sure a previous keeper of this membership can no longer clear it:
+/// ask it to hand over (or let a leave it already started finish), wait for
+/// it, abort it if it does not stop, and cancel any delayed leave it left
+/// behind. Our own delayed leave is NOT cancelled by our own new state
+/// event, so without this a detached old keeper (or its armed delayed
+/// leave) would remove the new call's membership.
+async fn supersede<T: MemberTransport>(prev: Slot, transport: &mut T, room_id: &str) {
+    request(&prev.cmd, Cmd::HandOver);
+    let mut done = prev.done;
+    let stopped = tokio::time::timeout(LEAVE_TIMEOUT, done.wait_for(|d| *d))
+        .await
+        .is_ok();
+    if !stopped {
+        prev.abort.abort();
+        tracing::warn!(
+            room_id,
+            "previous RTC membership keeper did not stop within {LEAVE_TIMEOUT:?}; aborted it"
+        );
+    }
+    let stale = prev
+        .delay_id
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(id) = stale {
+        match transport.cancel_leave(&id).await {
+            Ok(()) | Err(OpError::NotFound(_)) => {
+                tracing::info!(room_id, "cancelled the previous hold's delayed leave")
+            }
+            Err(e) => tracing::warn!(
+                room_id,
+                error = %e,
+                "could not cancel the previous hold's delayed leave; it may remove this membership once"
+            ),
+        }
+    }
+}
+
+/// Start a keeper for membership `key`, first retiring any previous keeper
+/// of the same key (see [`supersede`]).
+pub(crate) async fn hold_keyed<T: MemberTransport>(
+    mut transport: T,
+    timing: RtcMemberTiming,
+    room_id: String,
+    key: String,
+) -> Result<RtcMembership> {
+    timing.validate()?;
+    let cell = slot_for(&key);
+    let mut slot = cell.lock().await;
+    if let Some(prev) = slot.take() {
+        supersede(prev, &mut transport, &room_id).await;
+    }
+    let delay_id: Arc<StdMutex<Option<String>>> = Arc::default();
+    let keeper = Keeper::start_shared(transport, timing, room_id, delay_id.clone()).await?;
+    let (membership, new_slot) = RtcMembership::spawn(keeper, delay_id);
+    *slot = Some(new_slot);
+    Ok(membership)
+}
 
 /// A held MatrixRTC membership, returned by
 /// [`AgentClient::hold_rtc_member`]. While it lives, a background task keeps
@@ -588,22 +926,42 @@ const LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`leave_delay`](RtcMemberTiming::leave_delay), or, on a homeserver without
 /// MSC4140, the membership lapses at its current expiry (at most
 /// [`expiry`](RtcMemberTiming::expiry)).
+///
+/// A newer hold of the same room by the same agent device takes the
+/// membership over: this handle's keeper then stops without leaving, and a
+/// later `leave` or drop of this handle does nothing to the new membership.
 pub struct RtcMembership {
-    stop: Option<oneshot::Sender<()>>,
+    cmd: Arc<watch::Sender<Cmd>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     dead_man_switch: bool,
 }
 
 impl RtcMembership {
-    fn spawn<T: MemberTransport>(keeper: Keeper<T>) -> Self {
+    fn spawn<T: MemberTransport>(
+        keeper: Keeper<T>,
+        delay_id: Arc<StdMutex<Option<String>>>,
+    ) -> (Self, Slot) {
         let dead_man_switch = keeper.sched.leave_enabled();
-        let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(keeper.run(rx));
-        Self {
-            stop: Some(tx),
+        let (tx, rx) = watch::channel(Cmd::Hold);
+        let cmd = Arc::new(tx);
+        let (done_tx, done_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let res = keeper.run(rx).await;
+            let _ = done_tx.send(true);
+            res
+        });
+        let slot = Slot {
+            cmd: cmd.clone(),
+            done: done_rx,
+            abort: task.abort_handle(),
+            delay_id,
+        };
+        let membership = Self {
+            cmd,
             task: Some(task),
             dead_man_switch,
-        }
+        };
+        (membership, slot)
     }
 
     /// Whether a delayed leave (MSC4140) protects this membership. `false`
@@ -612,16 +970,16 @@ impl RtcMembership {
         self.dead_man_switch
     }
 
-    /// Whether the keeper task is still running (it only stops on leave).
+    /// Whether the keeper task is still running. It stops on leave, on a
+    /// hand-over to a newer hold, and when its session can no longer be
+    /// renewed (then [`leave`](Self::leave) returns that error).
     pub fn is_active(&self) -> bool {
         self.task.as_ref().is_some_and(|t| !t.is_finished())
     }
 
     /// Stop refreshing and leave the call. Bounded by 30 s.
     pub async fn leave(mut self) -> Result<()> {
-        if let Some(tx) = self.stop.take() {
-            let _ = tx.send(());
-        }
+        request(&self.cmd, Cmd::Leave);
         let Some(task) = self.task.take() else {
             return Ok(());
         };
@@ -638,9 +996,7 @@ impl RtcMembership {
 impl Drop for RtcMembership {
     fn drop(&mut self) {
         // Signal the keeper to leave; it finishes on its own (detached).
-        if let Some(tx) = self.stop.take() {
-            let _ = tx.send(());
-        }
+        request(&self.cmd, Cmd::Leave);
     }
 }
 
@@ -656,9 +1012,13 @@ impl AgentClient {
     /// [`expiry`](RtcMemberTiming::expiry) past "now", and keeps an MSC4140
     /// delayed leave armed so a crash removes the member within
     /// [`leave_delay`](RtcMemberTiming::leave_delay). If our membership
-    /// disappears mid-call (the delayed leave fired during an outage), it is
-    /// re-published as a new membership. See the module docs for the
-    /// matrix-js-sdk behaviour this mirrors.
+    /// disappears mid-call (the delayed leave fired during an outage) or
+    /// lapses, it is re-published as a new membership. See the module docs
+    /// for the matrix-js-sdk behaviour this mirrors.
+    ///
+    /// A previous hold of the same room by this agent device is retired
+    /// first (it hands over; its delayed leave is cancelled), so an old
+    /// call's keeper cannot clear the new call's membership.
     ///
     /// The keeper does NOT use this client after the call returns: it copies
     /// the current access token and runs on its own token-only REST session
@@ -686,9 +1046,9 @@ pub(crate) async fn hold_with_session(
     livekit_service_url: &str,
     timing: RtcMemberTiming,
 ) -> Result<RtcMembership> {
+    let key = format!("{room_id}|{}|{}", session.user_id, session.device_id);
     let transport = LiveTransport::new(session, room_id, livekit_alias, livekit_service_url)?;
-    let keeper = Keeper::start(transport, timing, room_id.to_owned()).await?;
-    Ok(RtcMembership::spawn(keeper))
+    hold_keyed(transport, timing, room_id.to_owned(), key).await
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +1085,13 @@ pub(crate) struct RestSession {
     device_id: String,
     /// What [`mint_session_token`] needs (key file, siwx-oidc, `config.toml`).
     config: AgentConfig,
+    /// Upper bound of one token rotation (lock wait, grant, persist).
+    rotate_timeout: Duration,
+    /// Set when a rotation minted (or would have used) another identity:
+    /// no further rotation is attempted, and the keeper stops.
+    poisoned: Option<String>,
+    /// Consecutive failed proactive rotations (log rate limiting).
+    rotate_failures: u32,
 }
 
 impl RestSession {
@@ -765,6 +1132,9 @@ impl RestSession {
             user_id,
             device_id,
             config,
+            rotate_timeout: REQUEST_TIMEOUT,
+            poisoned: None,
+            rotate_failures: 0,
         })
     }
 
@@ -772,26 +1142,69 @@ impl RestSession {
         self.expires_at_unix.saturating_sub(unix_now()) < TOKEN_REFRESH_MARGIN
     }
 
-    /// Mint a fresh token for the SAME user and device. A token for another
-    /// device is refused: the membership names this device, and switching
-    /// devices mid-call is the caller's decision, not the keeper's.
+    /// Mint a fresh token for the SAME user and device. A session for
+    /// another identity is refused before it is persisted
+    /// ([`mint_session_token`] with the expected identity); after that the
+    /// session is poisoned: no further rotation (and so no fresh login) is
+    /// attempted and the keeper stops, because the membership names this
+    /// device and switching devices mid-call is the caller's decision.
+    ///
+    /// The rotation runs in its own task, bounded by `rotate_timeout`: a
+    /// keeper stopped mid-rotation (leave, drop) does not cancel a refresh
+    /// grant between spending the refresh token and persisting the new one,
+    /// and a hung siwx-oidc cannot stall the keeper or hold the store's
+    /// session lock for longer than the bound.
     async fn rotate(&mut self) -> Result<()> {
-        let (token, user_id, device_id, expires_at_unix) =
-            mint_session_token(&self.config, None).await?;
-        if user_id != self.user_id.as_str() || device_id != self.device_id {
-            return Err(anyhow!(
-                "token rotation returned {user_id}/{device_id}, expected {}/{}; keeping the old token",
-                self.user_id,
-                self.device_id
-            ));
+        if let Some(why) = &self.poisoned {
+            return Err(anyhow!("token rotation stopped: {why}"));
         }
-        self.access_token = token;
-        self.expires_at_unix = expires_at_unix;
-        tracing::debug!(
-            valid_for_s = expires_at_unix.saturating_sub(unix_now()),
-            "RTC membership keeper: access token rotated (no client rebuilt)"
-        );
-        Ok(())
+        let config = self.config.clone();
+        let (user, device) = (self.user_id.to_string(), self.device_id.clone());
+        let limit = self.rotate_timeout;
+        let minted = tokio::spawn(async move {
+            let expect = Some((user.as_str(), device.as_str()));
+            tokio::time::timeout(limit, mint_session_token(&config, expect)).await
+        })
+        .await;
+        let minted = match minted {
+            Ok(Ok(res)) => res,
+            Ok(Err(_elapsed)) => Err(anyhow!("token rotation timed out after {limit:?}")),
+            Err(join) => Err(anyhow!("token rotation task failed: {join}")),
+        };
+        match minted {
+            Ok((token, user_id, device_id, expires_at_unix)) => {
+                if user_id != self.user_id.as_str() || device_id != self.device_id {
+                    // mint_session_token already refuses this; kept as a
+                    // guard should that ever change.
+                    let why = format!(
+                        "token rotation returned {user_id}/{device_id}, expected {}/{}",
+                        self.user_id, self.device_id
+                    );
+                    self.poisoned = Some(why.clone());
+                    return Err(anyhow!(why));
+                }
+                self.access_token = token;
+                self.expires_at_unix = expires_at_unix;
+                self.rotate_failures = 0;
+                tracing::debug!(
+                    valid_for_s = expires_at_unix.saturating_sub(unix_now()),
+                    "RTC membership keeper: access token rotated (no client rebuilt)"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                if e.chain()
+                    .any(|c| c.downcast_ref::<SessionIdentityMismatch>().is_some())
+                {
+                    tracing::error!(
+                        error = %format!("{e:#}"),
+                        "RTC membership keeper: token rotation is for another identity; no further rotation"
+                    );
+                    self.poisoned = Some(format!("{e:#}"));
+                }
+                Err(e)
+            }
+        }
     }
 
     fn state_key(&self, underscore: bool) -> CallMemberStateKey {
@@ -841,7 +1254,8 @@ impl RestSession {
                 let kind = err.error_kind();
                 let status = Some(err.status_code.as_u16());
                 let (token, class) = (is_token_rejection(kind, status), classify(kind, status));
-                (token, op_error(class, anyhow::Error::new(err)))
+                let wait = retry_after_of(kind);
+                (token, op_error(class, anyhow::Error::new(err), wait))
             }
             other_err => other(anyhow!("homeserver response: {other_err}")),
         })
@@ -857,6 +1271,7 @@ impl RestSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ErrClass {
     NotFound,
+    RateLimited,
     Unsupported,
     Other,
 }
@@ -865,6 +1280,7 @@ enum ErrClass {
 fn classify(kind: Option<&ErrorKind>, status: Option<u16>) -> ErrClass {
     match (kind, status) {
         (Some(ErrorKind::NotFound), _) => ErrClass::NotFound,
+        (Some(ErrorKind::LimitExceeded(_)), _) | (_, Some(429)) => ErrClass::RateLimited,
         // MSC4140 disabled (403 "Sending delayed events has been disallowed"),
         // endpoint unknown, or our delay above `max_event_delay_duration`
         // (400 with a non-standard errcode).
@@ -880,9 +1296,26 @@ fn is_token_rejection(kind: Option<&ErrorKind>, status: Option<u16>) -> bool {
     matches!(kind, Some(ErrorKind::UnknownToken(_))) || status == Some(401)
 }
 
-fn op_error(class: ErrClass, err: anyhow::Error) -> OpError {
+/// The server's `retry_after` (`retry_after_ms` in the body, or the
+/// `Retry-After` header, which ruma prefers) of an `M_LIMIT_EXCEEDED`.
+fn retry_after_of(kind: Option<&ErrorKind>) -> Option<Duration> {
+    use matrix_sdk::ruma::api::error::RetryAfter;
+    match kind? {
+        ErrorKind::LimitExceeded(data) => match data.retry_after? {
+            RetryAfter::Delay(d) => Some(d),
+            RetryAfter::DateTime(at) => Some(
+                at.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default(),
+            ),
+        },
+        _ => None,
+    }
+}
+
+fn op_error(class: ErrClass, err: anyhow::Error, retry_after: Option<Duration>) -> OpError {
     match class {
         ErrClass::NotFound => OpError::NotFound(err),
+        ErrClass::RateLimited => OpError::RateLimited { err, retry_after },
         ErrClass::Unsupported => OpError::Unsupported(err),
         ErrClass::Other => OpError::Other(err),
     }
@@ -932,9 +1365,16 @@ impl LiveTransport {
     }
 
     async fn ensure_fresh(&mut self) {
-        if self.session.needs_rotation() {
-            if let Err(e) = self.session.rotate().await {
-                tracing::warn!(error = %format!("{e:#}"), "RTC membership keeper: proactive token rotation failed");
+        if self.session.poisoned.is_some() || !self.session.needs_rotation() {
+            return;
+        }
+        if let Err(e) = self.session.rotate().await {
+            self.session.rotate_failures += 1;
+            let n = self.session.rotate_failures;
+            if n == 1 || n.is_multiple_of(WARN_EVERY) {
+                tracing::warn!(error = %format!("{e:#}"), consecutive_failures = n, "RTC membership keeper: proactive token rotation failed");
+            } else {
+                tracing::debug!(error = %format!("{e:#}"), consecutive_failures = n, "RTC membership keeper: proactive token rotation failed");
             }
         }
     }
@@ -983,8 +1423,10 @@ impl LiveTransport {
                 self.state_key = Some(owned);
                 Ok(eid)
             }
-            Err((true, e)) => Err((true, e)),
-            Err((false, e)) => {
+            // Only a policy refusal of the owned key (M_FORBIDDEN, no MSC3757)
+            // means "try the plain key". An outage, a 5xx or a rate limit
+            // must not flip the whole hold onto the legacy key.
+            Err((false, e)) if e.is_forbidden() => {
                 tracing::warn!(error = %e, "owned RTC member state key rejected; retrying unprefixed");
                 let plain = self.session.state_key(false);
                 let eid = self.put_member(&plain, content).await?;
@@ -995,6 +1437,7 @@ impl LiveTransport {
                 self.state_key = Some(plain);
                 Ok(eid)
             }
+            Err(other) => Err(other),
         }
     }
 
@@ -1111,6 +1554,19 @@ impl MemberTransport for LiveTransport {
     async fn clear_member(&mut self) -> OpResult<()> {
         with_token!(self, self.clear_once().await)
     }
+
+    async fn cancel_leave(&mut self, delay_id: &str) -> OpResult<()> {
+        use update_delayed_event::unstable::UpdateAction;
+        with_token!(
+            self,
+            self.update_delayed_once(delay_id, UpdateAction::Cancel)
+                .await
+        )
+    }
+
+    fn fatal(&self) -> Option<String> {
+        self.session.poisoned.clone()
+    }
 }
 
 #[cfg(test)]
@@ -1178,7 +1634,7 @@ mod tests {
         assert_eq!(sched.due(Duration::from_secs(20)), Some(Due::RestartLeave));
         // A failed restart retries after min(retry, restart) = 10 s, well
         // inside the 60 s dead-man delay.
-        sched.leave_restart_failed(Duration::from_secs(20));
+        sched.leave_restart_failed(Duration::from_secs(20), None);
         assert_eq!(sched.next_wake(), Duration::from_secs(30));
     }
 
@@ -1192,7 +1648,7 @@ mod tests {
         let mut attempts = 0;
         while now < 4 * H - Duration::from_secs(30) {
             assert!(matches!(sched.due(now), Some(Due::Refresh { .. })));
-            sched.refresh_failed(now);
+            sched.refresh_failed(now, None);
             attempts += 1;
             now = sched.next_wake();
         }
@@ -1281,6 +1737,7 @@ mod tests {
         LeaveNow,
         Clear,
         IsLive,
+        Cancel(String),
     }
 
     #[derive(Default)]
@@ -1296,6 +1753,16 @@ mod tests {
         fail_leave_now: bool,
         next_delay_id: u32,
         fail_join: bool,
+        /// Membership sends in `[from, until)` fail.
+        fail_member_between: Option<(Duration, Duration)>,
+        /// Membership sends from this time on never answer.
+        hang_member_from: Option<Duration>,
+        /// The first restart at or after `.0` answers 429 with retry_after `.1`.
+        rate_limit_restart_at: Option<(Duration, Duration)>,
+        /// From this time on the transport reports a fatal condition.
+        fatal_from: Option<Duration>,
+        /// `send_leave_now` takes this long; it is recorded when it completes.
+        leave_now_delay: Duration,
     }
 
     #[derive(Clone)]
@@ -1331,15 +1798,25 @@ mod tests {
             expires: Duration,
         ) -> OpResult<OwnedEventId> {
             let at = self.at();
-            let mut f = self.state.lock().unwrap();
-            f.calls.push(Call::Member {
-                at,
-                created_ts: created_ts.map(|t| u64::from(t.0)),
-                expires,
-            });
-            if f.fail_join || at < f.fail_member_until {
-                return Err(other("simulated 502"));
+            let hang = {
+                let mut f = self.state.lock().unwrap();
+                f.calls.push(Call::Member {
+                    at,
+                    created_ts: created_ts.map(|t| u64::from(t.0)),
+                    expires,
+                });
+                let in_window = f
+                    .fail_member_between
+                    .is_some_and(|(from, until)| at >= from && at < until);
+                if f.fail_join || at < f.fail_member_until || in_window {
+                    return Err(other("simulated 502"));
+                }
+                f.hang_member_from.is_some_and(|t| at >= t)
+            };
+            if hang {
+                return std::future::pending().await;
             }
+            let mut f = self.state.lock().unwrap();
             f.events.push(SERVER_EPOCH_MS + at.as_millis() as u64);
             let id = format!("$ev{}:example.org", f.events.len() - 1);
             Ok(OwnedEventId::try_from(id).unwrap())
@@ -1382,6 +1859,15 @@ mod tests {
             let at = self.at();
             let mut f = self.state.lock().unwrap();
             f.calls.push(Call::Restart { at });
+            if let Some((from, wait)) = f.rate_limit_restart_at {
+                if at >= from {
+                    f.rate_limit_restart_at = None;
+                    return Err(OpError::RateLimited {
+                        err: anyhow!("M_LIMIT_EXCEEDED"),
+                        retry_after: Some(wait),
+                    });
+                }
+            }
             if f.lose_leave_at.is_some_and(|t| at >= t) {
                 f.lose_leave_at = None;
                 return Err(OpError::NotFound(anyhow!("M_NOT_FOUND")));
@@ -1390,6 +1876,10 @@ mod tests {
         }
 
         async fn send_leave_now(&mut self, _delay_id: &str) -> OpResult<()> {
+            let delay = self.state.lock().unwrap().leave_now_delay;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let mut f = self.state.lock().unwrap();
             f.calls.push(Call::LeaveNow);
             if f.fail_leave_now {
@@ -1401,6 +1891,20 @@ mod tests {
         async fn clear_member(&mut self) -> OpResult<()> {
             self.state.lock().unwrap().calls.push(Call::Clear);
             Ok(())
+        }
+
+        async fn cancel_leave(&mut self, delay_id: &str) -> OpResult<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .push(Call::Cancel(delay_id.to_owned()));
+            Ok(())
+        }
+
+        fn fatal(&self) -> Option<String> {
+            let from = self.state.lock().unwrap().fatal_from?;
+            (self.at() >= from).then(|| "simulated identity mismatch".to_owned())
         }
     }
 
@@ -1431,12 +1935,23 @@ mod tests {
             .count()
     }
 
+    /// A registry key no other test uses (tests share the process-wide
+    /// registry).
+    fn unique_key() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "!room:example.org|test|{}",
+            N.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     async fn hold(fake: Fake) -> (RtcMembership, Arc<Mutex<Fake>>) {
         let (t, state) = FakeTransport::new(fake);
-        let keeper = Keeper::start(t, timing(), "!room:example.org".into())
+        let m = hold_keyed(t, timing(), "!room:example.org".into(), unique_key())
             .await
             .expect("join");
-        (RtcMembership::spawn(keeper), state)
+        (m, state)
     }
 
     /// Every re-send must land while the previous one is still valid, with the
@@ -1504,7 +2019,7 @@ mod tests {
             .unwrap();
         // Outage from now until 3 h 50 (the join is done; refreshes fail).
         state.lock().unwrap().fail_member_until = 3 * H + Duration::from_secs(50 * 60);
-        let m = RtcMembership::spawn(keeper);
+        let (m, _slot) = RtcMembership::spawn(keeper, Arc::default());
         tokio::time::sleep(4 * H + Duration::from_secs(1)).await;
         m.leave().await.unwrap();
 
@@ -1636,14 +2151,270 @@ mod tests {
         assert_eq!(count(&state, |c| matches!(c, Call::Schedule { .. })), 0);
     }
 
+    /// M1: after our delayed leave fired, a FAILED rejoin must be retried as a
+    /// rejoin (new chain). Re-anchoring the old join's created_ts would read
+    /// to Element as "keys already shared" after a leave.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_rejoin_is_retried_as_a_rejoin_not_a_refresh() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            lose_leave_at: Some(Duration::from_secs(300)),
+            member_live_after_loss: false,
+            fail_member_between: Some((Duration::from_secs(300), Duration::from_secs(305))),
+            ..Default::default()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(400)).await;
+        m.leave().await.unwrap();
+        let sends = members(&state);
+        assert_eq!(
+            sends.len(),
+            3,
+            "join, failed rejoin, retried rejoin: {sends:?}"
+        );
+        assert_eq!(sends[1].0, Duration::from_secs(300));
+        assert_eq!(
+            sends[2].0,
+            Duration::from_secs(310),
+            "retried after the back-off"
+        );
+        assert_eq!(sends[2].1, None, "the retry starts a new chain: {sends:?}");
+    }
+
+    /// minor 3: a membership that lapsed (every refresh failed until past its
+    /// expiry) is gone for Element; re-sending the old created_ts would read
+    /// as the same chain. It must come back as a new chain.
+    #[tokio::test(start_paused = true)]
+    async fn a_lapsed_membership_rejoins_instead_of_refreshing() {
+        let (m, state) = hold(Fake {
+            fail_member_between: Some((Duration::from_secs(1), 4 * H + Duration::from_secs(30))),
+            ..Default::default()
+        })
+        .await;
+        assert!(!m.has_dead_man_switch());
+        tokio::time::sleep(4 * H + Duration::from_secs(60)).await;
+        m.leave().await.unwrap();
+        let sends = members(&state);
+        let first_ok = sends
+            .iter()
+            .find(|(at, _, _)| *at >= 4 * H + Duration::from_secs(30))
+            .expect("a send after the outage");
+        assert_eq!(first_ok.1, None, "lapsed chain restarts: {first_ok:?}");
+        assert_eq!(first_ok.2, 4 * H, "a fresh chain's expiry");
+    }
+
+    /// M2: leave() must stop the keeper even while one of its requests hangs.
+    #[tokio::test(start_paused = true)]
+    async fn leave_preempts_a_hung_request() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            hang_member_from: Some(Duration::from_secs(1)),
+            ..Default::default()
+        })
+        .await;
+        // The hourly refresh at 1 h hangs forever.
+        tokio::time::sleep(H + Duration::from_secs(5)).await;
+        let started = Instant::now();
+        m.leave()
+            .await
+            .expect("leave must not wait for the hung refresh");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let calls = state.lock().unwrap().calls.clone();
+        assert_eq!(calls.last(), Some(&Call::LeaveNow));
+    }
+
+    /// minor 4: a 429 on a restart waits the server's retry_after (45 s),
+    /// not our own 10 s back-off.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_restart_waits_for_retry_after() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            rate_limit_restart_at: Some((Duration::from_secs(90), Duration::from_secs(45))),
+            ..Default::default()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        m.leave().await.unwrap();
+        let restarts: Vec<Duration> = state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::Restart { at } => Some(*at),
+                _ => None,
+            })
+            .collect();
+        let limited = restarts
+            .iter()
+            .position(|t| *t == Duration::from_secs(90))
+            .expect("restart at 90 s");
+        assert_eq!(
+            restarts[limited + 1],
+            Duration::from_secs(135),
+            "next restart honours retry_after: {restarts:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limits_are_classified_with_their_retry_after() {
+        use matrix_sdk::ruma::api::error::{LimitExceededErrorData, RetryAfter};
+        let mut data = LimitExceededErrorData::new();
+        data.retry_after = Some(RetryAfter::Delay(Duration::from_millis(2500)));
+        let kind = ErrorKind::LimitExceeded(data);
+        assert_eq!(classify(Some(&kind), Some(429)), ErrClass::RateLimited);
+        assert_eq!(classify(None, Some(429)), ErrClass::RateLimited);
+        assert_eq!(
+            retry_after_of(Some(&kind)),
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(retry_after_of(Some(&ErrorKind::Unknown)), None);
+        assert_eq!(
+            back_off(Duration::from_secs(10), Some(Duration::from_secs(3))),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            back_off(Duration::from_secs(10), Some(Duration::from_secs(30))),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// minor 1: once the session cannot be renewed for our identity, the
+    /// keeper stops (no retry loop), and the handle surfaces why.
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_session_error_stops_the_keeper_and_is_surfaced() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            fatal_from: Some(Duration::from_secs(100)),
+            ..Default::default()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert!(!m.is_active(), "the keeper stopped");
+        let calls = state.lock().unwrap().calls.clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::Restart { at } if *at > Duration::from_secs(100))),
+            "no retries after the fatal condition"
+        );
+        assert_eq!(calls.last(), Some(&Call::LeaveNow), "best-effort leave");
+        let err = m.leave().await.expect_err("the stop is surfaced");
+        assert!(format!("{err:#}").contains("identity mismatch"), "{err:#}");
+    }
+
+    /// minor 2: a new hold of the same membership takes over. The old keeper
+    /// cancels its delayed leave and stops without leaving, and dropping its
+    /// handle afterwards does nothing to the new membership.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_hold_takes_over_and_the_old_handle_cannot_clear_it() {
+        let key = unique_key();
+        let (t, state) = FakeTransport::new(Fake {
+            msc4140: true,
+            ..Default::default()
+        });
+        let old = hold_keyed(t.clone(), timing(), "!room:example.org".into(), key.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let new = hold_keyed(t, timing(), "!room:example.org".into(), key)
+            .await
+            .unwrap();
+        assert!(!old.is_active(), "the old keeper handed over");
+        drop(old);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(new.is_active());
+        let calls = state.lock().unwrap().calls.clone();
+        let new_join = calls
+            .iter()
+            .position(|c| matches!(c, Call::Member { created_ts: None, at, .. } if *at == Duration::from_secs(60)))
+            .expect("second join");
+        let cancel = calls
+            .iter()
+            .position(|c| *c == Call::Cancel("syd_1".into()))
+            .expect("old delayed leave cancelled");
+        assert!(cancel < new_join, "cancelled before the new join");
+        assert!(
+            !calls[new_join..]
+                .iter()
+                .any(|c| matches!(c, Call::LeaveNow | Call::Clear)),
+            "nothing cleared the new membership: {:?}",
+            &calls[new_join..]
+        );
+        new.leave().await.unwrap();
+        assert_eq!(
+            count(&state, |c| *c == Call::LeaveNow),
+            1,
+            "only the new hold left"
+        );
+    }
+
+    /// minor 2: an old keeper already leaving (handle dropped) finishes its
+    /// leave BEFORE the new hold joins, so the leave cannot land on top of
+    /// the new membership.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_hold_waits_for_a_previous_leave_in_flight() {
+        let key = unique_key();
+        let (t, state) = FakeTransport::new(Fake {
+            msc4140: true,
+            leave_now_delay: Duration::from_secs(5),
+            ..Default::default()
+        });
+        let old = hold_keyed(t.clone(), timing(), "!room:example.org".into(), key.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        drop(old);
+        tokio::task::yield_now().await;
+        let new = hold_keyed(t, timing(), "!room:example.org".into(), key)
+            .await
+            .unwrap();
+        let calls = state.lock().unwrap().calls.clone();
+        let left = calls.iter().position(|c| *c == Call::LeaveNow).unwrap();
+        let joined = calls
+            .iter()
+            .rposition(|c| {
+                matches!(
+                    c,
+                    Call::Member {
+                        created_ts: None,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            left < joined,
+            "old leave completed before the new join: {calls:?}"
+        );
+        drop(new);
+    }
+
     // ---- live transport over a real socket: no Client, no crypto store -----
 
     /// One recorded HTTP request: (method, path with query, bearer, body).
     type Seen = Arc<Mutex<Vec<(String, String, String, String)>>>;
 
+    /// Knobs of [`fake_homeserver_with`]. The same socket serves siwx-oidc.
+    #[derive(Clone, Default)]
+    struct Hs {
+        /// While set, requests carrying `Bearer tok0` get 401 M_UNKNOWN_TOKEN.
+        revoked: Arc<std::sync::atomic::AtomicBool>,
+        /// Answer for a membership PUT on the owned (`_@...`) state key.
+        owned_key_error: Option<(&'static str, &'static str)>,
+        /// siwx-oidc (any non-`/_matrix/` path) accepts and never answers.
+        siwx_hangs: bool,
+        /// Body of a 200 from siwx-oidc `/token`.
+        token_json: Option<String>,
+    }
+
     /// A minimal homeserver on 127.0.0.1 that answers the keeper's endpoints
     /// and 404s everything else (so token rotation against it fails).
     async fn fake_homeserver() -> (String, Seen) {
+        fake_homeserver_with(Hs::default()).await
+    }
+
+    async fn fake_homeserver_with(hs: Hs) -> (String, Seen) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1655,6 +2426,7 @@ mod tests {
                     return;
                 };
                 let log = log.clone();
+                let hs = hs.clone();
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1690,10 +2462,32 @@ mod tests {
                     let method = first.next().unwrap_or("").to_owned();
                     let path = first.next().unwrap_or("").to_owned();
                     let bearer = header("authorization");
-                    log.lock()
-                        .unwrap()
-                        .push((method.clone(), path.clone(), bearer, body.clone()));
-                    let (status, json) = if method == "PUT"
+                    log.lock().unwrap().push((
+                        method.clone(),
+                        path.clone(),
+                        bearer.clone(),
+                        body.clone(),
+                    ));
+                    let matrix = path.starts_with("/_matrix/");
+                    if !matrix && hs.siwx_hangs {
+                        std::future::pending::<()>().await;
+                    }
+                    let owned_put = method == "PUT"
+                        && path.contains("/state/org.matrix.msc3401.call.member/_@")
+                        && !path.contains("msc4140.delay=");
+                    let (status, json) = if matrix
+                        && bearer == "Bearer tok0"
+                        && hs.revoked.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        (
+                            "401 Unauthorized",
+                            r#"{"errcode":"M_UNKNOWN_TOKEN","error":"revoked"}"#.to_owned(),
+                        )
+                    } else if let (true, Some((status, json))) = (owned_put, hs.owned_key_error) {
+                        (status, json.to_owned())
+                    } else if !matrix && path.starts_with("/token") && hs.token_json.is_some() {
+                        ("200 OK", hs.token_json.clone().unwrap())
+                    } else if method == "PUT"
                         && path.contains("/state/org.matrix.msc3401.call.member/")
                     {
                         if path.contains("org.matrix.msc4140.delay=") {
@@ -1849,6 +2643,256 @@ mod tests {
             "the membership keeper opened a matrix-sdk store: {names:?}"
         );
         assert_eq!(names, vec!["agent.pem".to_owned()], "nothing but the key");
+    }
+
+    fn live_store(tag: &str, base: &str, device: &str, cached_device: Option<&str>) -> AgentConfig {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let store_dir = std::env::temp_dir().join(format!(
+            "aqua-rtc-member-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let key_file = store_dir.join("agent.pem");
+        std::fs::write(
+            &key_file,
+            siwx_oidc_auth::SiwxKey::generate_ed25519()
+                .to_pem()
+                .unwrap(),
+        )
+        .unwrap();
+        if let Some(cached) = cached_device {
+            let mut cfg = crate::ConfigFile::default();
+            cfg.oidc.client_id = Some("client".into());
+            cfg.oidc.redirect_uri = Some("http://localhost:0/callback".into());
+            cfg.session = Some(crate::SessionCache {
+                access_token: "tok0".into(),
+                user_id: "@agent:example.org".into(),
+                device_id: cached.into(),
+                expires_at_unix: unix_now() + 3600,
+                refresh_token: Some("rt0".into()),
+                did: Some("did:key:z6Mktest".into()),
+            });
+            cfg.save(&store_dir.join("config.toml")).unwrap();
+        }
+        AgentConfig {
+            key_file,
+            siwx_url: base.to_owned(),
+            matrix_url: format!("{base}/"),
+            client_id: None,
+            redirect_uri: None,
+            store_dir,
+            device_id: Some(device.into()),
+        }
+    }
+
+    /// The keeper's session: `tok0` for `@agent:example.org` / `AQUA_test`.
+    fn live_session(config: AgentConfig, valid_for_s: u64) -> RestSession {
+        RestSession::new(
+            config,
+            "tok0".into(),
+            unix_now() + valid_for_s,
+            "@agent:example.org".try_into().unwrap(),
+            "AQUA_test".into(),
+        )
+        .unwrap()
+    }
+
+    fn fast_timing() -> RtcMemberTiming {
+        RtcMemberTiming {
+            expiry: Duration::from_secs(4),
+            refresh_every: Duration::from_millis(900),
+            leave_delay: Duration::from_secs(2),
+            leave_restart_every: Duration::from_millis(250),
+            retry_after_error: Duration::from_millis(200),
+        }
+    }
+
+    /// Each live test holds its own room: holds of one (room, user, device)
+    /// hand over to each other process-wide, as they should.
+    async fn live_hold(session: RestSession, room: &str) -> Result<RtcMembership> {
+        hold_with_session(session, room, room, "https://lk.example.org", fast_timing()).await
+    }
+
+    /// A 401 on a keeper request rotates the token (refresh grant, persisted
+    /// to config.toml) and retries the request once with the new token.
+    #[tokio::test]
+    async fn a_rejected_token_is_rotated_and_the_request_retried() {
+        let hs = Hs {
+            token_json: Some(
+                r#"{"access_token":"tok1","token_type":"Bearer","expires_in":3600,"refresh_token":"rt1"}"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        hs.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (base, seen) = fake_homeserver_with(hs).await;
+        let config = live_store("rotate", &base, "AQUA_test", Some("AQUA_test"));
+        let store_dir = config.store_dir.clone();
+        let m = live_hold(live_session(config, 3600), "!rotate:example.org")
+            .await
+            .expect("join succeeds after one rotation");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        m.leave().await.expect("leave");
+
+        let seen = seen.lock().unwrap().clone();
+        let matrix: Vec<_> = seen
+            .iter()
+            .filter(|r| r.1.starts_with("/_matrix/"))
+            .collect();
+        assert_eq!(
+            matrix[0].2, "Bearer tok0",
+            "the join first tried the old token"
+        );
+        assert!(
+            matrix[1..].iter().all(|r| r.2 == "Bearer tok1"),
+            "the retry and everything after it use the rotated token: {matrix:?}"
+        );
+        assert!(
+            matrix[1].0 == "PUT" && matrix[1].1 == matrix[0].1,
+            "the join was retried"
+        );
+        let grants: Vec<_> = seen.iter().filter(|r| r.1.starts_with("/token")).collect();
+        assert_eq!(grants.len(), 1, "one refresh grant: {grants:?}");
+        assert!(grants[0].3.contains("refresh_token=rt0"));
+        let persisted = crate::ConfigFile::load(&store_dir.join("config.toml"))
+            .unwrap()
+            .session
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&store_dir);
+        assert_eq!(persisted.access_token, "tok1");
+        assert_eq!(persisted.refresh_token.as_deref(), Some("rt1"));
+        assert_eq!(persisted.device_id, "AQUA_test");
+    }
+
+    /// minor 1: a rotation that would yield another device's session is
+    /// refused before anything is spent or persisted, is never retried as a
+    /// fresh login, and stops the keeper with the error surfaced.
+    #[tokio::test]
+    async fn a_device_mismatch_is_refused_and_stops_the_keeper() {
+        let hs = Hs::default();
+        let revoked = hs.revoked.clone();
+        let (base, seen) = fake_homeserver_with(hs).await;
+        // config.toml holds the agent's session for ANOTHER device.
+        let config = live_store("mismatch", &base, "AQUA_other", Some("AQUA_other"));
+        let store_dir = config.store_dir.clone();
+        let before = std::fs::read_to_string(store_dir.join("config.toml")).unwrap();
+        let m = live_hold(live_session(config, 3600), "!mismatch:example.org")
+            .await
+            .expect("join with the still-valid token");
+        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(!m.is_active(), "the keeper stopped");
+        let n = seen.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(seen.lock().unwrap().len(), n, "no requests after the stop");
+        let err = m.leave().await.expect_err("the mismatch is surfaced");
+        let after = std::fs::read_to_string(store_dir.join("config.toml")).unwrap();
+        let _ = std::fs::remove_dir_all(&store_dir);
+        assert!(format!("{err:#}").contains("mismatch"), "{err:#}");
+        let siwx: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| !r.1.starts_with("/_matrix/"))
+            .cloned()
+            .collect();
+        assert!(
+            siwx.is_empty(),
+            "no refresh grant, no fresh login: {siwx:?}"
+        );
+        assert_eq!(before, after, "config.toml untouched");
+    }
+
+    /// M2: a siwx-oidc that accepts connections and never answers must not
+    /// stall the keeper: each rotation gives up after `rotate_timeout` and
+    /// the request goes out with the current token; leave still completes.
+    #[tokio::test]
+    async fn a_hung_token_endpoint_cannot_stall_join_or_leave() {
+        let (base, seen) = fake_homeserver_with(Hs {
+            siwx_hangs: true,
+            ..Default::default()
+        })
+        .await;
+        let config = live_store("hang", &base, "AQUA_test", None);
+        let store_dir = config.store_dir.clone();
+        // Near expiry: every request first tries a rotation.
+        let mut session = live_session(config, 5);
+        session.rotate_timeout = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let m = tokio::time::timeout(
+            Duration::from_secs(5),
+            live_hold(session, "!hang:example.org"),
+        )
+        .await
+        .expect("join must not hang on siwx-oidc")
+        .expect("join");
+        tokio::time::timeout(Duration::from_secs(5), m.leave())
+            .await
+            .expect("leave must not hang on siwx-oidc")
+            .expect("leave");
+        let _ = std::fs::remove_dir_all(&store_dir);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|r| !r.1.starts_with("/_matrix/")),
+            "a rotation was attempted"
+        );
+        assert!(seen
+            .iter()
+            .filter(|r| r.1.starts_with("/_matrix/"))
+            .all(|r| r.2 == "Bearer tok0"));
+    }
+
+    /// minor 5: only M_FORBIDDEN on the owned (MSC3757) key falls back to the
+    /// plain key; an outage or a rate limit fails the join instead.
+    #[tokio::test]
+    async fn the_plain_state_key_is_used_only_after_m_forbidden() {
+        for (status, json, falls_back) in [
+            (
+                "403 Forbidden",
+                r#"{"errcode":"M_FORBIDDEN","error":"no"}"#,
+                true,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"errcode":"M_UNKNOWN","error":"boom"}"#,
+                false,
+            ),
+            (
+                "429 Too Many Requests",
+                r#"{"errcode":"M_LIMIT_EXCEEDED","error":"slow","retry_after_ms":10}"#,
+                false,
+            ),
+        ] {
+            let (base, seen) = fake_homeserver_with(Hs {
+                owned_key_error: Some((status, json)),
+                ..Default::default()
+            })
+            .await;
+            let config = live_store("forbidden", &base, "AQUA_test", None);
+            let store_dir = config.store_dir.clone();
+            let res = live_hold(live_session(config, 3600), "!forbidden:example.org").await;
+            let plain_puts = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    r.0 == "PUT" && r.1.contains("/state/org.matrix.msc3401.call.member/@agent")
+                })
+                .count();
+            let _ = std::fs::remove_dir_all(&store_dir);
+            if falls_back {
+                let m = res.expect("M_FORBIDDEN falls back to the plain key");
+                assert!(plain_puts >= 1);
+                m.leave().await.unwrap();
+            } else {
+                assert!(res.is_err(), "{status} must fail the join");
+                assert_eq!(plain_puts, 0, "{status} must not switch to the plain key");
+            }
+        }
     }
 
     /// Source guard: the non-test part of this module must never build a
