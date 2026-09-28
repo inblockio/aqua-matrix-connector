@@ -87,15 +87,21 @@ pub struct SessionCache {
 }
 
 impl ConfigFile {
-    /// Load config from a TOML file. Returns default if file does not exist.
+    /// Load config from a TOML file. Returns default if file does not exist;
+    /// a file that exists but does not parse is an error (callers must not
+    /// treat it as "no config": that runs a fresh login over the real session).
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        toml::from_str(&contents)
-            .with_context(|| format!("failed to parse config: {}", path.display()))
+        toml::from_str(&contents).with_context(|| {
+            format!(
+                "failed to parse config: {} (fix it or move it aside; it is not treated as empty)",
+                path.display()
+            )
+        })
     }
 
     /// Save config to a TOML file, creating parent directories if needed.
@@ -105,8 +111,105 @@ impl ConfigFile {
                 .with_context(|| format!("failed to create config dir: {}", parent.display()))?;
         }
         let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
-        std::fs::write(path, contents)
+        write_atomically(path, contents.as_bytes())
             .with_context(|| format!("failed to write config: {}", path.display()))
+    }
+}
+
+/// Replace `path` with `bytes` so that a concurrent reader sees either the old
+/// or the new file, never a truncated one: write a sibling temp file, fsync it,
+/// rename it over `path`. `std::fs::write` truncates first, and a reader that
+/// lands in that window parses an empty `config.toml` as "no session, no
+/// client" and falls through to a fresh login. An existing file's permissions
+/// are carried over, so an operator's `chmod 600` survives.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".into());
+    let tmp = dir.join(format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Serialises token rotation for one agent store within this process.
+///
+/// Every client of one agent (the main client, the in-call poll client, the
+/// RTC membership keeper) rotates through the same `config.toml`: load it,
+/// spend the refresh token, persist the new one. Two rotations interleaving
+/// both spend the SAME refresh token (the loser's grant may be refused and
+/// fall through to a fresh login) and the last writer wins the file. Holding
+/// this lock from the load to the save makes each rotation see the previous
+/// one's result. Keyed by store dir, so agents sharing a process do not wait
+/// on each other.
+fn session_lock(store_dir: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(store_dir).unwrap_or_else(|_| store_dir.to_path_buf());
+    let mut map = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    map.entry(key).or_default().clone()
+}
+
+/// A minted session belongs to a different user or device than the caller
+/// holds. Returned (and nothing persisted) by [`mint_session_token`] when the
+/// caller passed the identity it expects.
+#[derive(Debug)]
+pub(crate) struct SessionIdentityMismatch {
+    pub(crate) expected: (String, String),
+    pub(crate) got: (String, String),
+}
+
+impl std::fmt::Display for SessionIdentityMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session identity mismatch: minted {}/{}, expected {}/{}",
+            self.got.0, self.got.1, self.expected.0, self.expected.1
+        )
+    }
+}
+
+impl std::error::Error for SessionIdentityMismatch {}
+
+/// Refuse `(user, device)` unless it is the identity the caller expects.
+fn check_identity(expect: Option<(&str, &str)>, user: &str, device: &str) -> Result<()> {
+    match expect {
+        Some((eu, ed)) if eu != user || ed != device => {
+            Err(anyhow::Error::new(SessionIdentityMismatch {
+                expected: (eu.to_owned(), ed.to_owned()),
+                got: (user.to_owned(), device.to_owned()),
+            }))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -452,15 +555,24 @@ fn wipe_crypto_store(store_dir: &Path) {
 /// the SQLite crypto store (the RTC membership keeper, `rtc_member.rs`).
 ///
 /// Returns `(access_token, user_id, device_id, expires_at_unix)`.
+///
+/// Serialised per agent store with [`session_lock`] (load, grant and save as
+/// one step), and a `config.toml` that exists but does not parse is an error.
+/// With `expect = Some((user_id, device_id))` a session for any other identity
+/// is refused with [`SessionIdentityMismatch`] BEFORE anything is persisted:
+/// a cached session for another identity is not even refreshed.
 pub(crate) async fn mint_session_token(
     config: &AgentConfig,
+    expect: Option<(&str, &str)>,
 ) -> Result<(String, String, String, u64)> {
     let key = SiwxKey::from_pem_file(&config.key_file).context("reauth: failed to load key")?;
     let config_path = config.store_dir.join("config.toml");
-    let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
+    let lock = session_lock(&config.store_dir);
+    let _guard = lock.lock().await;
+    let mut config_file = ConfigFile::load(&config_path).context("reauth: config.toml")?;
     let (client_id, redirect_uri) =
         resolve_oidc_client(config, &mut config_file, &config_path).await?;
-    acquire_session(
+    acquire_session_for(
         config,
         &key,
         &client_id,
@@ -468,6 +580,7 @@ pub(crate) async fn mint_session_token(
         &mut config_file,
         &config_path,
         true,
+        expect,
     )
     .await
     .context("reauth: could not acquire a fresh session")
@@ -689,6 +802,33 @@ async fn acquire_session(
     config_path: &Path,
     force_new: bool,
 ) -> Result<(String, String, String, u64)> {
+    acquire_session_for(
+        config,
+        key,
+        client_id,
+        redirect_uri,
+        config_file,
+        config_path,
+        force_new,
+        None,
+    )
+    .await
+}
+
+/// [`acquire_session`] that, given `expect = Some((user_id, device_id))`,
+/// refuses a session for any other identity before persisting it (see
+/// [`mint_session_token`]). `None` behaves exactly like `acquire_session`.
+#[allow(clippy::too_many_arguments)]
+async fn acquire_session_for(
+    config: &AgentConfig,
+    key: &SiwxKey,
+    client_id: &str,
+    redirect_uri: &str,
+    config_file: &mut ConfigFile,
+    config_path: &Path,
+    force_new: bool,
+    expect: Option<(&str, &str)>,
+) -> Result<(String, String, String, u64)> {
     // Resolve the EFFECTIVE stable device_id, pinned on every fresh auth so the
     // agent reuses ONE Synapse device instead of minting a fresh `SIWX_<uuid>`
     // each time. Precedence:
@@ -728,6 +868,12 @@ async fn acquire_session(
             false
         }
     });
+
+    // A cached session for another identity is not ours to use or to refresh
+    // (spending its refresh token would rotate it away from its owner).
+    if let Some(sess) = cached_clone.as_ref() {
+        check_identity(expect, &sess.user_id, &sess.device_id)?;
+    }
 
     let session_data: Option<(String, String, String, u64)> = if let Some(sess) = cached_clone {
         if !force_new && sess.expires_at_unix > now_unix + 30 {
@@ -904,6 +1050,9 @@ async fn acquire_session(
         identity.user_id,
         identity.device_id
     );
+    // Checked before the session is persisted: a caller that holds another
+    // identity must not have config.toml switched under the agent.
+    check_identity(expect, &identity.user_id, &identity.device_id)?;
     // The deployed siwx-oidc honours the proposed device scope verbatim. If a
     // server ever ignores it, the divergence guard above would discard the
     // cache on EVERY connect (perpetual full OAuth, store wipes on reauth).
@@ -1140,7 +1289,14 @@ impl AgentClient {
         // the same way — including the stable device_id pinning, which lives in
         // `acquire_session`. See docs/ARCHITECTURE.md "Identity and device-id persistence".
         let config_path = config.store_dir.join("config.toml");
-        let mut config_file = ConfigFile::load(&config_path).unwrap_or_default();
+        // Same per-store lock as `mint_session_token`: another client of this
+        // agent may be rotating through config.toml right now.
+        let lock = session_lock(&config.store_dir);
+        let guard = lock.lock().await;
+        // A config.toml that exists but does not parse is an error: treating
+        // it as empty would re-register a client and run a fresh login over
+        // the agent's real session. A missing file is still "no config".
+        let mut config_file = ConfigFile::load(&config_path)?;
 
         let (client_id, redirect_uri) =
             resolve_oidc_client(&config, &mut config_file, &config_path).await?;
@@ -1155,6 +1311,7 @@ impl AgentClient {
             false,
         )
         .await?;
+        drop(guard);
 
         let user_id: OwnedUserId = user_id_str
             .try_into()
@@ -1288,7 +1445,7 @@ impl AgentClient {
     /// against the other client and silently drop room keys (H9 single-sync).
     async fn reauth_inner(&mut self, sync_after: bool) -> Result<()> {
         let (access_token, user_id_str, device_id_str, expires_at_unix) =
-            mint_session_token(&self.config).await?;
+            mint_session_token(&self.config, None).await?;
 
         let user_id: OwnedUserId = user_id_str
             .try_into()
@@ -3754,5 +3911,291 @@ mod stale_olm_machine_tests {
         let b = crypto_store_lock_holder();
         assert_ne!(a, b);
         assert!(a.starts_with(&format!("aqua-{}-", std::process::id())));
+    }
+}
+
+/// `config.toml` is shared by every client of one agent in a process (the
+/// main client, the in-call poll client, the RTC membership keeper), and each
+/// of them rotates its token through it. These tests pin the three properties
+/// that keep a concurrent rotation from reading a half-written or default
+/// config and falling through to a fresh login.
+#[cfg(test)]
+mod config_concurrency_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn temp_store(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aqua-config-conc-{tag}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn session(n: u32) -> SessionCache {
+        SessionCache {
+            access_token: format!("at{n}"),
+            user_id: "@agent:localhost".into(),
+            device_id: "AQUA_test".into(),
+            expires_at_unix: unix_now() + 3600,
+            refresh_token: Some(format!("rt{n}")),
+            did: Some("did:key:z6Mktest".into()),
+        }
+    }
+
+    /// A reader running next to a writer must never see a missing, empty or
+    /// partial file: std::fs::write truncates first, and a reader landing in
+    /// that window used to get "no session" and fall through to a fresh login.
+    #[test]
+    fn a_reader_never_sees_a_half_written_config() {
+        let dir = temp_store("atomic");
+        let path = dir.join("config.toml");
+        let mut cfg = ConfigFile::default();
+        cfg.oidc.client_id = Some("client".into());
+        cfg.session = Some(session(0));
+        cfg.save(&path).unwrap();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let path = path.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let mut cfg = ConfigFile::default();
+                    cfg.oidc.client_id = Some("client".into());
+                    // Vary the size so a torn read cannot parse by luck.
+                    let mut s = session(n);
+                    s.access_token = "x".repeat(1 + (n as usize * 37) % 4000);
+                    cfg.session = Some(s);
+                    cfg.save(&path).unwrap();
+                }
+            })
+        };
+        let mut bad = Vec::new();
+        for _ in 0..4000 {
+            match ConfigFile::load(&path) {
+                Ok(c) if c.session.is_some() && c.oidc.client_id.is_some() => {}
+                Ok(_) => bad.push("parsed without session/client".to_string()),
+                Err(e) => bad.push(format!("{e:#}")),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            bad.is_empty(),
+            "{} torn reads, first: {:?}",
+            bad.len(),
+            bad.first()
+        );
+        assert_eq!(
+            leftovers,
+            vec!["config.toml".to_string()],
+            "no temp files left"
+        );
+    }
+
+    /// The atomic replace must not loosen an operator's `chmod 600`.
+    #[cfg(unix)]
+    #[test]
+    fn saving_keeps_the_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_store("mode");
+        let path = dir.join("config.toml");
+        ConfigFile::default().save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = ConfigFile {
+            session: Some(session(1)),
+            ..Default::default()
+        };
+        cfg.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600);
+    }
+
+    fn config_for(store_dir: PathBuf, siwx_url: String, device: &str) -> AgentConfig {
+        let key_file = store_dir.join("agent.pem");
+        std::fs::write(&key_file, SiwxKey::generate_ed25519().to_pem().unwrap()).unwrap();
+        AgentConfig {
+            key_file,
+            siwx_url: siwx_url.clone(),
+            matrix_url: siwx_url,
+            client_id: None,
+            redirect_uri: None,
+            store_dir,
+            device_id: Some(device.into()),
+        }
+    }
+
+    /// A config.toml that exists but does not parse is an error, not "no
+    /// config": the default would silently re-register a client and run a
+    /// fresh login, minting a new session over the agent's real one.
+    #[tokio::test]
+    async fn an_unparseable_config_is_an_error_not_a_fresh_login() {
+        let dir = temp_store("garbage");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is [not toml").unwrap();
+        // Nothing listens there: any network attempt fails differently.
+        let config = config_for(dir.clone(), "http://127.0.0.1:9".into(), "AQUA_test");
+        let err = mint_session_token(&config, None)
+            .await
+            .expect_err("an unparseable config must fail");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            format!("{err:#}").contains("failed to parse config"),
+            "must fail on the parse, before any network: {err:#}"
+        );
+        assert_eq!(
+            after, "this is [not toml",
+            "the file is left for the operator"
+        );
+    }
+
+    /// With an expected identity, a cached session for another device is
+    /// refused before anything is spent or written: no refresh grant, no
+    /// fresh login, config.toml untouched.
+    #[tokio::test]
+    async fn a_session_for_another_device_is_refused_before_it_is_persisted() {
+        let dir = temp_store("mismatch");
+        let path = dir.join("config.toml");
+        // Nothing listens there: a grant or login attempt would error on connect.
+        let config = config_for(dir.clone(), "http://127.0.0.1:9".into(), "AQUA_test");
+        let mut cfg = ConfigFile::default();
+        cfg.oidc.client_id = Some("client".into());
+        cfg.session = Some(session(0));
+        cfg.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = mint_session_token(&config, Some(("@agent:localhost", "AQUA_other")))
+            .await
+            .expect_err("another device's session must be refused");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<SessionIdentityMismatch>().is_some()),
+            "{err:#}"
+        );
+        assert_eq!(before, after, "nothing persisted");
+    }
+
+    /// A fake siwx-oidc `/token` that answers a refresh grant slowly, records
+    /// how many grants were in flight at once and which refresh token each
+    /// one presented, and rotates the refresh token on every grant.
+    async fn slow_token_endpoint() -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let presented = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let issued = Arc::new(AtomicUsize::new(0));
+        let (max, seen) = (max_in_flight.clone(), presented.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let (max, seen, in_flight, issued) =
+                    (max.clone(), seen.clone(), in_flight.clone(), issued.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + len {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(now, Ordering::SeqCst);
+                    let rt = body
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("refresh_token="))
+                        .unwrap_or("")
+                        .to_string();
+                    seen.lock().unwrap().push(rt);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let n = issued.fetch_add(1, Ordering::SeqCst) + 1;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let json = format!(
+                        r#"{{"access_token":"at{n}","token_type":"Bearer","expires_in":300,"refresh_token":"rt{n}"}}"#
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (url, max_in_flight, presented)
+    }
+
+    /// Two clients of one agent rotating at the same moment must take turns,
+    /// and the second must present the refresh token the first one received:
+    /// racing both on the same (possibly already rotated) refresh token is how
+    /// a rotation falls through to a fresh login.
+    #[tokio::test]
+    async fn concurrent_rotations_of_one_agent_serialise() {
+        let (url, max_in_flight, presented) = slow_token_endpoint().await;
+        let dir = temp_store("serialise");
+        let config = config_for(dir.clone(), url, "AQUA_test");
+        let mut cfg = ConfigFile::default();
+        cfg.oidc.client_id = Some("client".into());
+        cfg.oidc.redirect_uri = Some(DEFAULT_REDIRECT_URI.into());
+        cfg.session = Some(session(0));
+        cfg.save(&dir.join("config.toml")).unwrap();
+
+        let (a, b, c) = tokio::join!(
+            mint_session_token(&config, None),
+            mint_session_token(&config, None),
+            mint_session_token(&config, None),
+        );
+        let persisted = ConfigFile::load(&dir.join("config.toml")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for r in [&a, &b, &c] {
+            assert!(r.is_ok(), "{:?}", r.as_ref().err());
+        }
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1, "grants overlapped");
+        let mut seen = presented.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["rt0", "rt1", "rt2"],
+            "each grant used the latest refresh token"
+        );
+        assert_eq!(
+            persisted.session.unwrap().refresh_token.as_deref(),
+            Some("rt3")
+        );
     }
 }

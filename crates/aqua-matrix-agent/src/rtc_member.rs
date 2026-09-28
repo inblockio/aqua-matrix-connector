@@ -776,7 +776,8 @@ impl RestSession {
     /// device is refused: the membership names this device, and switching
     /// devices mid-call is the caller's decision, not the keeper's.
     async fn rotate(&mut self) -> Result<()> {
-        let (token, user_id, device_id, expires_at_unix) = mint_session_token(&self.config).await?;
+        let (token, user_id, device_id, expires_at_unix) =
+            mint_session_token(&self.config, None).await?;
         if user_id != self.user_id.as_str() || device_id != self.device_id {
             return Err(anyhow!(
                 "token rotation returned {user_id}/{device_id}, expected {}/{}; keeping the old token",
