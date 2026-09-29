@@ -6,10 +6,11 @@
 # per-instance config from ~/.aqua-matrix-test/consultant-config.template.json, launches
 # the container with the SAME hardened podman flags as the original scripts (verbatim -
 # the security posture must not drift), wires the systemd activity-watcher, DMs Tim
-# "channel up", and (with --onboard) DMs Tim a ready-to-forward onboarding message that
-# carries the agent's self-minted MXID. Since the template sets "initiate_dm": true,
+# "channel up", and (with --onboard) waits for the consultant's own welcome to be delivered and
+# tells Tim the outcome (see "Onboarding" below). Since the template sets "initiate_dm": true,
 # the consultant herself creates the DM room, invites the peer and delivers her
-# greeting (the peer just accepts the invite; no need to DM the MXID first).
+# greeting (the config's `hello`) into it: that greeting IS the welcome. The peer just accepts
+# the invite; no need to DM the MXID first, and no second message from anyone else.
 # SEQUENCING: a config carrying initiate_dm needs an image whose binary knows the
 # field (deny_unknown_fields) — never point an old image at a freshly rendered config.
 #
@@ -42,8 +43,9 @@
 # so roll-consultant-fleet.sh rolls it with the rest of the fleet.
 #
 # Persona: every consultant has a warm FEMALE persona. Pass --persona <Name> and the
-# script sets the Matrix display alias "<Name> (Aqua Consultant)", a heartfelt first-contact
-# greeting that addresses the served person (--name) by name with no DID/MXID noise, and a
+# script sets the Matrix display alias "<Name> (Aqua Consultant)", the first-contact greeting
+# (consultant-persona.py hello_for; the voice line only when the config's final voice.enabled is
+# true) that addresses the served person (--name) by name with no DID/MXID noise, and a
 # "# Who You Are" preamble in the system prompt so she introduces herself by name. The
 # served person's name is hardcoded per config (the hello placeholder layer only ever
 # interpolates the agent's OWN id, never the peer's). --display overrides the derived alias;
@@ -92,6 +94,29 @@
 # render/patch the config file and create the persist dirs, since those are the run's
 # inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
 #
+# Owner rule (Tim, 2026-09-29): every consultant has exactly ONE authoritative Owner, its single
+# target peer (--target, or the kept config's target; --generic = Tim). EVERY real spawn (new,
+# --replace, --keep-config, and so every fleet roll) first makes sure the Owner is on the Aqua
+# System allow-list (owner-allowlist.py: appends name=<label>, else <label>-owner, when no entry
+# has that MXID; flock, backup, validated like the bridge parses it, atomic rename). Fail-closed:
+# when that cannot be ensured (file missing/invalid, both names taken, generic operator absent)
+# the spawn aborts before any config render, --replace removal or launch. Print modes preview only.
+#
+# Onboarding (--onboard): the welcome is the consultant's OWN first message (the config's `hello`,
+# which the relay sends into the DM room it creates; the agent appends its "What's new" list on
+# first contact). There is no separate Aqua System DM to the peer. --onboard only confirms the
+# outcome to Tim: after launch it polls (up to ONBOARD_WAIT s, default 180) for the agent's
+# greeted marker (<persist>/memory/.whats_new_seen, written only after a confirmed send) and
+# watches `podman logs` for the relay's hello failure lines. Delivered -> INFO "welcome
+# delivered" with the hello quoted; a failure line or the timeout -> WARN "welcome NOT
+# confirmed" (retry: podman restart). A marker that already existed before launch (a roll of an
+# already-greeted consultant) -> nothing is sent. Never fails the spawn.
+#
+# --print-onboarding: print the consultant's hello as a spawn with the same flags would render it,
+# plus both Tim notices, to stdout and exit 0, before any token, network, config write, container
+# or DM (offline copy review), plus a read-only preview of the Owner allow-list step on stderr.
+# The voice line follows --voice when given, else the existing config (else the template).
+#
 # Env overrides (all optional; the defaults are this host's live paths):
 #   CONSULTANT_TEST_DIR     dir holding configs/persist/avatars/template (default ~/.aqua-matrix-test)
 #   CONSULTANT_TEMPLATE     config template path (default $CONSULTANT_TEST_DIR/consultant-config.template.json)
@@ -99,9 +124,12 @@
 #   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
 #   AQUA_CLAUDE_TOKEN_FILE  OAuth token file (default ~/.aqua-matrix-heartbeat/claude-oauth-token)
 #   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
+#   ONBOARD_WAIT            seconds --onboard waits for the welcome to be confirmed (default 180)
+#   AQUA_SYSTEM_ALLOWLIST   Aqua System allow-list the Owner step ensures (default ~/.aqua-system-bridge/allowlist.toml)
+#   CONSULTANT_NOTIFY       notifier used for Tim's DMs (default ~/.aqua-matrix-notify/notify-tim.sh; tests)
 #
 # Examples:
-#   # new consultant (fresh identity) with a female persona; DM Tim a forward-ready intro:
+#   # new consultant (fresh identity) with a female persona; tell Tim once her welcome is delivered:
 #   bash ~/spawn-consultant.sh --label gawain \
 #        --target '@<peer-localpart>:matrix.inblock.io' \
 #        --persona Talia --name Gawain --onboard
@@ -126,6 +154,10 @@
 #   # enable voice messages on an existing consultant (image already rolled to a voice-aware build):
 #   bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez --voice on
 #
+#   # review the onboarding copy offline (her hello + both Tim notices), nothing started:
+#   bash ~/spawn-consultant.sh --print-onboarding --label andreas --target '@…:matrix.inblock.io' \
+#        --persona Pelagia --name Andreas --voice on
+#
 #   # preview the exact podman argument vector, nothing started:
 #   bash ~/spawn-consultant.sh --print-run --label zdnaez --target '@…:matrix.inblock.io' --persona Coralie
 #
@@ -142,7 +174,8 @@ PERSONA=""            # the consultant's FEMALE persona name (e.g. Talia); drive
 GENERIC=0             # target the UN-LABELED generic consultant instead of a --label one
 REPLACE=0             # rm -f an existing container first (image roll; DID preserved)
 FRESH=0               # wipe persist dir first (force a brand-new identity)
-ONBOARD=0             # after connect, DM Tim a forward-ready onboarding message
+ONBOARD=0             # after launch, wait for the consultant's welcome to be delivered and tell Tim
+PRINT_ONBOARDING=0    # --print-onboarding: print the consultant's hello + both Tim notices and exit 0
 KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never clobber customizations)
 REFRESH_REFS=1        # fast-forward the /refs repos before launch (--no-refresh-refs to skip)
 REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mounts into the config
@@ -184,6 +217,7 @@ while [ $# -gt 0 ]; do
     --replace) REPLACE=1; shift ;;
     --fresh)   FRESH=1; shift ;;
     --onboard) ONBOARD=1; shift ;;
+    --print-onboarding) PRINT_ONBOARDING=1; shift ;;
     --keep-config) KEEP_CONFIG=1; shift ;;
     --no-refresh-refs) REFRESH_REFS=0; shift ;;
     --refresh-prompt) REFRESH_PROMPT=1; shift ;;
@@ -300,6 +334,109 @@ fi
 # means a pseudonymous peer, which the persona render greets without a name.
 [ -n "$PERSONA" ] || : "${HUMAN_NAME:=$DISPLAY_NAME}"
 
+# ---------------------------------------------------------------- owner allow-list
+# Every consultant has exactly ONE authoritative Owner: its single target peer (--target, or the
+# kept config's target; for --generic that is Tim). Tim's standing rule (2026-09-29): the Owner
+# is always on the Aqua System allow-list (independent of onboarding). owner-allowlist.py appends a [[recipients]] entry (name = label, else
+# <label>-owner) only when no entry has that MXID yet, under flock, with a backup, validated
+# against the bridge's own rules before an atomic rename. FAIL-CLOSED: a real spawn aborts
+# before any container change when the Owner cannot be ensured. Print modes only preview.
+OWNER_HELPER="$(dirname "$PERSONA_HELPER")/owner-allowlist.py"
+ALLOWLIST_FILE="${AQUA_SYSTEM_ALLOWLIST:-$HOME/.aqua-system-bridge/allowlist.toml}"
+ensure_owner_allowlisted() {  # ensure_owner_allowlisted check|apply
+  local sel=(--generic)
+  [ "$GENERIC" -eq 1 ] || sel=(--label "$LABEL")
+  if [ ! -f "$OWNER_HELPER" ]; then
+    echo "!! owner allow-list: helper missing: $OWNER_HELPER" >&2
+    [ "$1" = check ]; return
+  fi
+  python3 "$OWNER_HELPER" "$1" --path "$ALLOWLIST_FILE" --mxid "$TARGET" \
+    --container "$NAME" --who "${PERSONA:-$DISPLAY_NAME}" "${sel[@]}"
+}
+
+# ---------------------------------------------------------------- onboarding copy
+# The welcome is the consultant's own hello (consultant-persona.py); this section only renders
+# Tim's two notices around it, for --onboard and --print-onboarding alike. No em/en dashes
+# anywhere in the rendered text (tests enforce it).
+# config_voice_enabled <config.json>: exit 0 iff the config has voice.enabled == true.
+config_voice_enabled() {
+  [ -f "$1" ] || return 1
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("voice")
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(v, dict) and v.get("enabled") is True else 1)
+PY
+}
+
+# The config's FINAL voice.enabled for a render: --voice wins, else the base the render starts
+# from (the existing config, else the template). The --voice step below patches the file to the
+# same value, so a freshly rendered hello and voice.enabled always agree.
+if [ -f "$CFG" ]; then VOICE_BASE="$CFG"; else VOICE_BASE="$TEMPLATE"; fi
+case "$VOICE" in
+  on)  EFFECTIVE_VOICE=on ;;
+  off) EFFECTIVE_VOICE=off ;;
+  *)   if config_voice_enabled "$VOICE_BASE"; then EFFECTIVE_VOICE=on; else EFFECTIVE_VOICE=off; fi ;;
+esac
+
+# Who the notices name. Explicit --persona/--name win; a --keep-config spawn without them reads
+# the persona and person back from the kept config (display alias + "Hi <name>! " prefix).
+NOTICE_PERSONA="$PERSONA"; NOTICE_PERSON="$HUMAN_NAME"
+if [ -z "$PERSONA" ] && [ "$KEEP_CONFIG" -eq 1 ] && [ -f "$PERSONA_HELPER" ]; then
+  eval "$(python3 "$PERSONA_HELPER" derive "$CFG")"
+  NOTICE_PERSONA="$D_PERSONA"; NOTICE_PERSON="$D_PERSON"
+fi
+ONBOARD_WHO="${NOTICE_PERSON:-$NOTICE_PERSONA}"   # title fragment: the served person, else the persona
+
+# render_notice_delivered <hello>: Tim's DM once the consultant's welcome is confirmed, with the
+# hello quoted line by line (blank lines as a bare ">") and the What's-new tail marked.
+render_notice_delivered() {
+  local poss=its
+  [ -n "$NOTICE_PERSONA" ] && poss=her
+  printf '✅ %s invited %s and posted %s welcome.\n\nThis is what they see:\n\n' \
+    "${NOTICE_PERSONA:-The consultant}" "${NOTICE_PERSON:-the peer}" "$poss"
+  printf '%s\n' "$1" | sed -e 's/^/> /' -e 's/^> $/>/'
+  printf '>\n> *(followed by the "What'"'"'s new" list)*\n'
+}
+
+# render_notice_unconfirmed <seconds> [<relay log line or other detail>]: Tim's DM when the
+# welcome was not confirmed.
+render_notice_unconfirmed() {
+  local who="The consultant's"
+  [ -n "$NOTICE_PERSONA" ] && who="${NOTICE_PERSONA}'s"
+  printf '⚠️ %s welcome to %s was not confirmed within %s s.\n\n' "$who" "${NOTICE_PERSON:-the peer}" "$1"
+  [ -z "${2:-}" ] || printf '%s\n\n' "$2"
+  printf 'It retries on the next process start: podman restart %s.\n' "$NAME"
+}
+
+if [ "$PRINT_ONBOARDING" -eq 1 ]; then
+  # Offline copy review: no token, no network, no config write, no container, no DM.
+  # The Owner step a real spawn runs first, previewed read-only (stderr, so stdout stays copy).
+  case "$TARGET" in
+    @*:*) ensure_owner_allowlisted check ;;
+    *) echo ">> owner allow-list: --target is not an MXID yet (a DID is resolved only on a real spawn); not previewed" >&2 ;;
+  esac
+  [ -f "$PERSONA_HELPER" ] || { echo "!! --print-onboarding needs the helper, missing: $PERSONA_HELPER" >&2; exit 2; }
+  if [ "$KEEP_CONFIG" -eq 1 ]; then PO_BASE="$CFG"; else PO_BASE="$VOICE_BASE"; fi
+  PO_MXID="$(agent_mxid_from_store 2>/dev/null)" || PO_MXID=""
+  PO_HELLO="$(python3 "$PERSONA_HELPER" preview "$PO_BASE" "$KEEP_CONFIG" "$REFRESH_PROMPT" \
+    "$DISPLAY_NAME" "$PERSONA" "$HUMAN_NAME" "$EFFECTIVE_VOICE" "$PO_MXID")"
+  if [ "$KEEP_CONFIG" -eq 1 ] && [ "$REFRESH_PROMPT" -eq 0 ]; then
+    PO_VOICE_NOTE="kept config, hello verbatim"
+  else
+    PO_VOICE_NOTE="voice line $EFFECTIVE_VOICE"
+  fi
+  printf '==== consultant hello (her first message to %s; %s; What'"'"'s new list appended on first contact) ====\n' "$TARGET" "$PO_VOICE_NOTE"
+  printf '%s\n' "$PO_HELLO"
+  printf '\n==== Tim notice, delivered: INFO "welcome delivered: %s (%s)" ====\n' "$ONBOARD_WHO" "$NAME"
+  render_notice_delivered "$PO_HELLO"
+  printf '\n==== Tim notice, not confirmed: WARN "welcome NOT confirmed: %s (%s)" (example log line) ====\n' "$ONBOARD_WHO" "$NAME"
+  render_notice_unconfirmed "${ONBOARD_WAIT:-180}" 'Last relay log line: `… initiate-DM hello failed (retries next process start): <error>`'
+  exit 0
+fi
+
 # ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
 # `--target did:...` is resolved through siwx-oidc's public GET /resolve?did=, which applies
 # the server's own grandfathering rule. Any failure is FATAL: a guessed legacy MXID for a DID
@@ -362,6 +499,17 @@ case "$DISPLAY_NAME" in
   *'"'*|*$'\n'*)
     echo "!! --display must not contain a double-quote or newline (would break the systemd unit)." >&2; exit 2 ;;
 esac
+
+# The Owner (= TARGET, now a resolved MXID) must be allow-listed BEFORE anything else changes:
+# before the config render, the --replace removal and the launch. --print-run only previews.
+if [ "$PRINT_RUN" -eq 1 ]; then
+  ensure_owner_allowlisted check
+elif ! ensure_owner_allowlisted apply; then
+  echo "!! aborting: could not put the Owner $TARGET on the Aqua System allow-list ($ALLOWLIST_FILE)." >&2
+  echo "   Nothing was changed: no config render, no container removal, no launch. Fix the file (or" >&2
+  echo "   the name clash) and re-run; see SKILL.md \"Owner rule\"." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- token (by reference)
 TOKEN_FILE="${AQUA_CLAUDE_TOKEN_FILE:-/home/waldknoten-01/.aqua-matrix-heartbeat/claude-oauth-token}"
@@ -470,7 +618,7 @@ fi
 
 # ---------------------------------------------------------------- notify (best effort)
 # DM Tim from the host CLI identity (independent of any container), never fatal.
-NOTIFY=/home/waldknoten-01/.aqua-matrix-notify/notify-tim.sh
+NOTIFY="${CONSULTANT_NOTIFY:-/home/waldknoten-01/.aqua-matrix-notify/notify-tim.sh}"
 notify() {
   [ -x "$NOTIFY" ] || { echo "notify: $NOTIFY missing/not executable; skipping DM" >&2; return 0; }
   "$NOTIFY" "$@" || echo "notify: DM failed (non-fatal), see notify.log" >&2
@@ -541,11 +689,45 @@ else
   # Base = the EXISTING per-instance config when one is already present (so a re-run / relabel
   # preserves hand-customizations like a bespoke hello), otherwise the generic template.
   # The helper always sets id/target/display_name; with a non-empty persona it also (re)writes
-  # the heartfelt hello and the "# Who You Are" preamble (stripping any prior one first, so a
-  # changed persona name updates cleanly). To force a clean template render, delete $CFG first.
+  # the hello (the welcome; its voice line follows EFFECTIVE_VOICE, the value the --voice step
+  # below leaves in the file) and the "# Who You Are" preamble (stripping any prior one first,
+  # so a changed persona name updates cleanly). To force a clean template render, delete $CFG first.
   BASE="$TEMPLATE"; [ -f "$CFG" ] && BASE="$CFG"
-  python3 "$PERSONA_HELPER" render "$BASE" "$CFG" "$ID" "$TARGET" "$DISPLAY_NAME" "$PERSONA" "$HUMAN_NAME"
+  python3 "$PERSONA_HELPER" render "$BASE" "$CFG" "$ID" "$TARGET" "$DISPLAY_NAME" "$PERSONA" "$HUMAN_NAME" "$EFFECTIVE_VOICE"
 fi
+
+# --voice on|off: patch voice.enabled in the (rendered or kept) config, idempotently and
+# without touching any other key. `on` creates {"enabled": true} when the block is absent
+# and otherwise flips only `enabled`, preserving sibling voice keys (tts_voice, ...). `off`
+# flips `enabled` to false and KEEPS the block. `off` on a config with no voice block writes
+# nothing: absent already means disabled, and injecting the key would trip deny_unknown_fields
+# on an image older than the voice feature (image-before-config). No --voice = no write at
+# all, which is what lets --replace --keep-config carry an existing block through unchanged.
+# It runs BEFORE --refresh-prompt, whose canonical hello takes its voice line from this value.
+# A kept config's hello is never touched here (--keep-config = hello verbatim).
+if [ -n "$VOICE" ]; then
+python3 - "$CFG" "$VOICE" <<'PY'
+import json, sys
+path, mode = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path))
+want = mode == "on"
+voice = cfg.get("voice")
+if not isinstance(voice, dict):
+    if not want:
+        print(f">> voice: no voice block in {path}; already disabled, nothing written")
+        sys.exit(0)
+    voice = {}
+    cfg["voice"] = voice
+if voice.get("enabled") is want:
+    print(f">> voice: already {mode} in {path}, nothing written")
+    sys.exit(0)
+voice["enabled"] = want
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=True); f.write("\n")
+print(f">> voice: set voice.enabled={'true' if want else 'false'} in {path}")
+PY
+fi
+
 
 # --refresh-prompt: adopt the template's prompt surface into the (kept or re-rendered)
 # config, so a template prompt update can reach existing consultants without clobbering
@@ -583,44 +765,9 @@ if changed:
     print(f">> avatar_path {'set ' + want if want else 'removed'} in {path}")
 PY
 
-# --voice on|off: patch voice.enabled in the (rendered or kept) config, idempotently and
-# without touching any other key. `on` creates {"enabled": true} when the block is absent
-# and otherwise flips only `enabled`, preserving sibling voice keys (tts_voice, ...). `off`
-# flips `enabled` to false and KEEPS the block. `off` on a config with no voice block writes
-# nothing: absent already means disabled, and injecting the key would trip deny_unknown_fields
-# on an image older than the voice feature (image-before-config). No --voice = no write at
-# all, which is what lets --replace --keep-config carry an existing block through unchanged.
-if [ -n "$VOICE" ]; then
-python3 - "$CFG" "$VOICE" <<'PY'
-import json, sys
-path, mode = sys.argv[1], sys.argv[2]
-cfg = json.load(open(path))
-want = mode == "on"
-voice = cfg.get("voice")
-if not isinstance(voice, dict):
-    if not want:
-        print(f">> voice: no voice block in {path}; already disabled, nothing written")
-        sys.exit(0)
-    voice = {}
-    cfg["voice"] = voice
-if voice.get("enabled") is want:
-    print(f">> voice: already {mode} in {path}, nothing written")
-    sys.exit(0)
-voice["enabled"] = want
-with open(path, "w") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=True); f.write("\n")
-print(f">> voice: set voice.enabled={'true' if want else 'false'} in {path}")
-PY
-fi
-
 # A config with voice on but no key still launches (the agent logs the missing key and
 # disables voice at runtime), but say so loudly: this is almost always a missing env file.
-if [ "${#DEEPGRAM_ENV_ARGS[@]}" -eq 0 ] && python3 - "$CFG" <<'PY'
-import json, sys
-v = json.load(open(sys.argv[1])).get("voice")
-sys.exit(0 if isinstance(v, dict) and v.get("enabled") is True else 1)
-PY
-then
+if [ "${#DEEPGRAM_ENV_ARGS[@]}" -eq 0 ] && config_voice_enabled "$CFG"; then
   echo "!! voice: enabled in config but DEEPGRAM_API_KEY is not available (no readable $DEEPGRAM_ENV_FILE?); launching anyway, the agent will disable voice at runtime" >&2
 fi
 
@@ -691,6 +838,30 @@ else
 fi
 echo ">> persist volume ready, $IDENTITY_NOTE"
 
+# ---------------------------------------------------------------- greeted marker (for --onboard)
+# The agent commits <memory.config_dir>/.whats_new_seen only after the relay CONFIRMED the hello
+# send (claude-p hello_delivered). memory.config_dir is /agent/memory, bind-mounted from $MEM, so
+# the host sees it at $MEM/.whats_new_seen. Recorded here, after any --replace removal and --fresh
+# wipe and before the launch: a marker that already exists means this peer was greeted earlier.
+greeted_marker_path() {
+  python3 - "$CFG" "$MEM" <<'PY'
+import json, posixpath, sys
+cfg, mem = sys.argv[1], sys.argv[2]
+d = posixpath.normpath((json.load(open(cfg)).get("memory") or {}).get("config_dir") or "")
+if d == "/agent/memory":
+    print(f"{mem}/.whats_new_seen")
+elif d.startswith("/agent/memory/"):
+    print(f"{mem}/{d[len('/agent/memory/'):]}/.whats_new_seen")
+else:
+    sys.exit(1)   # not under the host-mounted memory dir: the marker is invisible from here
+PY
+}
+ONB_MARKER=""; ONB_ALREADY=0
+if [ "$ONBOARD" -eq 1 ]; then
+  ONB_MARKER="$(greeted_marker_path)" || ONB_MARKER=""
+  if [ -n "$ONB_MARKER" ] && [ -e "$ONB_MARKER" ]; then ONB_ALREADY=1; fi
+fi
+
 echo ">> launching $NAME bound single-target to $TARGET"
 set +e
 CID="$(podman run -d "${RUN_ARGS[@]}" 2>&1)"
@@ -728,48 +899,54 @@ else
   echo "   read it later with: bash ~/spawn-consultant.sh --print-mxid $MXID_SEL" >&2
 fi
 
-# ---------------------------------------------------------------- onboarding DM
+# ---------------------------------------------------------------- onboarding: confirm the welcome
+# The consultant sends her own welcome (the config's hello) into the DM room she creates. Here we
+# only confirm the outcome to Tim: wait (bounded, ONBOARD_WAIT) for the greeted marker, and watch
+# the relay log for its hello failure lines. A failure line is reported on the terminal at once,
+# but the wait continues (a crash restart under --restart on-failure retries the hello); on the
+# timeout Tim's WARN carries the last such line. Every outcome is non-fatal for the spawn.
+ONB_FAIL_RE='initiate-DM hello failed|no DM room yet; deferring hello|hello send failed'
+relay_hello_failure() {  # last relay hello-failure line of this container, ANSI-stripped, capped
+  podman logs "$NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$ONB_FAIL_RE" | tail -n1 \
+    | cut -c1-300 | tr '`' "'" || true
+}
 if [ "$ONBOARD" -eq 1 ]; then
-  if [ -n "$MXID" ]; then
-    onboard_hi="${HUMAN_NAME:-there}"
-    onboard_for="${HUMAN_NAME:-them}"
-    if [ -n "$PERSONA" ]; then
-      ONBOARD_MSG="$(cat <<EOF
-📋 Onboarding for ${HUMAN_NAME:-your contact}, forward the block below to ${onboard_for}.
-
-----------
-Hi ${onboard_hi}! You've got your own dedicated Aqua Consultant. Her name is ${PERSONA}.
-
-She'll reach out to you herself: expect a Matrix chat invite from
-  ${MXID}
-Just accept it and say hi; her greeting is already waiting for you.
-
-${PERSONA} is a warm, read-only guide to everything Aqua: the protocol, the spec and Rust SDK, the wider ecosystem of projects around it, and the thinking and governance behind it, all grounded in the latest local Aqua sources. She'll greet you, get to know what you're after, and tailor everything to you. She only ever explains and cites; she never changes anything. Enjoy! 🌊
-----------
-EOF
-)"
-    else
-      ONBOARD_MSG="$(cat <<EOF
-📋 Onboarding for ${HUMAN_NAME}, forward the block below to them.
-
-----------
-Hi ${HUMAN_NAME}! You now have your own dedicated Aqua Consultant on Matrix.
-
-It will reach out to you itself: expect a chat invite from
-  ${MXID}
-Just accept the invite; the greeting is already waiting in the room.
-
-It's a read-only assistant that answers questions about the Aqua protocol, spec, and Rust SDK, plus the repository ecosystem around them and the governance principles behind them, grounded in the latest local Aqua sources. On first contact it'll greet you and ask a couple of quick questions (your name, background, what brings you to Aqua, and how deep you want to go), then tailor everything to you. It only explains and cites; it never modifies anything.
-----------
-EOF
-)"
-    fi
-    notify -s INFO -t "onboarding: ${HUMAN_NAME:-$PERSONA} (${NAME})" "$ONBOARD_MSG"
-    echo ">> onboarding message DM'd to Tim (forward-ready, carries $MXID)"
+  ONB_WAIT="${ONBOARD_WAIT:-180}"
+  ONB_HELLO="$(python3 "$PERSONA_HELPER" hello-of "$CFG" "$MXID" 2>/dev/null)" || ONB_HELLO=""
+  if [ -n "$ONBOARD_WHO" ]; then ONB_TITLE="${ONBOARD_WHO} (${NAME})"; else ONB_TITLE="$NAME"; fi
+  if [ "$ONB_ALREADY" -eq 1 ]; then
+    echo ">> onboarding: ${NOTICE_PERSON:-the peer} was already greeted earlier; nothing to send"
+  elif [ -z "$ONB_HELLO" ]; then
+    echo "!! onboarding: $CFG has no hello, so the consultant sends no welcome" >&2
+    notify -s WARN -t "welcome NOT confirmed: ${ONB_TITLE}" \
+      "$(render_notice_unconfirmed 0 'The config has no `hello`, so the consultant sends no welcome at all.')"
+  elif [ -z "$ONB_MARKER" ]; then
+    echo "!! onboarding: memory.config_dir in $CFG is not under /agent/memory; delivery cannot be observed from the host" >&2
+    notify -s WARN -t "welcome NOT confirmed: ${ONB_TITLE}" \
+      "$(render_notice_unconfirmed 0 'Its memory.config_dir is not under /agent/memory, so the host cannot see the greeted marker.')"
   else
-    echo "!! could not read the agent's MXID from its session within the timeout, onboarding DM skipped." >&2
-    notify -s WARN -t "onboarding pending: ${NAME}" \
-      "Spawned '${NAME}' for ${HUMAN_NAME} but its first login has not completed yet, so its MXID is unknown. Read it with: bash ~/spawn-consultant.sh --print-mxid ${MXID_SEL}"
+    echo ">> onboarding: waiting up to ${ONB_WAIT}s for ${NOTICE_PERSONA:-the consultant}'s welcome to be delivered (marker $ONB_MARKER)"
+    ONB_START=$SECONDS; ONB_DONE=""; ONB_LOGLINE=""; ONB_SEEN=""
+    while :; do
+      if [ -e "$ONB_MARKER" ]; then ONB_DONE=delivered; break; fi
+      ONB_LOGLINE="$(relay_hello_failure)"
+      if [ -n "$ONB_LOGLINE" ] && [ "$ONB_LOGLINE" != "$ONB_SEEN" ]; then
+        echo "!! onboarding: the relay reports a failed hello (still waiting, a restart retries): $ONB_LOGLINE" >&2
+        ONB_SEEN="$ONB_LOGLINE"
+      fi
+      [ $((SECONDS - ONB_START)) -lt "$ONB_WAIT" ] || break
+      sleep 1
+    done
+    if [ "$ONB_DONE" = delivered ]; then
+      echo ">> onboarding: welcome delivered after $((SECONDS - ONB_START))s; telling Tim"
+      notify -s INFO -t "welcome delivered: ${ONB_TITLE}" "$(render_notice_delivered "$ONB_HELLO")"
+    else
+      ONB_DETAIL=""
+      [ -z "$ONB_LOGLINE" ] || ONB_DETAIL="Last relay log line: \`${ONB_LOGLINE}\`"
+      echo "!! onboarding: welcome not confirmed within ${ONB_WAIT}s; it retries on the next process start: podman restart $NAME" >&2
+      notify -s WARN -t "welcome NOT confirmed: ${ONB_TITLE}" \
+        "$(render_notice_unconfirmed "$ONB_WAIT" "$ONB_DETAIL")"
+    fi
   fi
 fi
 
