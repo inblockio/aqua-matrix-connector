@@ -21,6 +21,7 @@
 //! helpers ([`format`]).
 
 pub mod allowlist;
+pub mod attachments;
 pub mod format;
 pub mod inbox;
 pub mod jsonrpc;

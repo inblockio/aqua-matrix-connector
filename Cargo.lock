@@ -241,8 +241,10 @@ name = "aqua-system-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -258,6 +260,7 @@ dependencies = [
  "aqua-system-bridge",
  "clap",
  "matrix-sdk",
+ "matrix-sdk-base",
  "serde_json",
  "tokio",
  "tracing",

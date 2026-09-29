@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aqua_system_bridge::allowlist::{is_valid_mxid, AllowList};
+use aqua_system_bridge::attachments::{AttachmentPolicy, AttachmentStore};
 use aqua_system_bridge::format;
-use aqua_system_bridge::inbox::{Inbox, Query};
+use aqua_system_bridge::inbox::{Inbox, MediaRef, Query};
 use aqua_system_bridge::proto::{self, Request, Response};
 use aqua_system_bridge::ratelimit::RateLimiter;
 use aqua_system_bridge::{
@@ -30,14 +31,35 @@ const MAX_REQUEST_BYTES: u64 = 256 * 1024;
 
 pub enum SendKind {
     Text(String),
-    File { path: PathBuf, caption: String },
+    File {
+        path: PathBuf,
+        caption: String,
+    },
+    /// Download + decrypt an inbound attachment (`to_mxid` unused).
+    Fetch {
+        event_id: String,
+        room_id: String,
+        media: Option<MediaRef>,
+        max_bytes: u64,
+    },
+}
+
+/// Outcome of a command executed on the live Client.
+pub enum CmdOk {
+    /// A send: the new event id.
+    Sent(String),
+    /// A fetch: the decrypted, verified bytes and the mime type if known.
+    Fetched {
+        bytes: Vec<u8>,
+        mimetype: Option<String>,
+    },
 }
 
 pub struct SendCmd {
     pub to_mxid: String,
     pub kind: SendKind,
     pub deadline: Instant,
-    pub reply: oneshot::Sender<Result<String, String>>,
+    pub reply: oneshot::Sender<Result<CmdOk, String>>,
 }
 
 #[derive(Default, Clone)]
@@ -61,11 +83,23 @@ pub struct Shared {
     /// backfill does not re-log them every cycle.
     pub dropped: Mutex<std::collections::HashSet<String>>,
     pub cmd_tx: mpsc::Sender<SendCmd>,
+    pub attach_policy: AttachmentPolicy,
+    pub attachments: AttachmentStore,
+    /// Serialises fetches so two sessions asking for the same entry do not
+    /// download it twice.
+    pub fetch_lock: tokio::sync::Mutex<()>,
 }
 
 impl Shared {
-    pub fn new(state_dir: &Path, cmd_tx: mpsc::Sender<SendCmd>) -> Self {
+    pub fn new(
+        state_dir: &Path,
+        cmd_tx: mpsc::Sender<SendCmd>,
+        attach_policy: AttachmentPolicy,
+    ) -> Self {
         Self {
+            attach_policy,
+            attachments: AttachmentStore::new(state_dir.join("attachments")),
+            fetch_lock: tokio::sync::Mutex::new(()),
             state_dir: state_dir.to_path_buf(),
             allow: Mutex::new(AllowList::new(state_dir.join("allowlist.toml"))),
             inbox: Mutex::new(Inbox::load(state_dir.join("inbox.jsonl"))),
@@ -390,6 +424,7 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 }
             }
         }
+        Request::FetchAttachment { inbox_seq } => fetch_attachment(shared, inbox_seq).await,
         Request::Status => {
             let st = shared.status.lock().unwrap().clone();
             let inbox = shared.inbox.lock().unwrap();
@@ -455,6 +490,12 @@ async fn send(
         Ok(Err(_)) => Err("bridge dropped the request (shutting down?)".to_string()),
         Err(_) => Err("send did not complete in time; outcome unknown".to_string()),
     };
+    let outcome = outcome.and_then(|ok| match ok {
+        CmdOk::Sent(id) => Ok(id),
+        CmdOk::Fetched { .. } => {
+            Err("internal error: send answered with a fetch result".to_string())
+        }
+    });
     match outcome {
         Ok(event_id) => {
             tracing::info!(to = %name, origin = %origin, event_id = %event_id, "sent");
@@ -473,6 +514,103 @@ async fn send(
             tracing::warn!(to = %name, origin = %origin, "send failed: {e}");
             shared.audit(json!({"event": "send_failed", "to": name, "origin": origin, "error": e}));
             Response::err(format!("NOT delivered to {name}: {e}"))
+        }
+    }
+}
+
+/// `fetch_attachment`: serve the cached copy, or download + decrypt + verify
+/// on the live Client and store it (mode 600) under `<state>/attachments/`.
+async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
+    let _guard = shared.fetch_lock.lock().await;
+    let entry = match shared.inbox.lock().unwrap().get(inbox_seq).cloned() {
+        Some(e) => e,
+        None => {
+            return Response::err(format!(
+                "no inbox entry with seq {inbox_seq} (see read_inbox)"
+            ))
+        }
+    };
+    if !entry.has_attachment() {
+        return Response::err(format!(
+            "inbox entry {inbox_seq} is a {} message, not an attachment",
+            entry.kind
+        ));
+    }
+    let raw_name = entry.filename.clone().unwrap_or_else(|| entry.body.clone());
+    let policy = shared.attach_policy;
+    if let Some(f) = shared
+        .attachments
+        .lookup(inbox_seq, &entry.event_id, &raw_name)
+    {
+        return Response::ok(
+            json!({"framed": format::frame_attachment(&entry, &f, true), "path": f.path, "sha256": f.sha256, "cached": true}),
+        );
+    }
+    if let Some(declared) = entry.media.as_ref().and_then(|m| m.size) {
+        if let Err(e) = policy.check_size(declared, "declared") {
+            shared.audit(json!({"event": "fetch_refused", "reason": "too_large", "inbox_seq": inbox_seq, "declared": declared}));
+            return Response::err(e);
+        }
+    }
+    let (tx, rx) = oneshot::channel();
+    let cmd = SendCmd {
+        to_mxid: String::new(),
+        kind: SendKind::Fetch {
+            event_id: entry.event_id.clone(),
+            room_id: entry.room_id.clone(),
+            media: entry.media.clone(),
+            max_bytes: policy.max_bytes,
+        },
+        deadline: Instant::now() + SEND_DEADLINE,
+        reply: tx,
+    };
+    if shared.cmd_tx.send(cmd).await.is_err() {
+        return Response::err("bridge Matrix loop is not running");
+    }
+    let outcome = match tokio::time::timeout(SEND_DEADLINE + Duration::from_secs(10), rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err("bridge dropped the request (shutting down?)".to_string()),
+        Err(_) => Err("fetch did not complete in time".to_string()),
+    };
+    let (bytes, mimetype) = match outcome {
+        Ok(CmdOk::Fetched { bytes, mimetype }) => (bytes, mimetype),
+        Ok(CmdOk::Sent(_)) => {
+            return Response::err("internal error: fetch answered with a send result")
+        }
+        Err(e) => {
+            shared.audit(json!({"event": "fetch_failed", "inbox_seq": inbox_seq, "error": e}));
+            return Response::err(format!("attachment {inbox_seq} NOT fetched: {e}"));
+        }
+    };
+    let mimetype = mimetype.or_else(|| entry.media.as_ref().and_then(|m| m.mimetype.clone()));
+    let stored = shared.attachments.store(
+        &policy,
+        inbox_seq,
+        &entry.event_id,
+        &raw_name,
+        mimetype,
+        &bytes,
+    );
+    drop(bytes);
+    let removed = shared
+        .attachments
+        .prune(policy.retention_days, SystemTime::now());
+    match stored {
+        Ok(f) => {
+            tracing::info!(
+                inbox_seq,
+                size = f.size,
+                removed_old = removed,
+                "attachment fetched"
+            );
+            shared.audit(json!({"event": "fetched", "inbox_seq": inbox_seq, "bytes": f.size, "sha256": f.sha256}));
+            Response::ok(
+                json!({"framed": format::frame_attachment(&entry, &f, false), "path": f.path, "sha256": f.sha256, "cached": false}),
+            )
+        }
+        Err(e) => {
+            shared.audit(json!({"event": "fetch_failed", "inbox_seq": inbox_seq, "error": e}));
+            Response::err(format!("attachment {inbox_seq} NOT stored: {e}"))
         }
     }
 }

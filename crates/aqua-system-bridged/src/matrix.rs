@@ -30,7 +30,7 @@ use matrix_sdk::{
 use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 
-use crate::bridge::{SendCmd, SendKind, Shared};
+use crate::bridge::{CmdOk, SendCmd, SendKind, Shared};
 
 const ROLE: &str = "aqua-system";
 const REFRESH_GUARD_SECS: u64 = 30;
@@ -42,6 +42,8 @@ const BACKFILL_LIMIT: u32 = 30;
 const BACKFILL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on one send attempt (the connector's own retries included).
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound on one attachment download + decrypt (50 MiB on a slow link).
+const FETCH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(150);
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -200,24 +202,42 @@ async fn execute(agent: &AgentClient, cmd: SendCmd) -> Option<SendCmd> {
         ));
         return None;
     }
+    // Downloads run here, inline, on the one live Client: spawning them would
+    // keep this Client alive into the next cycle next to its successor.
+    let (limit, what) = match cmd.kind {
+        SendKind::Fetch { .. } => (FETCH_ATTEMPT_TIMEOUT, "fetch"),
+        _ => (SEND_ATTEMPT_TIMEOUT, "send"),
+    };
     let fut = async {
         match &cmd.kind {
-            SendKind::Text(md) => agent.send_dm_chunked(&cmd.to_mxid, md).await,
-            SendKind::File { path, caption } => {
-                agent.send_file(&cmd.to_mxid, path, Some(caption)).await
-            }
+            SendKind::Text(md) => agent
+                .send_dm_chunked(&cmd.to_mxid, md)
+                .await
+                .map(CmdOk::Sent),
+            SendKind::File { path, caption } => agent
+                .send_file(&cmd.to_mxid, path, Some(caption))
+                .await
+                .map(CmdOk::Sent),
+            SendKind::Fetch {
+                event_id,
+                room_id,
+                media,
+                max_bytes,
+            } => crate::media::fetch(agent.client(), room_id, event_id, media.clone(), *max_bytes)
+                .await
+                .map(|(bytes, mimetype)| CmdOk::Fetched { bytes, mimetype }),
         }
     };
-    let res = match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, fut).await {
+    let res = match tokio::time::timeout(limit, fut).await {
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!(
-            "send timed out after {}s (outcome unknown)",
-            SEND_ATTEMPT_TIMEOUT.as_secs()
+            "{what} timed out after {}s (outcome unknown)",
+            limit.as_secs()
         )),
     };
     match res {
-        Ok(id) => {
-            let _ = cmd.reply.send(Ok(id));
+        Ok(ok) => {
+            let _ = cmd.reply.send(Ok(ok));
             None
         }
         Err(e) if is_unknown_token(&e) => {
@@ -373,6 +393,7 @@ fn ingest(shared: &Shared, own: &str, ev: &OriginalSyncRoomMessageEvent, room_id
         kind: kind.to_string(),
         body,
         filename,
+        media: crate::media::media_ref(&ev.content.msgtype),
     };
     let seq = shared.inbox.lock().unwrap().ingest(entry);
     match seq {

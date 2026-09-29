@@ -61,6 +61,9 @@ pub enum Request {
         #[serde(default)]
         after_seq: Option<u64>,
     },
+    /// Download (on demand), decrypt and store the attachment of one inbox
+    /// entry; a second call returns the cached file.
+    FetchAttachment { inbox_seq: u64 },
     /// Daemon health: identity, connection state, inbox counts.
     Status,
 }

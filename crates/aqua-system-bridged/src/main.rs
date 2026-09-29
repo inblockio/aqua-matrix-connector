@@ -19,6 +19,7 @@
 
 mod bridge;
 mod matrix;
+mod media;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -61,6 +62,12 @@ struct Args {
         default_value = "Aqua System"
     )]
     display_name: String,
+    /// Size cap for one fetched inbound attachment, in bytes (default 50 MiB).
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_ATTACHMENT_MAX_BYTES", default_value_t = aqua_system_bridge::attachments::DEFAULT_MAX_BYTES)]
+    attachment_max_bytes: u64,
+    /// Fetched attachments older than this many days are deleted (default 14).
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_ATTACHMENT_RETENTION_DAYS", default_value_t = aqua_system_bridge::attachments::DEFAULT_RETENTION_DAYS)]
+    attachment_retention_days: u64,
     /// Print the identity (DID, and MXID once logged in) and exit.
     #[arg(long)]
     print_identity: bool,
@@ -127,7 +134,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
-    let shared = Arc::new(bridge::Shared::new(&state, cmd_tx));
+    let policy = aqua_system_bridge::attachments::AttachmentPolicy {
+        max_bytes: args.attachment_max_bytes,
+        retention_days: args.attachment_retention_days,
+    };
+    let shared = Arc::new(bridge::Shared::new(&state, cmd_tx, policy));
+    let pruned = shared
+        .attachments
+        .prune(policy.retention_days, std::time::SystemTime::now());
+    if pruned > 0 {
+        tracing::info!(pruned, "removed fetched attachments past retention");
+    }
 
     let listener = bridge::bind_socket(&sock)?;
     tracing::info!(sock = %sock.display(), state = %state.display(), matrix = %args.matrix_url, "aqua-system-bridged starting");

@@ -201,6 +201,15 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
                 Duration::from_secs(t + 30),
             )
         }
+        jsonrpc::T_FETCH_ATTACHMENT => {
+            let Some(seq) = args.get("inbox_seq").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            }) else {
+                return ("fetch_attachment needs an integer `inbox_seq`".into(), true);
+            };
+            (Request::FetchAttachment { inbox_seq: seq }, SEND_TIMEOUT)
+        }
         other => return (format!("unknown tool {other}"), true),
     };
 
@@ -241,6 +250,7 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
                 format::frame_entries(&entries, "Reply received (marked read).")
             }
         }
+        jsonrpc::T_FETCH_ATTACHMENT => d["framed"].as_str().map(String::from).unwrap_or_else(|| d.to_string()),
         _ => d.to_string(),
     };
     (text, false)

@@ -38,8 +38,34 @@ pub struct InboxEntry {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+    /// Media reference of an attachment (fetched on demand with
+    /// `fetch_attachment`). Never shown to sessions: for an E2EE attachment it
+    /// holds the file's decryption key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaRef>,
     #[serde(default)]
     pub read: bool,
+}
+
+/// Where an attachment's bytes live, as recorded from the event at ingest
+/// time. `source` is the Matrix `MediaSource` JSON (`{"url": ...}` or
+/// `{"file": <EncryptedFile>}`), kept opaque here so this crate stays
+/// Matrix-free.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaRef {
+    pub source: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    /// Size declared by the sender (unverified until downloaded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+impl InboxEntry {
+    /// True when the entry is an attachment `fetch_attachment` can download.
+    pub fn has_attachment(&self) -> bool {
+        crate::attachments::MEDIA_KINDS.contains(&self.kind.as_str())
+    }
 }
 
 /// A new inbound message, before it gets a `seq`.
@@ -53,6 +79,7 @@ pub struct NewEntry {
     pub kind: String,
     pub body: String,
     pub filename: Option<String>,
+    pub media: Option<MediaRef>,
 }
 
 /// Filter for [`Inbox::query`].
@@ -144,6 +171,7 @@ impl Inbox {
             kind: new.kind,
             body: new.body,
             filename: new.filename,
+            media: new.media,
             read: false,
         });
         self.prune();
@@ -191,6 +219,11 @@ impl Inbox {
             }
         }
         out
+    }
+
+    /// The entry with this seq, if still in the inbox.
+    pub fn get(&self, seq: u64) -> Option<&InboxEntry> {
+        self.entries.iter().find(|e| e.seq == seq)
     }
 
     /// Mark the given seqs read. Persists if anything changed.
@@ -266,6 +299,7 @@ mod tests {
             kind: "text".into(),
             body: format!("body {id}"),
             filename: None,
+            media: None,
         }
     }
 
