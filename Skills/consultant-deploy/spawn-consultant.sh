@@ -93,21 +93,30 @@
 # render/patch the config file and create the persist dirs, since those are the run's
 # inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
 #
-# Onboarding (--onboard): once the agent's MXID is known, the script renders the peer welcome
+# Owner rule (Tim, 2026-09-29): every consultant has exactly ONE authoritative Owner, its single
+# target peer (--target, or the kept config's target; --generic = Tim). EVERY real spawn (new,
+# --replace, --keep-config, and so every fleet roll) first makes sure the Owner is on the Aqua
+# System allow-list (owner-allowlist.py: appends name=<label>, else <label>-owner, when no entry
+# has that MXID; flock, backup, validated like the bridge parses it, atomic rename). Fail-closed:
+# when that cannot be ensured (file missing/invalid, both names taken, generic operator absent)
+# the spawn aborts before any config render, --replace removal or launch. Print modes preview only.
+#
+# Onboarding (--onboard): once the agent has logged in (its MXID is known), the script renders the peer welcome
 # (persona or legacy wording; the voice line only when the config has voice.enabled == true, read
 # from the config file so --keep-config spawns are right too) and tries to send it to --target
 # DIRECTLY as the shared "Aqua System" identity, via the stdio MCP server
 # aqua-system-bridge-mcp (tool send_message, via onboard-send.py, hard 30 s cap). The bridge only
 # messages people on ~/.aqua-system-bridge/allowlist.toml, and that Tim-approved list is what
-# authorizes the direct send. Then Tim gets ONE DM: "onboarding sent" (with the quoted text) on
-# delivery, or "onboarding to forward" (the text between two lines, plus the reason) when the peer
-# is not allow-listed (INFO) or the bridge failed or timed out (WARN). A failed send never fails
+# authorizes the direct send (the Owner rule above puts the peer there). Then Tim gets ONE DM:
+# "onboarding sent" (with the quoted text) on delivery, or "onboarding to forward" (the text
+# between two lines, plus the reason, WARN) when the bridge refused, failed or timed out (a
+# refusal for the allow-list is now unexpected and says so). A failed send never fails
 # the spawn. --onboard-forward-only (implies --onboard) skips the direct send: the old behaviour.
 #
 # --print-onboarding: print the peer welcome and both Tim notices to stdout and exit 0, before any
-# token, network, config write, container or DM (offline copy review). The MXID comes from the
-# persisted session when there is one, else the placeholder @<agent-mxid>:matrix.inblock.io; the
-# voice line follows --voice when given, else the existing config (else the template).
+# token, network, config write, container or DM (offline copy review), plus a read-only preview
+# of the Owner allow-list step on stderr. The voice line follows --voice when given, else the
+# existing config (else the template).
 #
 # Env overrides (all optional; the defaults are this host's live paths):
 #   CONSULTANT_TEST_DIR     dir holding configs/persist/avatars/template (default ~/.aqua-matrix-test)
@@ -118,6 +127,7 @@
 #   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
 #   AQUA_SYSTEM_BRIDGE_MCP  bridge MCP binary for --onboard (default ~/.local/bin/aqua-system-bridge-mcp)
 #   ONBOARD_SEND_TIMEOUT    seconds before a direct onboarding send counts as failed (default 30)
+#   AQUA_SYSTEM_ALLOWLIST   Aqua System allow-list the Owner step ensures (default ~/.aqua-system-bridge/allowlist.toml)
 #   CONSULTANT_NOTIFY       notifier used for Tim's DMs (default ~/.aqua-matrix-notify/notify-tim.sh; tests)
 #
 # Examples:
@@ -330,6 +340,27 @@ fi
 # means a pseudonymous peer, which the persona render greets without a name.
 [ -n "$PERSONA" ] || : "${HUMAN_NAME:=$DISPLAY_NAME}"
 
+# ---------------------------------------------------------------- owner allow-list
+# Every consultant has exactly ONE authoritative Owner: its single target peer (--target, or the
+# kept config's target; for --generic that is Tim). Tim's standing rule (2026-09-29): the Owner
+# is always on the Aqua System allow-list, so the direct onboarding send never falls back for an
+# allow-list reason. owner-allowlist.py appends a [[recipients]] entry (name = label, else
+# <label>-owner) only when no entry has that MXID yet, under flock, with a backup, validated
+# against the bridge's own rules before an atomic rename. FAIL-CLOSED: a real spawn aborts
+# before any container change when the Owner cannot be ensured. Print modes only preview.
+OWNER_HELPER="$(dirname "$PERSONA_HELPER")/owner-allowlist.py"
+ALLOWLIST_FILE="${AQUA_SYSTEM_ALLOWLIST:-$HOME/.aqua-system-bridge/allowlist.toml}"
+ensure_owner_allowlisted() {  # ensure_owner_allowlisted check|apply
+  local sel=(--generic)
+  [ "$GENERIC" -eq 1 ] || sel=(--label "$LABEL")
+  if [ ! -f "$OWNER_HELPER" ]; then
+    echo "!! owner allow-list: helper missing: $OWNER_HELPER" >&2
+    [ "$1" = check ]; return
+  fi
+  python3 "$OWNER_HELPER" "$1" --path "$ALLOWLIST_FILE" --mxid "$TARGET" \
+    --container "$NAME" --who "${PERSONA:-$DISPLAY_NAME}" "${sel[@]}"
+}
+
 # ---------------------------------------------------------------- onboarding copy
 # One source for the peer welcome and Tim's two notices, used by --onboard and by
 # --print-onboarding. No em/en dashes anywhere in the rendered text (tests enforce it).
@@ -346,9 +377,10 @@ sys.exit(0 if isinstance(v, dict) and v.get("enabled") is True else 1)
 PY
 }
 
-# render_peer_welcome <agent-mxid> <voice 0|1>: the Markdown the peer reads.
+# render_peer_welcome <voice 0|1>: the Markdown the peer reads. The reader is already inside
+# Element (the DM arrives there), so it carries no app explanation and no agent MXID.
 render_peer_welcome() {
-  local mxid="$1" voice="$2" hi="${HUMAN_NAME:-there}"
+  local voice="$1" hi="${HUMAN_NAME:-there}"
   local intro who who_mid she she_lc obj poss
   if [ -n "$PERSONA" ]; then
     intro="You now have your own Aqua Consultant, **${PERSONA}**. She is an AI assistant who knows Aqua inside out, and she is there just for you whenever you have a question."
@@ -365,7 +397,7 @@ render_peer_welcome() {
     "Aqua is inblock.io's protocol for trust that travels with your data: every signature, AI action and file carries its own proof, so anyone can check what happened." \
     "" \
     "**How to start**" \
-    "${who} has sent you a chat invitation in Element, your Matrix chat app. Accept it, and ${poss} welcome message is already waiting for you. If you ever need to find ${obj}, ${poss} address is \`${mxid}\`." \
+    "Open your chat with ${who_mid} and say hi. If it still shows as an invitation, accept it first; ${poss} welcome is already waiting there." \
     "" \
     "**What you can ask**" \
     "Anything, in your own words. You don't need a technical background, and if you are a developer ${she_lc} will happily go deep. For example:" \
@@ -387,7 +419,7 @@ render_peer_welcome() {
 
 # render_notice_delivered <welcome> <event-id>: Tim's DM after a direct delivery (text quoted).
 render_notice_delivered() {
-  printf '✅ Onboarding delivered to %s directly (Aqua System DM, event %s). %s has also invited them to a chat. Nothing to forward.\n\nFor reference, this is what they received:\n\n' \
+  printf '✅ Onboarding delivered to %s directly (Aqua System DM, event %s). %s has also invited them to a chat.\n\nFor reference, this is what they received:\n\n' \
     "${HUMAN_NAME:-the peer}" "$2" "${PERSONA:-The consultant}"
   printf '%s\n' "$1" | sed -e 's/^/> /' -e 's/^> $/>/'
 }
@@ -404,7 +436,6 @@ ONBOARD_WHO="${HUMAN_NAME:-$PERSONA}"
 
 if [ "$PRINT_ONBOARDING" -eq 1 ]; then
   # Offline copy review: no token, no network, no config write, no container, no DM.
-  PO_MXID="$(agent_mxid_from_store)" || PO_MXID="@<agent-mxid>:matrix.inblock.io"
   case "$VOICE" in
     on)  PO_VOICE=1 ;;
     off) PO_VOICE=0 ;;
@@ -412,17 +443,22 @@ if [ "$PRINT_ONBOARDING" -eq 1 ]; then
          if config_voice_enabled "$PO_BASE"; then PO_VOICE=1; else PO_VOICE=0; fi ;;
   esac
   if [ "$ONBOARD_DIRECT" -eq 1 ]; then
-    PO_REASON="${TARGET} is not on the Aqua System allow-list"
+    PO_LEVEL=WARN; PO_REASON="the Aqua System bridge failed (<short error>)"
   else
-    PO_REASON="direct send disabled (--onboard-forward-only)"
+    PO_LEVEL=INFO; PO_REASON="direct send disabled (--onboard-forward-only)"
   fi
-  PO_WELCOME="$(render_peer_welcome "$PO_MXID" "$PO_VOICE")"
+  # The Owner step a real spawn runs first, previewed read-only (stderr, so stdout stays copy).
+  case "$TARGET" in
+    @*:*) ensure_owner_allowlisted check ;;
+    *) echo ">> owner allow-list: --target is not an MXID yet (a DID is resolved only on a real spawn); not previewed" >&2 ;;
+  esac
+  PO_WELCOME="$(render_peer_welcome "$PO_VOICE")"
   if [ "$PO_VOICE" = 1 ]; then PO_VOICE_WORD=on; else PO_VOICE_WORD=off; fi
   printf '==== peer welcome (Aqua System DM to %s; voice line %s) ====\n' "$TARGET" "$PO_VOICE_WORD"
   printf '%s\n' "$PO_WELCOME"
   printf '\n==== Tim notice, delivered: INFO "onboarding sent: %s (%s)" ====\n' "$ONBOARD_WHO" "$NAME"
   render_notice_delivered "$PO_WELCOME" '$<event-id>'
-  printf '\n==== Tim notice, not delivered: INFO "onboarding to forward: %s (%s)" (WARN if the bridge errored) ====\n' "$ONBOARD_WHO" "$NAME"
+  printf '\n==== Tim notice, not delivered: %s "onboarding to forward: %s (%s)" (example reason) ====\n' "$PO_LEVEL" "$ONBOARD_WHO" "$NAME"
   render_notice_forward "$PO_WELCOME" "$PO_REASON"
   exit 0
 fi
@@ -489,6 +525,17 @@ case "$DISPLAY_NAME" in
   *'"'*|*$'\n'*)
     echo "!! --display must not contain a double-quote or newline (would break the systemd unit)." >&2; exit 2 ;;
 esac
+
+# The Owner (= TARGET, now a resolved MXID) must be allow-listed BEFORE anything else changes:
+# before the config render, the --replace removal and the launch. --print-run only previews.
+if [ "$PRINT_RUN" -eq 1 ]; then
+  ensure_owner_allowlisted check
+elif ! ensure_owner_allowlisted apply; then
+  echo "!! aborting: could not put the Owner $TARGET on the Aqua System allow-list ($ALLOWLIST_FILE)." >&2
+  echo "   Nothing was changed: no config render, no container removal, no launch. Fix the file (or" >&2
+  echo "   the name clash) and re-run; see SKILL.md \"Owner rule\"." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- token (by reference)
 TOKEN_FILE="${AQUA_CLAUDE_TOKEN_FILE:-/home/waldknoten-01/.aqua-matrix-heartbeat/claude-oauth-token}"
@@ -856,7 +903,7 @@ fi
 if [ "$ONBOARD" -eq 1 ]; then
   if [ -n "$MXID" ]; then
     if config_voice_enabled "$CFG"; then ONB_VOICE=1; else ONB_VOICE=0; fi
-    ONB_WELCOME="$(render_peer_welcome "$MXID" "$ONB_VOICE")"
+    ONB_WELCOME="$(render_peer_welcome "$ONB_VOICE")"
     ONB_LEVEL=INFO; ONB_EVENT=""; ONB_REASON=""
     if [ "$ONBOARD_DIRECT" -eq 0 ]; then
       ONB_REASON="direct send disabled (--onboard-forward-only)"
@@ -875,7 +922,8 @@ if [ "$ONBOARD" -eq 1 ]; then
       case "$onb_rc:$ONB_OUT" in
         0:DELIVERED\ *) ONB_EVENT="$ONB_DETAIL" ;;
         3:REFUSED\ *is\ not\ on\ the\ Aqua\ System\ allow-list*)
-          ONB_REASON="${TARGET} is not on the Aqua System allow-list" ;;
+          ONB_LEVEL=WARN
+          ONB_REASON="${TARGET} is not on the Aqua System allow-list (unexpected: the owner is added automatically at spawn; check allowlist.toml)" ;;
         3:REFUSED\ *allow-list\ failed\ to\ load*)
           ONB_LEVEL=WARN; ONB_REASON="the Aqua System bridge failed (${ONB_DETAIL})" ;;
         3:REFUSED\ *)
@@ -897,12 +945,12 @@ if [ "$ONBOARD" -eq 1 ]; then
       fi
       notify -s "$ONB_LEVEL" -t "onboarding to forward: ${ONBOARD_WHO} (${NAME})" \
         "$(render_notice_forward "$ONB_WELCOME" "$ONB_REASON")"
-      echo ">> onboarding: forward-ready copy DM'd to Tim (carries $MXID)"
+      echo ">> onboarding: forward-ready copy DM'd to Tim"
     fi
   else
     echo "!! could not read the agent's MXID from its session within the timeout, onboarding skipped." >&2
     notify -s WARN -t "onboarding pending: ${NAME}" \
-      "Spawned '${NAME}' for ${ONBOARD_WHO:-its peer} but its first login has not completed yet, so its MXID is unknown and nothing was sent. Once it has logged in, get the text to forward with the same spawn flags plus --print-onboarding (it reads the MXID from the session)."
+      "Spawned '${NAME}' for ${ONBOARD_WHO:-its peer} but its first login has not completed yet, so it has not invited them yet and nothing was sent. Once it has logged in, get the text to forward with the same spawn flags plus --print-onboarding, or check with: bash ~/spawn-consultant.sh --print-mxid ${MXID_SEL}"
   fi
 fi
 

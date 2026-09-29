@@ -32,7 +32,7 @@ runs it via symlinks so there is a single source of truth (no drift):
 | `Skills/consultant-deploy/restore-agent-fleet.sh` | `~/restore-agent-fleet.sh` | boot-time fleet restore (see below) |
 | `Skills/consultant-deploy/consultant-config.template.json` | `~/.aqua-matrix-test/consultant-config.template.json` | config template |
 | `Skills/consultant-deploy/consultants.registry.example` | *(host state — not symlinked)* | format reference |
-| `Skills/consultant-deploy/consultant-persona.py`, `onboard-send.py` | *(none: found next to the symlink target)* | persona render, onboarding direct send |
+| `Skills/consultant-deploy/consultant-persona.py`, `onboard-send.py`, `owner-allowlist.py` | *(none: found next to the symlink target)* | persona render, onboarding direct send, Owner allow-list step |
 
 **Host state stays on the host** (not in the repo): the live registry
 `~/.aqua-matrix-test/consultants.registry`, and every consultant's `<label>-aqua-consultant-config.json`
@@ -78,21 +78,53 @@ bash ~/spawn-consultant.sh \
   --onboard
 ```
 
-**Onboarding (`--onboard`).** Once the agent's MXID is known, spawn renders the peer welcome
-(what Aqua is, how to accept the invitation, example questions, "good to know"; persona wording
+**Owner rule (Tim, standing, 2026-09-29).** Every consultant has exactly ONE authoritative
+Owner: its single target peer (`--target`, or the kept config's `target`; for `--generic`, Tim).
+The Owner is **always on the Aqua System allow-list**: every real spawn (new, `--replace`,
+`--keep-config`, and therefore every `roll-consultant-fleet.sh` roll, which backfills existing
+Owners) runs `owner-allowlist.py` before anything else changes (before the config render, the
+`--replace` removal and the launch). It is a no-op when any `[[recipients]]` entry already has
+that MXID (ASCII case-insensitive, like the bridge); otherwise it appends
+
+```toml
+[[recipients]]
+name = "<label>"            # "<label>-owner" if <label> is taken (by a person OR a room)
+mxid = "<Owner MXID>"
+note = "Owner of <container> (<persona or display>), auto-added by spawn-consultant.sh YYYY-MM-DD"
+```
+
+right after the last existing `[[recipients]]` entry, under `flock` on `allowlist.toml.lock`,
+with a backup `allowlist.toml.bak-<label>-<ts>` (only on change), via a mode-600 temp file that
+is parsed with `tomllib` and checked against the bridge's own rules (names unique across
+recipients and rooms, valid MXIDs/room ids, existing entries unchanged) before an atomic rename.
+The daemon hot-reloads it. Tim's standing approval covers Owners only; everyone else still needs
+his explicit go. The generic consultant's Owner (Tim) is never auto-added: if he is missing, the
+spawn fails. Path override: `AQUA_SYSTEM_ALLOWLIST` (default `~/.aqua-system-bridge/allowlist.toml`).
+
+**New failure mode (fail-closed):** when the Owner cannot be ensured (file missing, unreadable or
+already invalid, `<label>` and `<label>-owner` both taken, generic operator absent, lock not
+obtained in 60 s, result would not validate) the spawn prints `!! owner allow-list: …` and
+`!! aborting: could not put the Owner … on the Aqua System allow-list` and exits 1 with nothing
+changed: no config render, no `--replace` removal, no launch. A fleet roll reports that label as
+failed and moves on. Fix the file (a bad file also silences the bridge itself) or free a name, then
+re-run. `--print-run` and `--print-onboarding` only preview (`would add …` / `already present`) and
+never write.
+
+**Onboarding (`--onboard`).** Once the agent has logged in (its MXID is known), spawn renders the peer welcome
+(what Aqua is, "open your chat with <persona> and say hi", example questions, "good to know"; persona wording
 with `--persona`, neutral "it" wording without; the "send her voice messages" line only when the
 config has `voice.enabled: true`, read from the config file so `--keep-config` spawns are right)
 and sends it to `--target` **directly** as the shared "Aqua System" identity, through the bridge's
 stdio MCP server (`~/.local/bin/aqua-system-bridge-mcp`, tool `send_message`, via
 `onboard-send.py`, hard cap 30 s). The bridge only messages people on
 `~/.aqua-system-bridge/allowlist.toml`; that Tim-approved list is what authorizes the direct
-send, so **add the peer there (with Tim's approval) before spawning** if the welcome should go out
-by itself. The operator then gets ONE DM:
+send, and the Owner rule above puts the peer there. The welcome carries no agent MXID and no
+app explanation (the reader is already in Element). The operator then gets ONE DM:
 
 | Outcome | Level | Title | Body |
 |---|---|---|---|
-| delivered | INFO | `onboarding sent: <name or persona> (<container>)` | event id + the welcome as a quote, "Nothing to forward." |
-| peer not allow-listed | INFO | `onboarding to forward: …` | the welcome between two `----------` rules + the reason |
+| delivered | INFO | `onboarding sent: <name or persona> (<container>)` | event id + the welcome as a quote |
+| peer not allow-listed (unexpected since the Owner rule) | WARN | `onboarding to forward: …` | the welcome between two `----------` rules + the reason, flagged as unexpected ("check allowlist.toml") |
 | bridge error / timeout | WARN | `onboarding to forward: …` | same, reason carries the short error (a timeout says it may still arrive) |
 
 A failed direct send never fails the spawn. `--onboard-forward-only` (implies `--onboard`) skips
@@ -104,9 +136,8 @@ bash ~/spawn-consultant.sh --print-onboarding --label gawain --target '@…:matr
   --persona Talia --name Gawain --voice on
 ```
 
-The MXID comes from the persisted session when there is one, else the placeholder
-`@<agent-mxid>:matrix.inblock.io`; the voice line follows `--voice` when given, else the existing
-config, else the template. With `--replace --keep-config --onboard`, also pass `--persona`/`--name`
+It also previews the Owner step on stderr. The voice line follows `--voice` when given, else the
+existing config, else the template. With `--replace --keep-config --onboard`, also pass `--persona`/`--name`
 (the kept config does not record them), or the welcome falls back to the neutral wording.
 
 **MXIDs are never derived from DIDs (2026-09-27).** siwx-oidc gives every NEW DID an opaque
@@ -205,9 +236,9 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 | `--replace` | `podman rm -f` + re-run, **reusing persist** → DID + memory PRESERVED (the image-roll path). |
 | `--keep-config` | Use the existing config verbatim (no re-render); derives id/target/display from it. |
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) |
-| `--onboard` | After connect, read the agent MXID from its persisted session, send the peer the welcome directly via the Aqua System bridge (allow-listed peers only), and DM the operator "onboarding sent" (INFO) or "onboarding to forward" (INFO when not allow-listed, WARN on a bridge error). Never fails the spawn. See "Onboarding". |
+| `--onboard` | After the agent's first login, send the peer (the Owner, allow-listed at spawn) the welcome directly via the Aqua System bridge and DM the operator "onboarding sent" (INFO) or "onboarding to forward" (WARN on a refusal or bridge error; INFO for forward-only). Never fails the spawn. See "Onboarding". |
 | `--onboard-forward-only` | Implies `--onboard` but never sends directly: the operator gets the forward-ready copy (reason "direct send disabled"). |
-| `--print-onboarding` | Print the peer welcome and both operator notices to stdout and exit 0 before any token, network, config write, container or DM. Placeholder MXID when no session exists. |
+| `--print-onboarding` | Print the peer welcome and both operator notices to stdout and exit 0 before any token, network, config write, container or DM; previews the Owner allow-list step on stderr. |
 | `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
 | `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
 | `--voice on\|off` | Patch only `voice.enabled` in the rendered/kept config (idempotent, sibling voice keys preserved, `off` keeps the block). Without it the config's voice block is left exactly as it is. See "Voice messages". |
@@ -285,12 +316,16 @@ the shims were never called.
 
 `tests/spawn-consultant-onboarding.sh` covers `--onboard`: `--print-onboarding` for persona +
 name, pseudonymous persona ("Hi there"), legacy wording, the voice line on/off (flag, existing
-config, `--keep-config`, template default), session MXID vs placeholder, no side effects, and no
+config, `--keep-config`, template default), no agent MXID or app explanation in the peer text, no side effects, and no
 U+2014/U+2013 dash in any rendered text; `onboard-send.py` against a fake bridge (delivered,
 refusals, tool and JSON-RPC errors, timeout, garbage, missing binary); and whole `--onboard`
 spawns with podman shimmed, a recording notifier and the fake bridge (delivered = INFO "sent",
-not allow-listed = INFO "forward", bridge error/timeout = WARN, forward-only never calls the
-bridge, the spawn exits 0 throughout). No message leaves the machine.
+not allow-listed = WARN "forward" (unexpected), bridge error/timeout = WARN, forward-only never
+calls the bridge, the spawn exits 0 throughout). The Owner step: added when missing (name, note,
+mode 600, one backup), no-op when present (also by case), `<label>-owner` on a clash, abort before
+any podman call (also with `--replace`) when both names are taken or the file is invalid or
+missing, print modes write nothing, generic never auto-added, concurrent applies serialize. No
+message leaves the machine and the real allow-list is never read or written.
 
 ```bash
 bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
@@ -300,7 +335,7 @@ bash Skills/consultant-deploy/tests/spawn-consultant-onboarding.sh
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
 avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
 `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
-`CONSULTANT_NOTIFY`, `AQUA_SYSTEM_BRIDGE_MCP` and `ONBOARD_SEND_TIMEOUT`.
+`CONSULTANT_NOTIFY`, `AQUA_SYSTEM_BRIDGE_MCP`, `ONBOARD_SEND_TIMEOUT` and `AQUA_SYSTEM_ALLOWLIST`.
 
 ## Model pin (`model`)
 

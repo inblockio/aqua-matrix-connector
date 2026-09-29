@@ -17,8 +17,12 @@
 #     verbatim), allow-list refusal, other refusal, tool error, JSON-RPC error, timeout,
 #     garbage output, missing binary
 #   - full --onboard spawn (podman shimmed): delivered -> INFO "onboarding sent", not
-#     allow-listed -> INFO "onboarding to forward", bridge error -> WARN, forward-only never
-#     calls the bridge; the spawn exits 0 in every case
+#     allow-listed (now unexpected) -> WARN "onboarding to forward", bridge error -> WARN,
+#     forward-only never calls the bridge; the spawn exits 0 in every case
+#   - Owner allow-list step: add when missing (name, note, mode, backup), no-op when present
+#     (also by case), label clash -> <label>-owner, both taken / invalid / missing file -> abort
+#     before any podman call (also with --replace), print modes write nothing, generic never
+#     auto-added, concurrent applies serialize
 #
 # Usage:  bash Skills/consultant-deploy/tests/spawn-consultant-onboarding.sh
 # Exit:   0 when every assertion passes, 1 otherwise (each failure is printed).
@@ -50,6 +54,21 @@ for r in aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compli
 done
 TARGET='@did-key-zfaketestpeer:matrix.inblock.io'
 AGENT_MXID='@0a1b2c3d4e5f6g7h:matrix.inblock.io'
+TIM_MXID='@tim-operator:matrix.inblock.io'
+# The allow-list every spawn in this file uses (AQUA_SYSTEM_ALLOWLIST); owner tests swap it.
+# Default: Tim plus the peer already present, so the onboarding-flow cases are Owner no-ops.
+AL="$SB/allowlist.toml"
+cat > "$AL" <<EOF
+# sandbox allow-list
+[[recipients]]
+name = "tim"
+mxid = "$TIM_MXID"
+
+[[recipients]]
+name = "peer"
+mxid = "$TARGET"
+EOF
+chmod 600 "$AL"
 
 # podman/systemctl: in "print" mode any call is a failure; in "spawn" mode podman pretends
 # (container exists -> no, run -> fake id) and systemctl succeeds. Every call is logged.
@@ -112,7 +131,7 @@ chmod +x "$SB/fake-bridge"
 print_onb() {
   local name="$1"; shift; local rc=0
   env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" \
-    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" \
+    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_SYSTEM_ALLOWLIST="$AL" \
     bash "$SPAWN" --print-onboarding "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
   # Split the three sections for targeted assertions.
@@ -127,15 +146,17 @@ print_onb a --label andreas --target "$TARGET" --persona Pelagia --name Andreas 
 check "exit 0" [ "$(cat "$SB/out/a.rc")" = 0 ]
 check "greets by name" has "$SB/out/a.peer" "Hi Andreas! 👋"
 check "persona intro" has "$SB/out/a.peer" "You now have your own Aqua Consultant, **Pelagia**. She is an AI assistant who knows Aqua inside out, and she is there just for you whenever you have a question."
-check "how to start names the persona" has "$SB/out/a.peer" "Pelagia has sent you a chat invitation in Element, your Matrix chat app. Accept it, and her welcome message is already waiting for you."
-check "placeholder MXID when no session" has "$SB/out/a.peer" 'her address is `@<agent-mxid>:matrix.inblock.io`.'
+check "how to start (persona)" bash -c 'grep -A1 -xF "**How to start**" "$1" | tail -n1 | grep -qxF "Open your chat with Pelagia and say hi. If it still shows as an invitation, accept it first; her welcome is already waiting there."' _ "$SB/out/a.peer"
+check "peer text: no MXID, no app explanation" bash -c '! grep -qE "@[^ ]*:matrix\.inblock\.io|agent-mxid|Matrix chat app|address is" "$1"' _ "$SB/out/a.peer"
 check "voice line present" has "$SB/out/a.peer" "- You can type, or send her voice messages."
 check "one-to-one line" has "$SB/out/a.peer" "- The chat is one-to-one: Pelagia talks only with you."
 check "ends with Enjoy" bash -c '[ "$(grep -v "^$" "$1" | tail -n1)" = "Enjoy! 🌊" ]' _ "$SB/out/a.peer"
-check "delivered notice head" has "$SB/out/a.delivered" "✅ Onboarding delivered to Andreas directly (Aqua System DM, event \$<event-id>). Pelagia has also invited them to a chat. Nothing to forward."
+check "delivered notice head" has "$SB/out/a.delivered" "✅ Onboarding delivered to Andreas directly (Aqua System DM, event \$<event-id>). Pelagia has also invited them to a chat."
+check "delivered notice: no 'Nothing to forward'" hasnt "$SB/out/a.delivered" "Nothing to forward"
 check "delivered notice quotes the welcome" has "$SB/out/a.delivered" "> Hi Andreas! 👋"
 check "quoted blank lines are bare >" bash -c 'grep -qx ">" "$1" && ! grep -q "^> $" "$1"' _ "$SB/out/a.delivered"
-check "forward notice head (allow-list example reason)" has "$SB/out/a.forward" "📋 Onboarding for Andreas: please forward the text between the lines. It was not sent directly: $TARGET is not on the Aqua System allow-list."
+check "forward notice head (example reason)" has "$SB/out/a.forward" "📋 Onboarding for Andreas: please forward the text between the lines. It was not sent directly: the Aqua System bridge failed (<short error>)."
+check "print-onboarding previews the Owner step (already present)" has "$SB/out/a.err" "owner allow-list: Owner $TARGET already present as 'peer'"
 check "forward notice has the text between two rules" bash -c '[ "$(grep -cx -- "----------" "$1")" = 2 ]' _ "$SB/out/a.forward"
 check "section titles" bash -c 'grep -qF "\"onboarding sent: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1" && grep -qF "\"onboarding to forward: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1"' _ "$SB/out/a.out"
 check "no em/en dash" no_dashes "$SB/out/a.out"
@@ -154,7 +175,8 @@ echo "== --print-onboarding: legacy (no persona)"
 print_onb c --label legacy --target "$TARGET" --display "Aqua Consultant" --name Bob
 check "exit 0" [ "$(cat "$SB/out/c.rc")" = 0 ]
 check "legacy intro" has "$SB/out/c.peer" "You now have your own **Aqua Consultant**. It is an AI assistant who knows Aqua inside out, and it is there just for you whenever you have a question."
-check "legacy how to start" has "$SB/out/c.peer" "Your consultant has sent you a chat invitation in Element, your Matrix chat app. Accept it, and its welcome message is already waiting for you. If you ever need to find it, its address is"
+check "legacy how to start" bash -c 'grep -A1 -xF "**How to start**" "$1" | tail -n1 | grep -qxF "Open your chat with your consultant and say hi. If it still shows as an invitation, accept it first; its welcome is already waiting there."' _ "$SB/out/c.peer"
+check "legacy: no MXID, no app explanation" bash -c '! grep -qE "@[^ ]*:matrix\.inblock\.io|agent-mxid|Matrix chat app|address is" "$1"' _ "$SB/out/c.peer"
 check "legacy go deep" has "$SB/out/c.peer" "if you are a developer it will happily go deep"
 check "legacy one-to-one" has "$SB/out/c.peer" "- The chat is one-to-one: your consultant talks only with you."
 check "legacy explains" has "$SB/out/c.peer" "- It explains and shows you where its answers come from. It cannot change anything or act on your behalf."
@@ -173,7 +195,7 @@ printf '[session]\nuser_id = "%s"\naccess_token = "mat_FAKE-SECRET"\n' "$AGENT_M
 print_onb d --label kept --keep-config --persona Pelagia --name Andreas
 check "keep-config: exit 0" [ "$(cat "$SB/out/d.rc")" = 0 ]
 check "keep-config: voice line from the config" has "$SB/out/d.peer" "- You can type, or send her voice messages."
-check "keep-config: MXID from the session" has "$SB/out/d.peer" "her address is \`$AGENT_MXID\`."
+check "keep-config: the session MXID stays out of the peer text" hasnt "$SB/out/d.peer" "$AGENT_MXID"
 check "keep-config: no token material printed" hasnt "$SB/out/d.out" "FAKE-SECRET"
 print_onb d2 --label kept --target "$TARGET" --persona Pelagia --name Andreas
 check "re-render: voice line from the existing config" has "$SB/out/d2.peer" "send her voice messages"
@@ -219,7 +241,7 @@ spawn_onb() {
   env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_BRIDGE_MCP="$SB/fake-bridge" FAKE_BRIDGE_MODE="$mode" \
-    ONBOARD_SEND_TIMEOUT=5 \
+    ONBOARD_SEND_TIMEOUT=5 AQUA_SYSTEM_ALLOWLIST="$AL" \
     bash "$SPAWN" --label "$label" --target "$TARGET" --persona Pelagia --name Andreas --no-refresh-refs "$@" \
     > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
@@ -232,22 +254,23 @@ export -f onb_field; export SB
 spawn_onb f1 delivered --onboard --voice on
 check "delivered: spawn exit 0" [ "$(cat "$SB/out/f1.rc")" = 0 ]
 check "delivered: INFO + sent title" bash -c '[ "$(onb_field f1 1)" = INFO ] && [ "$(onb_field f1 3)" = "onboarding sent: Andreas (aqua-agent-s-f1-aqua-consultant-1)" ]'
-check "delivered: body names the event" bash -c 'onb_field f1 4 | head -n1 | grep -qF "✅ Onboarding delivered to Andreas directly (Aqua System DM, event \$AbC-123_xyz). Pelagia has also invited them to a chat. Nothing to forward."'
-check "delivered: welcome carries the real MXID and the voice line (config voice on)" \
-  bash -c 'b="$(onb_field f1 4)"; [[ "$b" == *"> Pelagia has sent you"*"$0"* && "$b" == *"> - You can type, or send her voice messages."* ]]' "$AGENT_MXID"
+check "delivered: body names the event" bash -c 'onb_field f1 4 | head -n1 | grep -qF "✅ Onboarding delivered to Andreas directly (Aqua System DM, event \$AbC-123_xyz). Pelagia has also invited them to a chat."'
+check "delivered: quoted welcome has the new how-to-start and the voice line (config voice on), no MXID" \
+  bash -c 'b="$(onb_field f1 4)"; [[ "$b" == *"> Open your chat with Pelagia and say hi."* && "$b" == *"> - You can type, or send her voice messages."* && "$b" != *"$0"* && "$b" != *"Nothing to forward"* ]]' "$AGENT_MXID"
 check "delivered: the bridge got the same welcome" python3 - "$BRIDGE_LOG" "$AGENT_MXID" <<'PY'
 import json, sys
 md = [json.loads(l) for l in open(sys.argv[1])][2]["params"]["arguments"]["markdown"]
-assert md.startswith("Hi Andreas! 👋\n") and f"`{sys.argv[2]}`" in md and "send her voice messages" in md, md
+assert md.startswith("Hi Andreas! 👋\n") and sys.argv[2] not in md and "send her voice messages" in md, md
+assert "Matrix chat app" not in md and "Open your chat with Pelagia and say hi." in md, md
 assert "\u2014" not in md and "\u2013" not in md
 PY
 check "delivered notice body extracted" bash -c 'onb_field f1 4 > "$SB/out/f1.body"'
 check "delivered notice body has no em/en dash" no_dashes "$SB/out/f1.body"
 
 spawn_onb f2 refused --onboard
-check "not allow-listed: spawn exit 0" [ "$(cat "$SB/out/f2.rc")" = 0 ]
-check "not allow-listed: INFO + forward title" bash -c '[ "$(onb_field f2 1)" = INFO ] && [ "$(onb_field f2 3)" = "onboarding to forward: Andreas (aqua-agent-s-f2-aqua-consultant-1)" ]'
-check "not allow-listed: reason" bash -c 'onb_field f2 4 | head -n1 | grep -qF "It was not sent directly: $0 is not on the Aqua System allow-list."' "$TARGET"
+check "not allow-listed (unexpected): spawn exit 0" [ "$(cat "$SB/out/f2.rc")" = 0 ]
+check "not allow-listed (unexpected): WARN + forward title" bash -c '[ "$(onb_field f2 1)" = WARN ] && [ "$(onb_field f2 3)" = "onboarding to forward: Andreas (aqua-agent-s-f2-aqua-consultant-1)" ]'
+check "not allow-listed (unexpected): reason" bash -c 'onb_field f2 4 | head -n1 | grep -qF "It was not sent directly: $0 is not on the Aqua System allow-list (unexpected: the owner is added automatically at spawn; check allowlist.toml)."' "$TARGET"
 check "not allow-listed: no voice line (template has none)" bash -c '! onb_field f2 4 | grep -q "voice messages"'
 
 spawn_onb f3 tool-error --onboard
@@ -268,6 +291,132 @@ check "forward-only: INFO + reason" bash -c '[ "$(onb_field f6 1)" = INFO ] && o
 
 spawn_onb f7 delivered
 check "no --onboard: bridge never called, only channel-up notified" bash -c '[ ! -e "$1" ] && [ "$(wc -l < "$2")" = 1 ]' _ "$BRIDGE_LOG" "$NOTIFY_LOG"
+
+echo "== Owner allow-list (owner-allowlist.py; real spawns with podman shimmed)"
+OWNER_HELPER="$SKILL_DIR/owner-allowlist.py"
+OWNER='@1vo8g4vofiha69ua:matrix.inblock.io'
+OTHER='@someoneelse00000:matrix.inblock.io'
+TODAY="$(date +%F)"
+mk_al() { # mk_al <file> [extra toml lines...]: Tim plus the extras, mode 600
+  local f="$1"; shift
+  { printf '# sandbox allow-list, comments must survive\n[[recipients]]\nname = "tim"\nmxid = "%s"\n' "$TIM_MXID"
+    [ "$#" -eq 0 ] || printf '%s\n' "$@"; } > "$f"
+  chmod 600 "$f"
+}
+# spawn_owner <name> <label> <allowlist> [spawn args...]: real spawn (no --onboard), Owner = $OWNER
+spawn_owner() {
+  local name="$1" label="$2" al="$3"; shift 3; local rc=0
+  mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
+  printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
+  rm -f "$SIDE_EFFECTS"
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" SHIM_MODE=spawn \
+    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+    CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_BRIDGE_MCP="$SB/fake-bridge" AQUA_SYSTEM_ALLOWLIST="$al" \
+    bash "$SPAWN" --label "$label" --target "$OWNER" --persona Pelagia --name Andreas --no-refresh-refs "$@" \
+    > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
+  echo "$rc" > "$SB/out/$name.rc"
+}
+al_entry() { # al_entry <file> <mxid>: prints "name|note" of the entry with that MXID (exact), or NONE
+  python3 - "$1" "$2" <<'PY'
+import sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+hits = [r for r in d.get("recipients", []) if r["mxid"] == sys.argv[2]]
+print("NONE" if not hits else "|".join([hits[0]["name"], hits[0].get("note", "")]) if len(hits) == 1 else "MULTIPLE")
+PY
+}
+backups() { ls "$1".bak-* 2>/dev/null | wc -l; }
+podman_ran() { grep -q '^podman run' "$SIDE_EFFECTS" 2>/dev/null; }
+export -f al_entry backups
+no_podman() { [ ! -e "$SIDE_EFFECTS" ] || ! grep -q '^podman' "$SIDE_EFFECTS"; }
+
+# O1: add when missing
+O1="$SB/o1.toml"; mk_al "$O1"
+spawn_owner o1 andreas "$O1"
+check "add: spawn exit 0 and launched" bash -c '[ "$(cat "$1")" = 0 ]' _ "$SB/out/o1.rc"
+check "add: podman run happened after the Owner step" podman_ran
+check "add: entry name=label, exact note" [ "$(al_entry "$O1" "$OWNER")" = "andreas|Owner of aqua-agent-andreas-aqua-consultant-1 (Pelagia), auto-added by spawn-consultant.sh $TODAY" ]
+check "add: comments and Tim preserved" bash -c 'grep -q "comments must survive" "$1" && grep -q "name = \"tim\"" "$1"' _ "$O1"
+check "add: file stays mode 600" [ "$(stat -c %a "$O1")" = 600 ]
+check "add: exactly one backup, mode 600, equal to the old file" bash -c '[ "$(ls "$1".bak-andreas-* | wc -l)" = 1 ] && [ "$(stat -c %a "$1".bak-andreas-*)" = 600 ] && ! grep -q "$2" "$1".bak-andreas-*' _ "$O1" "$OWNER"
+check "add: no temp file left behind" bash -c '! ls "$(dirname "$1")"/.allowlist.*.tmp >/dev/null 2>&1' _ "$O1"
+check "add: stderr reports it" has "$SB/out/o1.err" "added Owner $OWNER as 'andreas'"
+cp "$O1" "$SB/o1.after"
+spawn_owner o1b andreas "$O1" --replace --keep-config
+check "re-roll (--replace --keep-config): no-op, file byte-identical, no new backup" bash -c '[ "$(cat "$1")" = 0 ] && cmp -s "$2" "$3" && [ "$(ls "$2".bak-* | wc -l)" = 1 ]' _ "$SB/out/o1b.rc" "$O1" "$SB/o1.after"
+
+# O2: present under a case difference -> no-op
+O2="$SB/o2.toml"; mk_al "$O2" '[[recipients]]' 'name = "andreas-x"' "mxid = \"$(printf '%s' "$OWNER" | tr a-z A-Z | sed 's/:MATRIX.INBLOCK.IO/:matrix.inblock.io/')\""
+cp "$O2" "$SB/o2.before"
+spawn_owner o2 andreas "$O2"
+check "case-insensitive present: exit 0, file untouched, no backup" bash -c '[ "$(cat "$1")" = 0 ] && cmp -s "$2" "$3" && [ "$(backups "$2")" = 0 ]' _ "$SB/out/o2.rc" "$O2" "$SB/o2.before"
+check "case-insensitive present: says already present" has "$SB/out/o2.err" "already present as 'andreas-x'"
+
+# O3: label taken (by a person with another MXID; rooms follow) -> <label>-owner, inserted contiguously
+O3="$SB/o3.toml"; mk_al "$O3" '[[recipients]]' 'name = "Andreas"' "mxid = \"$OTHER\"" '' '# the rooms' '[[rooms]]' 'name = "daily"' 'room_id = "!abc:matrix.inblock.io"'
+spawn_owner o3 andreas "$O3"
+check "collision: exit 0, added as andreas-owner" bash -c '[ "$(cat "$1")" = 0 ] && [ "$(al_entry "$2" "$3" | cut -d"|" -f1)" = andreas-owner ]' _ "$SB/out/o3.rc" "$O3" "$OWNER"
+check "collision: the other Andreas untouched" bash -c '[ "$(al_entry "$1" "$2" | cut -d"|" -f1)" = Andreas ]' _ "$O3" "$OTHER"
+check "collision: new entry sits before the rooms comment and [[rooms]]" bash -c 'a=$(grep -n "andreas-owner" "$1" | cut -d: -f1); c=$(grep -n "^# the rooms" "$1" | cut -d: -f1); [ "$a" -lt "$c" ]' _ "$O3"
+
+# O4: label and <label>-owner both taken (a room counts) -> abort before launch
+O4="$SB/o4.toml"; mk_al "$O4" '[[recipients]]' 'name = "clash"' "mxid = \"$OTHER\"" '[[rooms]]' 'name = "CLASH-owner"' 'room_id = "!r:matrix.inblock.io"'
+cp "$O4" "$SB/o4.before"
+spawn_owner o4 clash "$O4"
+check "both names taken: spawn exits non-zero" [ "$(cat "$SB/out/o4.rc")" != 0 ]
+check "both names taken: no podman call at all" no_podman
+check "both names taken: allow-list untouched, no backup" bash -c 'cmp -s "$1" "$2" && [ "$(backups "$1")" = 0 ]' _ "$O4" "$SB/o4.before"
+check "both names taken: no config rendered" [ ! -e "$TEST_DIR/clash-aqua-consultant-config.json" ]
+check "both names taken: clear error" bash -c 'grep -q "both taken" "$1" && grep -q "aborting: could not put the Owner" "$1"' _ "$SB/out/o4.err"
+
+# O5: invalid existing file (duplicate name, like the bridge rejects) -> abort; missing file -> abort
+O5="$SB/o5.toml"; mk_al "$O5" '[[recipients]]' 'name = "TIM"' "mxid = \"$OTHER\""
+cp "$O5" "$SB/o5.before"
+spawn_owner o5 invalid "$O5"
+check "invalid file: exit non-zero, untouched, no podman" bash -c '[ "$(cat "$1")" != 0 ] && cmp -s "$2" "$3" && [ "$(backups "$2")" = 0 ]' _ "$SB/out/o5.rc" "$O5" "$SB/o5.before"
+check "invalid file: no podman call" no_podman
+check "invalid file: names the problem" has "$SB/out/o5.err" "duplicate name"
+spawn_owner o5b missing "$SB/does-not-exist.toml"
+check "missing file: exit non-zero, no podman, not created" bash -c '[ "$(cat "$1")" != 0 ] && [ ! -e "$2" ]' _ "$SB/out/o5b.rc" "$SB/does-not-exist.toml"
+check "missing file: no podman call" no_podman
+
+# O6: --replace aborts BEFORE the rm when the Owner cannot be ensured
+spawn_owner o6 invalid "$O5" --replace --keep-config
+check "--replace + bad allow-list: exit non-zero" [ "$(cat "$SB/out/o6.rc")" != 0 ]
+check "--replace + bad allow-list: no podman rm (no podman at all)" no_podman
+
+# O7: print modes write nothing, but preview
+O7="$SB/o7.toml"; mk_al "$O7"; cp "$O7" "$SB/o7.before"
+rc=0; env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" \
+  CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+  AQUA_SYSTEM_ALLOWLIST="$O7" bash "$SPAWN" --print-run --label printrun --target "$OWNER" --persona Pelagia \
+  > "$SB/out/o7.out" 2> "$SB/out/o7.err" || rc=$?
+check "--print-run: exit 0, allow-list untouched, no backup, no lock file" bash -c '[ "$1" = 0 ] && cmp -s "$2" "$3" && [ "$(backups "$2")" = 0 ] && [ ! -e "$2.lock" ]' _ "$rc" "$O7" "$SB/o7.before"
+check "--print-run: previews the entry" bash -c 'grep -q "would add to" "$1" && grep -qF "name = \"printrun\"" "$1"' _ "$SB/out/o7.err"
+AL_SAVE="$AL"; AL="$O7"
+print_onb o7b --label printonb --target "$OWNER" --persona Pelagia --name Andreas
+AL="$AL_SAVE"
+check "--print-onboarding: exit 0, allow-list untouched" bash -c '[ "$(cat "$1")" = 0 ] && cmp -s "$2" "$3" && [ "$(backups "$2")" = 0 ]' _ "$SB/out/o7b.rc" "$O7" "$SB/o7.before"
+check "--print-onboarding: previews the entry on stderr, not in the copy" bash -c 'grep -qF "name = \"printonb\"" "$1" && ! grep -q "would add" "$2"' _ "$SB/out/o7b.err" "$SB/out/o7b.out"
+check "print modes: podman never called" [ ! -e "$SIDE_EFFECTS" ] || ! grep -q '^podman run' "$SIDE_EFFECTS"
+
+# O8: generic = Tim; never auto-added
+O8="$SB/o8.toml"; mk_al "$O8"
+check "generic: operator present -> exit 0" python3 "$OWNER_HELPER" apply --path "$O8" --mxid "$(printf '%s' "$TIM_MXID" | tr a-z A-Z | sed 's/:MATRIX.INBLOCK.IO/:matrix.inblock.io/')" --container aqua-agent-aqua-consultant-1 --who x --generic
+check "generic: operator absent -> exit 1, nothing written" bash -c '! python3 "$1" apply --path "$2" --mxid "$3" --container c --who x --generic 2>/dev/null && [ "$(ls "$2".bak-* 2>/dev/null | wc -l)" = 0 ]' _ "$OWNER_HELPER" "$O8" "$OWNER"
+
+# O9: concurrent applies (fleet roll) serialize on the lock
+O9="$SB/o9.toml"; mk_al "$O9"
+for i in 1 2 3 4; do
+  python3 "$OWNER_HELPER" apply --path "$O9" --mxid "@conc$i:matrix.inblock.io" --container "c$i" --who x --label "conc$i" 2>/dev/null &
+done
+wait
+check "concurrent: all four Owners present, file valid" python3 - "$O9" <<'PY'
+import sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+names = sorted(r["name"] for r in d["recipients"])
+assert names == ["conc1", "conc2", "conc3", "conc4", "tim"], names
+PY
+check "no em/en dash in any owner output" no_dashes "$SB"/out/o*.err
 
 echo
 echo "passed=$PASS failed=$FAIL"

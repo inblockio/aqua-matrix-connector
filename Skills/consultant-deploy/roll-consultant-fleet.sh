@@ -15,6 +15,10 @@
 # consultant (aqua-agent-aqua-consultant-1) and rolls it via spawn-consultant.sh
 # --generic instead of --label, so one roll covers the whole fleet including it.
 #
+# Owner rule: each spawn first ensures its Owner (the config's target) is on the Aqua System
+# allow-list, so a roll backfills every existing Owner. A label whose Owner cannot be ensured
+# aborts BEFORE its container is removed and is reported as failed; the roll continues.
+#
 # Registry: ~/.aqua-matrix-test/consultants.registry  (override with CONSULTANTS_REGISTRY)
 #
 # Usage:
