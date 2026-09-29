@@ -80,6 +80,15 @@ cd ~/aqua-matrix-agent && cargo build
 
 Default to debug builds (release is much slower for iteration). The systemd units intentionally point at `target/debug/`.
 
+## Aqua System bridge (host-wide system messages)
+
+Two crates give every Claude Code session on the host a way to DM allow-listed people on Element and read their replies, from ONE shared identity ("Aqua System"):
+
+- `crates/aqua-system-bridged` -- the daemon (systemd --user `aqua-system-bridge.service`, unit in `systemd/`). It owns the ONLY matrix-sdk Client and crypto store for the identity (state `~/.aqua-system-bridge/`, mode 700: `agent.pem`, `store/`, `allowlist.toml`, `inbox.jsonl`, `audit.jsonl`, `bridge.sock`). Multi-peer version of the `run_daemon` lifecycle: outage-aware connect, invites joined only from allow-listed people, handlers removed per rotation, event-id-deduped backfill, sends executed on the live Client only (an `M_UNKNOWN_TOKEN` send is carried to the next Client, never a second Client in place).
+- `crates/aqua-system-bridge` -- Matrix-free core (protocol, allow-list, inbox, rate limit, framing) plus the stdio MCP server `aqua-system-bridge-mcp` (tools `send_message`, `send_file`, `list_recipients`, `read_inbox`, `wait_for_reply`). It only talks to the socket.
+
+Never point a second process (the one-shot CLI, a test) at `~/.aqua-system-bridge/store`. Binaries run from `~/.local/bin` (release build + `install`), not from `target/`.
+
 ## Architecture
 
 This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. After the **physical repo split**, this repo is the **connector substrate: six crates** under `crates/`. The three backend crates + agent content now live in the sibling **`../aqua-agents`** repo, which path-deps back here (see "Repo boundary" below and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
