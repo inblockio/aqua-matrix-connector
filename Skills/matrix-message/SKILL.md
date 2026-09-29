@@ -25,6 +25,22 @@ cd ~/aqua-matrix-agent && cargo build
 | Print agent DID | `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --print-did` |
 | Use different identity | Add `--key-file path/to/other.pem` |
 
+## Finding the target MXID
+
+There is no name search here. siwx-oidc maps a **DID** to its MXID (unauthenticated, handles legacy
+`@did-pkh-…` localparts and EIP-55 mixed-case addresses):
+
+```bash
+curl -s "https://siwx-oidc.inblock.io/resolve?did=did:pkh:eip155:1:0x..."
+# -> {"did": ..., "mxid": "@...:matrix.inblock.io", "exists": true, "attested": ...}
+```
+
+Send only when `exists` is `true`. `?mxid=@…` answers the reverse, but returns `did: null` unless the
+account is `attested`. A name or email alone cannot be resolved (that needs the Synapse user
+directory, which the CLI does not expose): ask the user for the DID or MXID, never guess one from
+logs. Note: until siwx-oidc#24 is deployed, `/resolve?did=<not-a-did>` returns 200 with a made-up
+MXID and `exists: false` (after the deploy it is a 400), so `exists` is the check that matters.
+
 ## Setup
 
 **Zero-config:** The agent auto-registers an OIDC client on first run and caches credentials in `~/.aqua-matrix-agent/config.toml`. No manual setup needed.
