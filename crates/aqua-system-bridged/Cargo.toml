@@ -1,0 +1,22 @@
+[package]
+name = "aqua-system-bridged"
+version.workspace = true
+edition.workspace = true
+description = "The Aqua System bridge daemon: owns the ONLY matrix-sdk Client and crypto store of the \"Aqua System\" identity, sends allow-listed E2EE DMs on request, and records replies in a durable inbox, serving local sessions over a unix socket."
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aqua-system-bridged"
+path = "src/main.rs"
+
+[dependencies]
+aqua-matrix-agent.workspace = true
+aqua-system-bridge.workspace = true
+matrix-sdk.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
