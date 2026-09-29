@@ -12,7 +12,13 @@ pub const T_LIST_RECIPIENTS: &str = "list_recipients";
 pub const T_READ_INBOX: &str = "read_inbox";
 pub const T_WAIT_FOR_REPLY: &str = "wait_for_reply";
 
-pub const TOOL_NAMES: [&str; 5] = [T_SEND_MESSAGE, T_SEND_FILE, T_LIST_RECIPIENTS, T_READ_INBOX, T_WAIT_FOR_REPLY];
+pub const TOOL_NAMES: [&str; 5] = [
+    T_SEND_MESSAGE,
+    T_SEND_FILE,
+    T_LIST_RECIPIENTS,
+    T_READ_INBOX,
+    T_WAIT_FOR_REPLY,
+];
 
 /// Shown to the model in `initialize` (MCP server instructions).
 pub const INSTRUCTIONS: &str = "Aqua System messenger: sends E2EE Matrix/Element DMs from the shared \
@@ -93,12 +99,18 @@ pub enum Action {
     /// Write this response.
     Reply(Value),
     /// Run a tool, then answer with [`tool_result`].
-    Call { id: Value, name: String, args: Value },
+    Call {
+        id: Value,
+        name: String,
+        args: Value,
+    },
 }
 
 pub fn classify(req: &Value) -> Action {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-    let Some(id) = req.get("id").cloned() else { return Action::None };
+    let Some(id) = req.get("id").cloned() else {
+        return Action::None;
+    };
     match method {
         "initialize" => {
             let protocol = req
@@ -119,12 +131,22 @@ pub fn classify(req: &Value) -> Action {
         "tools/list" => Action::Reply(ok(id, json!({"tools": tools()}))),
         "tools/call" => {
             let params = req.get("params");
-            let name = params.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("");
+            let name = params
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if !TOOL_NAMES.contains(&name) {
                 return Action::Reply(err(id, -32602, &format!("unknown tool: {name}")));
             }
-            let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or_else(|| json!({}));
-            Action::Call { id, name: name.to_string(), args }
+            let args = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            Action::Call {
+                id,
+                name: name.to_string(),
+                args,
+            }
         }
         "ping" => Action::Reply(ok(id, json!({}))),
         other => Action::Reply(err(id, -32601, &format!("method not found: {other}"))),
@@ -132,7 +154,10 @@ pub fn classify(req: &Value) -> Action {
 }
 
 pub fn tool_result(id: Value, text: &str, is_error: bool) -> Value {
-    ok(id, json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+    ok(
+        id,
+        json!({"content": [{"type": "text", "text": text}], "isError": is_error}),
+    )
 }
 
 fn ok(id: Value, result: Value) -> Value {
@@ -149,7 +174,10 @@ mod tests {
 
     #[test]
     fn lists_five_tools_with_schemas() {
-        let Action::Reply(r) = classify(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})) else { panic!() };
+        let Action::Reply(r) = classify(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        else {
+            panic!()
+        };
         let tools = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, TOOL_NAMES.to_vec());
@@ -160,24 +188,45 @@ mod tests {
 
     #[test]
     fn initialize_echoes_protocol_and_instructions() {
-        let Action::Reply(r) = classify(&json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})) else { panic!() };
+        let Action::Reply(r) = classify(
+            &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+        ) else {
+            panic!()
+        };
         assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
-        assert!(r["result"]["instructions"].as_str().unwrap().contains("untrusted"));
+        assert!(r["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("untrusted"));
     }
 
     #[test]
     fn notification_and_unknown() {
-        assert_eq!(classify(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})), Action::None);
-        let Action::Reply(r) = classify(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rm_rf"}})) else { panic!() };
+        assert_eq!(
+            classify(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})),
+            Action::None
+        );
+        let Action::Reply(r) = classify(
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rm_rf"}}),
+        ) else {
+            panic!()
+        };
         assert_eq!(r["error"]["code"], -32602);
-        let Action::Reply(r) = classify(&json!({"jsonrpc":"2.0","id":3,"method":"resources/list"})) else { panic!() };
+        let Action::Reply(r) = classify(&json!({"jsonrpc":"2.0","id":3,"method":"resources/list"}))
+        else {
+            panic!()
+        };
         assert_eq!(r["error"]["code"], -32601);
     }
 
     #[test]
     fn tool_call_is_classified() {
-        let a = classify(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_message","arguments":{"to":"tim","markdown":"x"}}}));
-        let Action::Call { name, args, .. } = a else { panic!() };
+        let a = classify(
+            &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_message","arguments":{"to":"tim","markdown":"x"}}}),
+        );
+        let Action::Call { name, args, .. } = a else {
+            panic!()
+        };
         assert_eq!(name, "send_message");
         assert_eq!(args["to"], "tim");
     }

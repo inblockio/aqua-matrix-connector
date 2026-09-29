@@ -29,7 +29,10 @@ use clap::Parser;
 use tokio::sync::Notify;
 
 #[derive(Parser, Debug)]
-#[command(name = "aqua-system-bridged", about = "Aqua System Matrix bridge daemon")]
+#[command(
+    name = "aqua-system-bridged",
+    about = "Aqua System Matrix bridge daemon"
+)]
 struct Args {
     /// State directory (key, crypto store, inbox, allow-list, logs).
     #[arg(long, env = "AQUA_SYSTEM_BRIDGE_DIR")]
@@ -38,13 +41,25 @@ struct Args {
     #[arg(long, env = "AQUA_SYSTEM_BRIDGE_SOCK")]
     sock: Option<PathBuf>,
     /// siwx-oidc provider URL.
-    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_SIWX_URL", default_value = "https://siwx-oidc.inblock.io")]
+    #[arg(
+        long,
+        env = "AQUA_SYSTEM_BRIDGE_SIWX_URL",
+        default_value = "https://siwx-oidc.inblock.io"
+    )]
     siwx_url: String,
     /// Matrix homeserver URL.
-    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_MATRIX_URL", default_value = "https://matrix.inblock.io")]
+    #[arg(
+        long,
+        env = "AQUA_SYSTEM_BRIDGE_MATRIX_URL",
+        default_value = "https://matrix.inblock.io"
+    )]
     matrix_url: String,
     /// Display name published for the identity.
-    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_DISPLAY_NAME", default_value = "Aqua System")]
+    #[arg(
+        long,
+        env = "AQUA_SYSTEM_BRIDGE_DISPLAY_NAME",
+        default_value = "Aqua System"
+    )]
     display_name: String,
     /// Print the identity (DID, and MXID once logged in) and exit.
     #[arg(long)]
@@ -63,13 +78,20 @@ async fn main() -> anyhow::Result<()> {
         // journald under systemd: no ANSI colour codes in the journal.
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,matrix_sdk=warn,matrix_sdk_crypto=warn,matrix_sdk_base=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,matrix_sdk=warn,matrix_sdk_crypto=warn,matrix_sdk_base=warn".into()
+            }),
         )
         .init();
     let args = Args::parse();
-    let state = args.state_dir.clone().unwrap_or_else(aqua_system_bridge::state_dir);
-    let sock = args.sock.clone().unwrap_or_else(|| state.join("bridge.sock"));
+    let state = args
+        .state_dir
+        .clone()
+        .unwrap_or_else(aqua_system_bridge::state_dir);
+    let sock = args
+        .sock
+        .clone()
+        .unwrap_or_else(|| state.join("bridge.sock"));
     let store = state.join("store");
     let key_file = state.join("agent.pem");
 
@@ -79,7 +101,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             println!("did: (no key yet at {})", key_file.display());
         }
-        let cfg = aqua_matrix_agent::ConfigFile::load(&store.join("config.toml")).unwrap_or_default();
+        let cfg =
+            aqua_matrix_agent::ConfigFile::load(&store.join("config.toml")).unwrap_or_default();
         match cfg.session {
             Some(s) => println!("mxid: {}\ndevice_id: {}", s.user_id, s.device_id),
             None => println!("mxid: (not logged in yet)"),
@@ -113,7 +136,15 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = Arc::new(Notify::new());
     spawn_shutdown_listener(shutdown.clone());
 
-    matrix::run(config, shared, cmd_rx, shutdown, args.display_name.clone(), key_file).await;
+    matrix::run(
+        config,
+        shared,
+        cmd_rx,
+        shutdown,
+        args.display_name.clone(),
+        key_file,
+    )
+    .await;
 
     server.abort();
     let _ = std::fs::remove_file(&sock);
@@ -124,7 +155,10 @@ async fn main() -> anyhow::Result<()> {
 fn spawn_shutdown_listener(shutdown: Arc<Notify>) {
     use tokio::signal::unix::{signal, SignalKind};
     tokio::spawn(async move {
-        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
             tracing::warn!("failed to install signal handlers");
             return;
         };

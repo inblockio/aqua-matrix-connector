@@ -38,8 +38,12 @@ struct AllowListFile {
 
 /// Structural MXID check: `@localpart:server`, no whitespace.
 pub fn is_valid_mxid(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix('@') else { return false };
-    let Some((local, server)) = rest.split_once(':') else { return false };
+    let Some(rest) = s.strip_prefix('@') else {
+        return false;
+    };
+    let Some((local, server)) = rest.split_once(':') else {
+        return false;
+    };
     !local.is_empty() && !server.is_empty() && !s.chars().any(char::is_whitespace)
 }
 
@@ -47,14 +51,18 @@ pub fn is_valid_mxid(s: &str) -> bool {
 /// are an error for the whole file, so a typo can never silently widen or
 /// narrow the list.
 pub fn parse(text: &str) -> Result<Vec<Recipient>, String> {
-    let file: AllowListFile = toml::from_str(text).map_err(|e| format!("allow-list parse error: {e}"))?;
+    let file: AllowListFile =
+        toml::from_str(text).map_err(|e| format!("allow-list parse error: {e}"))?;
     let mut seen = std::collections::HashSet::new();
     for r in &file.recipients {
         if r.name.trim().is_empty() {
             return Err(format!("allow-list entry for {} has an empty name", r.mxid));
         }
         if !is_valid_mxid(&r.mxid) {
-            return Err(format!("allow-list entry {:?}: {:?} is not a valid MXID (@localpart:server)", r.name, r.mxid));
+            return Err(format!(
+                "allow-list entry {:?}: {:?} is not a valid MXID (@localpart:server)",
+                r.name, r.mxid
+            ));
         }
         if !seen.insert(r.name.to_ascii_lowercase()) {
             return Err(format!("allow-list has duplicate name {:?}", r.name));
@@ -73,7 +81,12 @@ pub struct AllowList {
 
 impl AllowList {
     pub fn new(path: PathBuf) -> Self {
-        let mut a = Self { path, mtime: None, recipients: Vec::new(), load_error: None };
+        let mut a = Self {
+            path,
+            mtime: None,
+            recipients: Vec::new(),
+            load_error: None,
+        };
         a.reload(true);
         a
     }
@@ -85,7 +98,9 @@ impl AllowList {
     /// Re-read the file if its mtime changed (or `force`). Returns true when a
     /// reload happened.
     pub fn reload(&mut self, force: bool) -> bool {
-        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
         if !force && mtime == self.mtime && self.mtime.is_some() {
             return false;
         }
@@ -132,7 +147,9 @@ impl AllowList {
 
     /// The allow-listed recipient whose MXID is `sender`, if any.
     pub fn by_mxid(&self, sender: &str) -> Option<&Recipient> {
-        self.recipients.iter().find(|r| r.mxid.eq_ignore_ascii_case(sender))
+        self.recipients
+            .iter()
+            .find(|r| r.mxid.eq_ignore_ascii_case(sender))
     }
 
     /// The error a session sees when `who` is not on the list.
@@ -167,7 +184,12 @@ mxid = "@def456:matrix.inblock.io"
 "#;
 
     fn list(text: &str) -> AllowList {
-        AllowList { path: PathBuf::from("/nonexistent"), mtime: None, recipients: parse(text).unwrap(), load_error: None }
+        AllowList {
+            path: PathBuf::from("/nonexistent"),
+            mtime: None,
+            recipients: parse(text).unwrap(),
+            load_error: None,
+        }
     }
 
     #[test]

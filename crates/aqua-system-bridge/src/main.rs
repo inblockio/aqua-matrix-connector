@@ -32,13 +32,18 @@ async fn roundtrip(sock: &Path, req: &Request, timeout: Duration) -> Result<Resp
                 sock.display()
             )
         })?;
-        stream.write_all(proto::encode_line(req).as_bytes()).await.map_err(|e| format!("write: {e}"))?;
+        stream
+            .write_all(proto::encode_line(req).as_bytes())
+            .await
+            .map_err(|e| format!("write: {e}"))?;
         let _ = stream.flush().await;
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
         match reader.read_line(&mut line).await {
             Ok(0) => Err("bridge closed the connection with no reply".to_string()),
-            Ok(_) => serde_json::from_str::<Response>(&line).map_err(|e| format!("malformed reply: {e}")),
+            Ok(_) => {
+                serde_json::from_str::<Response>(&line).map_err(|e| format!("malformed reply: {e}"))
+            }
             Err(e) => Err(format!("read: {e}")),
         }
     };
@@ -73,14 +78,21 @@ fn default_origin() -> String {
 }
 
 fn origin(args: &Value) -> String {
-    match args.get("from_label").and_then(Value::as_str).map(str::trim) {
+    match args
+        .get("from_label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
         Some(l) if !l.is_empty() => format!("{l} ({})", default_origin()),
         _ => default_origin(),
     }
 }
 
 fn str_arg<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
-    args.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    args.get(k)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 fn entries_of(data: &Value) -> Vec<InboxEntry> {
@@ -91,20 +103,37 @@ fn entries_of(data: &Value) -> Vec<InboxEntry> {
 async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
     let (req, timeout) = match name {
         jsonrpc::T_SEND_MESSAGE => {
-            let (Some(to), Some(md)) = (str_arg(args, "to"), args.get("markdown").and_then(Value::as_str)) else {
-                return ("send_message needs `to` and a non-empty `markdown`".into(), true);
+            let (Some(to), Some(md)) = (
+                str_arg(args, "to"),
+                args.get("markdown").and_then(Value::as_str),
+            ) else {
+                return (
+                    "send_message needs `to` and a non-empty `markdown`".into(),
+                    true,
+                );
             };
             if md.trim().is_empty() {
                 return ("send_message needs a non-empty `markdown`".into(), true);
             }
-            (Request::SendMessage { to: to.into(), markdown: md.into(), origin: origin(args) }, SEND_TIMEOUT)
+            (
+                Request::SendMessage {
+                    to: to.into(),
+                    markdown: md.into(),
+                    origin: origin(args),
+                },
+                SEND_TIMEOUT,
+            )
         }
         jsonrpc::T_SEND_FILE => {
             let (Some(to), Some(path)) = (str_arg(args, "to"), str_arg(args, "path")) else {
                 return ("send_file needs `to` and `path`".into(), true);
             };
             let p = PathBuf::from(path);
-            let abs = if p.is_absolute() { p } else { std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p) };
+            let abs = if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p)
+            };
             let abs = match abs.canonicalize() {
                 Ok(a) => a,
                 Err(e) => return (format!("cannot open {}: {e}", abs.display()), true),
@@ -122,7 +151,11 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
         jsonrpc::T_LIST_RECIPIENTS => (Request::ListRecipients, QUICK_TIMEOUT),
         jsonrpc::T_READ_INBOX => {
             let (mut since_seq, mut since_ts_ms) = (None, None);
-            if let Some(s) = args.get("since").and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(String::from))) {
+            if let Some(s) = args.get("since").and_then(|v| {
+                v.as_u64()
+                    .map(|n| n.to_string())
+                    .or_else(|| v.as_str().map(String::from))
+            }) {
                 match format::parse_since(&s) {
                     Ok(Since::Seq(n)) => since_seq = Some(n),
                     Ok(Since::TsMs(t)) => since_ts_ms = Some(t),
@@ -136,8 +169,16 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
                     since_seq,
                     since_ts_ms,
                     unread_only,
-                    mark_read: args.get("mark_read").and_then(Value::as_bool).unwrap_or(true),
-                    limit: Some(args.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 500) as usize),
+                    mark_read: args
+                        .get("mark_read")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    limit: Some(
+                        args.get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(50)
+                            .clamp(1, 500) as usize,
+                    ),
                 },
                 QUICK_TIMEOUT,
             )
@@ -146,9 +187,17 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
             let Some(from) = str_arg(args, "from") else {
                 return ("wait_for_reply needs `from`".into(), true);
             };
-            let t = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(120).clamp(1, MAX_WAIT_SECS);
+            let t = args
+                .get("timeout_s")
+                .and_then(Value::as_u64)
+                .unwrap_or(120)
+                .clamp(1, MAX_WAIT_SECS);
             (
-                Request::WaitForReply { from: from.into(), timeout_s: t, after_seq: args.get("after_seq").and_then(Value::as_u64) },
+                Request::WaitForReply {
+                    from: from.into(),
+                    timeout_s: t,
+                    after_seq: args.get("after_seq").and_then(Value::as_u64),
+                },
                 Duration::from_secs(t + 30),
             )
         }
@@ -160,7 +209,11 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
         Err(e) => return (e, true),
     };
     if !resp.ok {
-        return (resp.error.unwrap_or_else(|| "bridge reported an unspecified error".into()), true);
+        return (
+            resp.error
+                .unwrap_or_else(|| "bridge reported an unspecified error".into()),
+            true,
+        );
     }
     let d = &resp.data;
     let text = match name {
@@ -198,7 +251,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,aqua_system_bridge=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,aqua_system_bridge=info".into()),
         )
         .init();
     let sock = aqua_system_bridge::sock_path();

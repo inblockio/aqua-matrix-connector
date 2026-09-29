@@ -41,12 +41,19 @@ pub fn sanitize_origin(raw: &str) -> String {
 
 /// Append the unobtrusive origin tag to a Markdown message.
 pub fn tag_markdown(markdown: &str, origin: &str) -> String {
-    format!("{}\n\n<sub>via `{}`</sub>", markdown.trim_end(), sanitize_origin(origin))
+    format!(
+        "{}\n\n<sub>via `{}`</sub>",
+        markdown.trim_end(),
+        sanitize_origin(origin)
+    )
 }
 
 /// Caption for an attachment: the caller's caption (or none) plus the tag.
 pub fn tag_caption(caption: Option<&str>, filename: &str, origin: &str) -> String {
-    let base = caption.map(str::trim).filter(|c| !c.is_empty()).unwrap_or(filename);
+    let base = caption
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or(filename);
     format!("{base} (via {})", sanitize_origin(origin))
 }
 
@@ -80,7 +87,12 @@ pub fn fmt_ts_ms(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 /// A parsed `since` argument: an inbox sequence number, or a UTC instant.
@@ -98,8 +110,13 @@ pub fn parse_since(s: &str) -> Result<Since, String> {
     if let Ok(n) = s.parse::<u64>() {
         return Ok(Since::Seq(n));
     }
-    let bad = || format!("cannot parse since={s:?}: use an inbox seq number or a UTC time like 2026-09-29T10:00:00Z");
-    let body = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')).unwrap_or(s);
+    let bad = || {
+        format!("cannot parse since={s:?}: use an inbox seq number or a UTC time like 2026-09-29T10:00:00Z")
+    };
+    let body = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix('z'))
+        .unwrap_or(s);
     let (date, time) = match body.split_once(['T', ' ']) {
         Some((d, t)) => (d, Some(t)),
         None => (body, None),
@@ -159,7 +176,8 @@ pub fn frame_entries(entries: &[InboxEntry], note: &str) -> String {
             });
             if let Some(f) = &e.filename {
                 v["filename"] = serde_json::json!(f);
-                v["note"] = serde_json::json!("attachment received; content not downloaded by the bridge");
+                v["note"] =
+                    serde_json::json!("attachment received; content not downloaded by the bridge");
             }
             v
         })
@@ -177,7 +195,10 @@ mod tests {
 
     #[test]
     fn origin_is_sanitized() {
-        assert_eq!(sanitize_origin("aqua-agents@NUC10-Office"), "aqua-agents@NUC10-Office");
+        assert_eq!(
+            sanitize_origin("aqua-agents@NUC10-Office"),
+            "aqua-agents@NUC10-Office"
+        );
         assert_eq!(sanitize_origin("evil`**\n[link](x)"), "evillinkx");
         assert_eq!(sanitize_origin("   "), "unknown session");
         assert_eq!(sanitize_origin(&"a".repeat(200)).len(), MAX_ORIGIN_CHARS);
@@ -189,17 +210,26 @@ mod tests {
         let t = tag_markdown("# Hi\n\nbody\n\n", "repo@host");
         assert!(t.starts_with("# Hi\n\nbody\n\n<sub>via `repo@host`</sub>"));
         assert_eq!(tag_caption(None, "a.md", "r@h"), "a.md (via r@h)");
-        assert_eq!(tag_caption(Some("Report"), "a.md", "r@h"), "Report (via r@h)");
+        assert_eq!(
+            tag_caption(Some("Report"), "a.md", "r@h"),
+            "Report (via r@h)"
+        );
     }
 
     #[test]
     fn timestamps_roundtrip() {
         assert_eq!(fmt_ts_ms(0), "1970-01-01T00:00:00Z");
         assert_eq!(fmt_ts_ms(1_790_000_000_000), "2026-09-21T14:13:20Z");
-        assert_eq!(parse_since("2026-09-21T14:13:20Z").unwrap(), Since::TsMs(1_790_000_000_000));
+        assert_eq!(
+            parse_since("2026-09-21T14:13:20Z").unwrap(),
+            Since::TsMs(1_790_000_000_000)
+        );
         assert_eq!(parse_since("1970-01-02").unwrap(), Since::TsMs(86_400_000));
         assert_eq!(parse_since("42").unwrap(), Since::Seq(42));
-        assert_eq!(parse_since("2026-09-21T14:13").unwrap(), Since::TsMs(1_789_999_980_000));
+        assert_eq!(
+            parse_since("2026-09-21T14:13").unwrap(),
+            Since::TsMs(1_789_999_980_000)
+        );
         assert!(parse_since("yesterday").is_err());
         assert!(parse_since("2026-09-21T14:13:20+02:00").is_err());
     }

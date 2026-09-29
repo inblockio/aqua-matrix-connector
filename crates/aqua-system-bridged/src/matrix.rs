@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aqua_matrix_agent::{connect_with_outage_retry, is_unknown_token, AgentClient, AgentConfig, ConnectOutcome};
+use aqua_matrix_agent::{
+    connect_with_outage_retry, is_unknown_token, AgentClient, AgentConfig, ConnectOutcome,
+};
 use aqua_system_bridge::inbox::NewEntry;
 use matrix_sdk::{
     config::SyncSettings,
@@ -42,7 +44,10 @@ const BACKFILL_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub async fn run(
@@ -57,7 +62,14 @@ pub async fn run(
     // A send that hit M_UNKNOWN_TOKEN on the old Client, retried on the next.
     let mut carry: Option<SendCmd> = None;
     loop {
-        let agent = match connect_with_outage_retry(&config, ROLE, MAX_CONNECT_FAILURES, shutdown.notified()).await {
+        let agent = match connect_with_outage_retry(
+            &config,
+            ROLE,
+            MAX_CONNECT_FAILURES,
+            shutdown.notified(),
+        )
+        .await
+        {
             ConnectOutcome::Connected(a) => a,
             ConnectOutcome::Shutdown => {
                 tracing::info!("shutdown while connecting");
@@ -124,10 +136,15 @@ async fn run_cycle(
 
     let sync_client = agent.client().clone();
     aqua_matrix_agent::reload_olm_if_store_changed(&sync_client).await;
-    let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
+    let mut sync_task =
+        tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
 
     let now = unix_now();
-    let ttl = agent.expires_at_unix().saturating_sub(now).saturating_sub(REFRESH_GUARD_SECS).max(MIN_CYCLE_SECS);
+    let ttl = agent
+        .expires_at_unix()
+        .saturating_sub(now)
+        .saturating_sub(REFRESH_GUARD_SECS)
+        .max(MIN_CYCLE_SECS);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(ttl);
     tracing::info!("cycle starting (rotating in {ttl}s)");
 
@@ -178,18 +195,25 @@ async fn run_cycle(
 /// was rejected (to retry on the next cycle's fresh Client); otherwise replies.
 async fn execute(agent: &AgentClient, cmd: SendCmd) -> Option<SendCmd> {
     if Instant::now() > cmd.deadline {
-        let _ = cmd.reply.send(Err("the bridge could not reach Matrix before the send deadline (outage?); not sent".into()));
+        let _ = cmd.reply.send(Err(
+            "the bridge could not reach Matrix before the send deadline (outage?); not sent".into(),
+        ));
         return None;
     }
     let fut = async {
         match &cmd.kind {
             SendKind::Text(md) => agent.send_dm_chunked(&cmd.to_mxid, md).await,
-            SendKind::File { path, caption } => agent.send_file(&cmd.to_mxid, path, Some(caption)).await,
+            SendKind::File { path, caption } => {
+                agent.send_file(&cmd.to_mxid, path, Some(caption)).await
+            }
         }
     };
     let res = match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, fut).await {
         Ok(r) => r,
-        Err(_) => Err(anyhow::anyhow!("send timed out after {}s (outcome unknown)", SEND_ATTEMPT_TIMEOUT.as_secs())),
+        Err(_) => Err(anyhow::anyhow!(
+            "send timed out after {}s (outcome unknown)",
+            SEND_ATTEMPT_TIMEOUT.as_secs()
+        )),
     };
     match res {
         Ok(id) => {
@@ -244,34 +268,53 @@ async fn handle_invite(agent: &AgentClient, shared: &Arc<Shared>, room: Room, in
     }
 }
 
-fn register_invite_handler(agent: &AgentClient, shared: Arc<Shared>, own: String) -> EventHandlerHandle {
+fn register_invite_handler(
+    agent: &AgentClient,
+    shared: Arc<Shared>,
+    own: String,
+) -> EventHandlerHandle {
     let agent_c = agent.clone();
-    agent.client().add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room| {
-        let agent = agent_c.clone();
-        let shared = shared.clone();
-        let own = own.clone();
-        async move {
-            if ev.state_key.as_str() != own || ev.content.membership != MembershipState::Invite {
-                return;
+    agent
+        .client()
+        .add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room| {
+            let agent = agent_c.clone();
+            let shared = shared.clone();
+            let own = own.clone();
+            async move {
+                if ev.state_key.as_str() != own || ev.content.membership != MembershipState::Invite
+                {
+                    return;
+                }
+                handle_invite(&agent, &shared, room, ev.sender.to_string()).await;
             }
-            handle_invite(&agent, &shared, room, ev.sender.to_string()).await;
-        }
-    })
+        })
 }
 
-fn register_message_handler(agent: &AgentClient, shared: Arc<Shared>, own: String) -> EventHandlerHandle {
-    agent.client().add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-        let shared = shared.clone();
-        let own = own.clone();
-        async move {
-            if ingest(&shared, &own, &ev, room.room_id().as_str()) {
-                let event_id = ev.event_id.clone();
-                tokio::spawn(async move {
-                    let _ = room.send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id).await;
-                });
+fn register_message_handler(
+    agent: &AgentClient,
+    shared: Arc<Shared>,
+    own: String,
+) -> EventHandlerHandle {
+    agent
+        .client()
+        .add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room| {
+            let shared = shared.clone();
+            let own = own.clone();
+            async move {
+                if ingest(&shared, &own, &ev, room.room_id().as_str()) {
+                    let event_id = ev.event_id.clone();
+                    tokio::spawn(async move {
+                        let _ = room
+                            .send_single_receipt(
+                                ReceiptType::Read,
+                                ReceiptThread::Unthreaded,
+                                event_id,
+                            )
+                            .await;
+                    });
+                }
             }
-        }
-    })
+        })
 }
 
 /// Record one inbound message if it comes from an allow-listed sender.
@@ -281,7 +324,12 @@ fn ingest(shared: &Shared, own: &str, ev: &OriginalSyncRoomMessageEvent, room_id
     if sender.eq_ignore_ascii_case(own) {
         return false;
     }
-    let name = shared.allow.lock().unwrap().by_mxid(sender).map(|r| r.name.clone());
+    let name = shared
+        .allow
+        .lock()
+        .unwrap()
+        .by_mxid(sender)
+        .map(|r| r.name.clone());
     let Some(name) = name else {
         let event_id = ev.event_id.to_string();
         if shared.dropped.lock().unwrap().insert(event_id.clone()) {
@@ -294,10 +342,26 @@ fn ingest(shared: &Shared, own: &str, ev: &OriginalSyncRoomMessageEvent, room_id
         MessageType::Text(t) => ("text", t.body.clone(), None),
         MessageType::Notice(n) => ("notice", n.body.clone(), None),
         MessageType::Emote(e) => ("emote", e.body.clone(), None),
-        MessageType::File(f) => ("file", f.body.clone(), Some(f.filename.clone().unwrap_or_else(|| f.body.clone()))),
-        MessageType::Image(i) => ("image", i.body.clone(), Some(i.filename.clone().unwrap_or_else(|| i.body.clone()))),
-        MessageType::Audio(a) => ("audio", a.body.clone(), Some(a.filename.clone().unwrap_or_else(|| a.body.clone()))),
-        MessageType::Video(v) => ("video", v.body.clone(), Some(v.filename.clone().unwrap_or_else(|| v.body.clone()))),
+        MessageType::File(f) => (
+            "file",
+            f.body.clone(),
+            Some(f.filename.clone().unwrap_or_else(|| f.body.clone())),
+        ),
+        MessageType::Image(i) => (
+            "image",
+            i.body.clone(),
+            Some(i.filename.clone().unwrap_or_else(|| i.body.clone())),
+        ),
+        MessageType::Audio(a) => (
+            "audio",
+            a.body.clone(),
+            Some(a.filename.clone().unwrap_or_else(|| a.body.clone())),
+        ),
+        MessageType::Video(v) => (
+            "video",
+            v.body.clone(),
+            Some(v.filename.clone().unwrap_or_else(|| v.body.clone())),
+        ),
         other => ("other", other.body().to_string(), None),
     };
     let entry = NewEntry {
@@ -343,11 +407,18 @@ async fn backfill(agent: &AgentClient, shared: &Arc<Shared>, own: &str) {
                     utd += 1;
                     continue;
                 }
-                let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg))) = event.raw().deserialize() else {
+                let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    msg,
+                ))) = event.raw().deserialize()
+                else {
                     continue;
                 };
                 if let Some(orig) = msg.as_original() {
-                    found.push((u64::from(orig.origin_server_ts.0), room.room_id().to_string(), orig.clone()));
+                    found.push((
+                        u64::from(orig.origin_server_ts.0),
+                        room.room_id().to_string(),
+                        orig.clone(),
+                    ));
                 }
             }
         }

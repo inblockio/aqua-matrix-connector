@@ -13,12 +13,19 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(max: usize, window: Duration) -> Self {
-        Self { max, window, sends: HashMap::new() }
+        Self {
+            max,
+            window,
+            sends: HashMap::new(),
+        }
     }
 
     fn trim(&mut self, key: &str, now: Instant) -> &mut VecDeque<Instant> {
         let q = self.sends.entry(key.to_ascii_lowercase()).or_default();
-        while q.front().is_some_and(|t| now.duration_since(*t) >= self.window) {
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= self.window)
+        {
             q.pop_front();
         }
         q
@@ -62,7 +69,9 @@ mod tests {
         let t0 = Instant::now();
         assert!(rl.try_acquire("@a:x", t0).is_ok());
         assert!(rl.try_acquire("@A:x", t0 + Duration::from_secs(1)).is_ok());
-        let wait = rl.try_acquire("@a:x", t0 + Duration::from_secs(2)).unwrap_err();
+        let wait = rl
+            .try_acquire("@a:x", t0 + Duration::from_secs(2))
+            .unwrap_err();
         assert_eq!(wait, Duration::from_secs(8));
         // another key is independent
         assert!(rl.try_acquire("@b:x", t0).is_ok());

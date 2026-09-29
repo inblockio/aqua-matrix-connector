@@ -52,7 +52,9 @@ pub fn state_dir() -> PathBuf {
     if let Some(d) = std::env::var_os(STATE_DIR_ENV) {
         return PathBuf::from(d);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".aqua-system-bridge")
 }
 

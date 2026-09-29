@@ -91,7 +91,12 @@ impl Inbox {
         }
         let seen = entries.iter().map(|e| e.event_id.clone()).collect();
         let next_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
-        Self { path, entries, seen, next_seq }
+        Self {
+            path,
+            entries,
+            seen,
+            next_seq,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -169,7 +174,11 @@ impl Inbox {
         let mut out: Vec<InboxEntry> = self
             .entries
             .iter()
-            .filter(|e| q.sender.as_ref().is_none_or(|s| e.sender.eq_ignore_ascii_case(s)))
+            .filter(|e| {
+                q.sender
+                    .as_ref()
+                    .is_none_or(|s| e.sender.eq_ignore_ascii_case(s))
+            })
             .filter(|e| q.since_seq.is_none_or(|s| e.seq > s))
             .filter(|e| q.since_ts_ms.is_none_or(|t| e.ts_ms > t))
             .filter(|e| !q.unread_only || !e.read)
@@ -224,7 +233,12 @@ impl Inbox {
 /// Create/truncate a file readable only by its owner.
 pub fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
     // `mode` only applies on creation; force it for a pre-existing file too.
     use std::os::unix::fs::PermissionsExt;
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -278,17 +292,30 @@ mod tests {
         ib.ingest(msg("$1", "@t:x", 100));
         ib.ingest(msg("$2", "@k:x", 200));
         ib.ingest(msg("$3", "@T:x", 300));
-        let q = Query { sender: Some("@t:x".into()), unread_only: true, ..Default::default() };
+        let q = Query {
+            sender: Some("@t:x".into()),
+            unread_only: true,
+            ..Default::default()
+        };
         let got = ib.query(&q);
         assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 3]);
         ib.mark_read(&[1]);
         assert_eq!(ib.query(&q).len(), 1);
         assert_eq!(ib.unread_count(), 2);
-        let since = Query { since_seq: Some(1), ..Default::default() };
+        let since = Query {
+            since_seq: Some(1),
+            ..Default::default()
+        };
         assert_eq!(ib.query(&since).len(), 2);
-        let ts = Query { since_ts_ms: Some(150), ..Default::default() };
+        let ts = Query {
+            since_ts_ms: Some(150),
+            ..Default::default()
+        };
         assert_eq!(ib.query(&ts).len(), 2);
-        let lim = Query { limit: Some(1), ..Default::default() };
+        let lim = Query {
+            limit: Some(1),
+            ..Default::default()
+        };
         assert_eq!(ib.query(&lim)[0].seq, 3);
         // read state survives reload
         let re = Inbox::load(p);

@@ -77,10 +77,18 @@ pub struct Response {
 
 impl Response {
     pub fn ok(data: Value) -> Self {
-        Self { ok: true, error: None, data }
+        Self {
+            ok: true,
+            error: None,
+            data,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(msg.into()), data: Value::Null }
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            data: Value::Null,
+        }
     }
 }
 
@@ -97,7 +105,11 @@ mod tests {
 
     #[test]
     fn request_roundtrip_is_tagged() {
-        let r = Request::SendMessage { to: "tim".into(), markdown: "# hi".into(), origin: "x@y".into() };
+        let r = Request::SendMessage {
+            to: "tim".into(),
+            markdown: "# hi".into(),
+            origin: "x@y".into(),
+        };
         let line = encode_line(&r);
         assert!(line.contains("\"op\":\"send_message\""));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
