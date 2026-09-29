@@ -70,6 +70,16 @@ impl InboxEntry {
     pub fn has_attachment(&self) -> bool {
         crate::attachments::MEDIA_KINDS.contains(&self.kind.as_str())
     }
+
+    /// A copy safe to hand to a session process: the media reference keeps
+    /// its declared metadata but loses the source (and so the file key).
+    pub fn public(&self) -> Self {
+        let mut e = self.clone();
+        if let Some(m) = e.media.as_mut() {
+            m.source = serde_json::Value::Null;
+        }
+        e
+    }
 }
 
 /// A new inbound message, before it gets a `seq`.
@@ -315,6 +325,26 @@ mod tests {
             filename: None,
             media: None,
         }
+    }
+
+    #[test]
+    fn public_copy_drops_the_media_source() {
+        let mut m = msg("$f", "@t:x", 1);
+        m.kind = "file".into();
+        m.media = Some(MediaRef {
+            source: serde_json::json!({"file": {"url": "mxc://x/y", "key": {"k": "SECRET"}}}),
+            mimetype: Some("application/pdf".into()),
+            size: Some(3),
+        });
+        let mut ib = Inbox::load(tmp_path("public"));
+        let seq = ib.ingest(m).unwrap();
+        let e = ib.get(seq).unwrap();
+        assert!(e.media.as_ref().unwrap().source.get("file").is_some());
+        let p = e.public();
+        let out = serde_json::to_string(&p).unwrap();
+        assert!(!out.contains("SECRET") && !out.contains("mxc://"), "{out}");
+        assert_eq!(p.media.as_ref().unwrap().size, Some(3));
+        assert!(p.has_attachment());
     }
 
     #[test]

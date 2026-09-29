@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqua_system_bridge::allowlist::{is_valid_mxid, is_valid_room_id, AllowList, Target};
 use aqua_system_bridge::attachments::{AttachmentPolicy, AttachmentStore};
 use aqua_system_bridge::format;
-use aqua_system_bridge::inbox::{Inbox, MediaRef, Query};
+use aqua_system_bridge::inbox::{Inbox, InboxEntry, MediaRef, Query};
 use aqua_system_bridge::proto::{self, Request, Response};
 use aqua_system_bridge::ratelimit::RateLimiter;
 use aqua_system_bridge::{
@@ -479,6 +479,7 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
                 inbox.mark_read(&seqs);
             }
+            let entries: Vec<_> = entries.iter().map(|e| e.public()).collect();
             Response::ok(
                 json!({"entries": entries, "high_water": inbox.high_water(), "unread_remaining": inbox.unread_count()}),
             )
@@ -512,6 +513,7 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                     if !entries.is_empty() {
                         let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
                         inbox.mark_read(&seqs);
+                        let entries: Vec<_> = entries.iter().map(|e| e.public()).collect();
                         return Response::ok(
                             json!({"entries": entries, "waited_s": secs, "high_water": inbox.high_water()}),
                         );
@@ -623,6 +625,29 @@ async fn send(
     }
 }
 
+/// Whether an entry's attachment may be fetched now: it was posted in a
+/// listed `[[rooms]]` room (by any member), or sent by a person who is on the
+/// allow-list. Re-checked at fetch time, not only at ingest, so removing a
+/// person or room from the list also stops downloads (and cache hits) of what
+/// they sent before. A broken allow-list refuses everything.
+fn fetch_permitted(shared: &Shared, entry: &InboxEntry) -> Result<(), String> {
+    let mut allow = shared.allow.lock().unwrap();
+    allow.reload(false);
+    if let Some(e) = allow.load_error() {
+        return Err(format!(
+            "REFUSED: the allow-list failed to load ({e}); attachments cannot be fetched until it is fixed"
+        ));
+    }
+    if allow.is_listed_room(&entry.room_id) || allow.by_mxid(&entry.sender).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "REFUSED: inbox entry {} is from {} in a room that is not under [[rooms]], and that \
+         sender is not (or no longer) on the allow-list; its attachment is not fetched",
+        entry.seq, entry.sender
+    ))
+}
+
 /// `fetch_attachment`: serve the cached copy, or download + decrypt + verify
 /// on the live Client and store it (mode 600) under `<state>/attachments/`.
 async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
@@ -640,6 +665,10 @@ async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
             "inbox entry {inbox_seq} is a {} message, not an attachment",
             entry.kind
         ));
+    }
+    if let Err(e) = fetch_permitted(shared, &entry) {
+        shared.audit(json!({"event": "fetch_refused", "reason": "not_allowed", "inbox_seq": inbox_seq, "from": entry.sender, "room": entry.room_id}));
+        return Response::err(e);
     }
     let raw_name = entry.filename.clone().unwrap_or_else(|| entry.body.clone());
     let policy = shared.attach_policy;
@@ -782,6 +811,92 @@ room_id = "!daily:x"
             Ok(FromFilter::Room(_))
         ));
         assert!(resolve_from(&sh, "nobody").is_err());
+    }
+
+    fn add_file(sh: &Shared, ev: &str, room_id: &str, sender: &str, room: Option<&str>) -> u64 {
+        let e = aqua_system_bridge::inbox::NewEntry {
+            event_id: ev.into(),
+            room_id: room_id.into(),
+            sender: sender.into(),
+            sender_name: None,
+            room: room.map(Into::into),
+            ts_ms: 1,
+            kind: "file".into(),
+            body: "a.pdf".into(),
+            filename: Some("a.pdf".into()),
+            media: Some(MediaRef {
+                source: json!({"file": {"url": "mxc://x/secretmedia", "key": {"k": "SECRETKEY"}}}),
+                mimetype: Some("application/pdf".into()),
+                size: Some(10),
+            }),
+        };
+        sh.inbox.lock().unwrap().ingest(e).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetch_gate_allows_listed_rooms_and_people_only() {
+        let sh = Arc::new(shared_with(LIST, "fetchgate"));
+        // any member of a listed room; an allow-listed person (MXID case-insensitive)
+        let room = add_file(&sh, "$r", "!daily:x", "@stranger:x", Some("daily-updates"));
+        let tim = add_file(&sh, "$t", "!dm:x", "@TIM:x", None);
+        // a non-listed sender outside a listed room (e.g. removed since ingest)
+        let other = add_file(&sh, "$o", "!dm2:x", "@stranger:x", None);
+        for seq in [room, tim] {
+            let r = fetch_attachment(&sh, seq).await;
+            let e = r.error.unwrap();
+            // passed the gate; failed only because no Matrix loop runs here
+            assert!(e.contains("Matrix loop is not running"), "{seq}: {e}");
+        }
+        let e = fetch_attachment(&sh, other).await.error.unwrap();
+        assert!(e.starts_with("REFUSED"), "{e}");
+        // removing tim from the list stops fetches of what he sent earlier
+        std::fs::write(
+            sh.state_dir.join("allowlist.toml"),
+            "[[rooms]]\nname = \"daily-updates\"\nroom_id = \"!daily:x\"\n",
+        )
+        .unwrap();
+        sh.allow.lock().unwrap().reload(true);
+        let e = fetch_attachment(&sh, tim).await.error.unwrap();
+        assert!(e.starts_with("REFUSED"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn inbox_output_never_carries_the_media_source() {
+        let sh = Arc::new(shared_with(LIST, "public"));
+        add_file(&sh, "$r", "!daily:x", "@stranger:x", Some("daily-updates"));
+        let r = handle(
+            Request::ReadInbox {
+                from: Some("daily-updates".into()),
+                since_seq: None,
+                since_ts_ms: None,
+                unread_only: false,
+                mark_read: false,
+                limit: None,
+            },
+            &sh,
+        )
+        .await;
+        let out = serde_json::to_string(&r).unwrap();
+        assert!(out.contains("a.pdf"), "{out}");
+        assert!(
+            !out.contains("SECRETKEY") && !out.contains("secretmedia"),
+            "{out}"
+        );
+        let r = handle(
+            Request::WaitForReply {
+                from: "daily-updates".into(),
+                timeout_s: 1,
+                after_seq: None,
+            },
+            &sh,
+        )
+        .await;
+        let out = serde_json::to_string(&r).unwrap();
+        assert!(out.contains("a.pdf"), "{out}");
+        assert!(
+            !out.contains("SECRETKEY") && !out.contains("secretmedia"),
+            "{out}"
+        );
     }
 
     #[test]
