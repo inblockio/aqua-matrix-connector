@@ -237,6 +237,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqua-system-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aqua-system-bridged"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-agent",
+ "aqua-system-bridge",
+ "clap",
+ "matrix-sdk",
+ "matrix-sdk-base",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aquamarine"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

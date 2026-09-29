@@ -8,6 +8,8 @@ members = [
     "crates/aqua-matrix-gating",
     "crates/aqua-matrix-orchestrator",
     "crates/aqua-activity-watch",
+    "crates/aqua-system-bridge",
+    "crates/aqua-system-bridged",
 ]
 
 # Shared metadata for every crate in the workspace. Members opt in with
@@ -28,6 +30,7 @@ aqua-matrix-ask-mcp = { path = "crates/aqua-matrix-ask-mcp" }
 aqua-matrix-md-mcp = { path = "crates/aqua-matrix-md-mcp" }
 aqua-matrix-gating = { path = "crates/aqua-matrix-gating" }
 aqua-matrix-orchestrator = { path = "crates/aqua-matrix-orchestrator" }
+aqua-system-bridge = { path = "crates/aqua-system-bridge" }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
 # `experimental-send-custom-to-device` gates `Encryption::encrypt_and_send_raw_to_device`,

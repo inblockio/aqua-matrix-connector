@@ -1,0 +1,48 @@
+# Aqua System bridge: host-wide "system messages" channel to Element.
+#
+# The daemon owns the ONLY matrix-sdk Client + crypto store of the
+# "Aqua System" identity (state in ~/.aqua-system-bridge/, mode 700). Claude
+# Code sessions reach it through the stdio MCP server aqua-system-bridge-mcp
+# (registered at user scope as `aqua-messenger`) over
+# ~/.aqua-system-bridge/bridge.sock. Never run a second instance or any other
+# client on that store: two Clients on one crypto store is the 2026-09-27 OTK
+# collision / Olm-deafness failure.
+#
+# Binaries are installed to ~/.local/bin (not a cargo target/ dir, which the
+# cargo maintenance sweep deletes):
+#   cargo build --release -p aqua-system-bridged -p aqua-system-bridge
+#   install -m 755 target/release/aqua-system-bridged target/release/aqua-system-bridge-mcp ~/.local/bin/
+# Install the unit:
+#   cp systemd/aqua-system-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now aqua-system-bridge
+#
+# Network outages are waited out in-process (connect_with_outage_retry); the
+# process only exits non-zero after repeated NON-transient connect failures.
+
+[Unit]
+Description=Aqua System Matrix bridge (allow-listed system messages to Element, inbox for replies)
+Documentation=https://github.com/inblockio/aqua-matrix-connector
+After=network-online.target
+Wants=network-online.target
+# No start-rate trap: RestartSteps/RestartMaxDelaySec bound the churn instead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aqua-system-bridged
+WorkingDirectory=%h/.aqua-system-bridge
+Environment=AQUA_SYSTEM_BRIDGE_DIR=%h/.aqua-system-bridge
+Environment=RUST_LOG=info,matrix_sdk=warn,matrix_sdk_crypto=warn,matrix_sdk_base=warn
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+RestartSteps=8
+RestartMaxDelaySec=120s
+TimeoutStopSec=30
+KillMode=control-group
+MemoryMax=1G
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

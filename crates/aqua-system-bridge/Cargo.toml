@@ -1,0 +1,26 @@
+[package]
+name = "aqua-system-bridge"
+version.workspace = true
+edition.workspace = true
+description = "Matrix-free core of the Aqua System bridge (allow-list, inbox, rate limit, socket protocol) plus the thin stdio MCP server `aqua-system-bridge-mcp` that Claude Code sessions use to message allow-listed people on Element through the `aqua-system-bridged` daemon. Never opens a Matrix client or crypto store."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_system_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aqua-system-bridge-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
