@@ -46,12 +46,17 @@ enum Cmd {
         #[arg(long)]
         name: String,
     },
-    /// Post a text message in `room`.
+    /// Post a text message in `room` (optionally as a reply, and/or inside
+    /// the thread rooted at `--thread-root`).
     Post {
         #[arg(long)]
         room: String,
         #[arg(long)]
         text: String,
+        #[arg(long)]
+        reply_to: Option<String>,
+        #[arg(long)]
+        thread_root: Option<String>,
     },
     /// Send a local file as an (E2EE) attachment into `room`.
     PostFile {
@@ -64,6 +69,14 @@ enum Cmd {
     Read {
         #[arg(long)]
         room: String,
+    },
+    /// Print the last messages in `room` as JSON lines with their
+    /// `m.relates_to` (reply/thread checks).
+    ReadRaw {
+        #[arg(long)]
+        room: String,
+        #[arg(long, default_value_t = 15)]
+        limit: u32,
     },
 }
 
@@ -105,8 +118,34 @@ async fn main() -> anyhow::Result<()> {
             let room = agent.client().create_room(req).await?;
             println!("{}", room.room_id());
         }
-        Cmd::Post { room, text } => {
-            let id = agent.send_to_room(&room, &text).await?;
+        Cmd::Post {
+            room,
+            text,
+            reply_to,
+            thread_root,
+        } => {
+            let id = match (reply_to, thread_root) {
+                (Some(r), t) => {
+                    let target = aqua_matrix_agent::ReplyTarget {
+                        event_id: r,
+                        thread_root: t,
+                    };
+                    agent
+                        .send_to_room_chunked_reply(&room, &text, Some(&target))
+                        .await?
+                }
+                (None, Some(root)) => {
+                    let rel = aqua_matrix_agent::reply::continuation_relation(Some(&root), &root)?;
+                    let content = aqua_matrix_agent::reply::markdown_with(&text, rel);
+                    let rid: &matrix_sdk::ruma::RoomId = room.as_str().try_into()?;
+                    let r = agent
+                        .client()
+                        .get_room(rid)
+                        .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
+                    r.send(content).await?.response.event_id.to_string()
+                }
+                (None, None) => agent.send_to_room(&room, &text).await?,
+            };
             let _ = agent.sync_once_nowait().await;
             println!("sent {id}");
         }
@@ -118,6 +157,32 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Read { room } => {
             for m in agent.messages(&room, 10).await? {
                 println!("{} {}: {}", m.timestamp_ms, m.sender, m.body);
+            }
+        }
+        Cmd::ReadRaw { room, limit } => {
+            let rid: &matrix_sdk::ruma::RoomId = room.as_str().try_into()?;
+            let r = agent
+                .client()
+                .get_room(rid)
+                .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
+            let mut opts = matrix_sdk::room::MessagesOptions::backward();
+            opts.limit = matrix_sdk::ruma::UInt::from(limit);
+            for ev in r.messages(opts).await?.chunk {
+                let Ok(v) = ev.raw().deserialize_as::<serde_json::Value>() else {
+                    continue;
+                };
+                if v["type"] != "m.room.message" {
+                    continue;
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event_id": v["event_id"],
+                        "sender": v["sender"],
+                        "body": v["content"]["body"],
+                        "relates_to": v["content"]["m.relates_to"],
+                    })
+                );
             }
         }
     }

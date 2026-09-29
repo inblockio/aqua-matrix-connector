@@ -99,6 +99,8 @@ Edits (socket op only, no MCP tool; engine `Request::EditMessage` -> `Transport:
 
 Never point a second process (the one-shot CLI, a test) at `~/.aqua-system-bridge/store`. Binaries run from `~/.local/bin` (release build + `install`), not from `target/`.
 
+**Messenger as standard tooling (merged 2026-10-04; the consultant switch-over is tracked separately in aqua-agents#35):** the tools and policy live in the Matrix-free crate `crates/aqua-messenger` (engine behind a `Transport` trait, profile-driven tools with MCP annotations, `reply_to` threading, stdio server `aqua-messenger-mcp`) and `crates/aqua-messenger-matrix` (inbound/outbound/media, and `AgentMessenger` for an embedding agent: attach/detach on its OWN live Client, owner-only allow-list, no `wait_for_reply`). The two bridge crates are thin host front ends on it (`Profile::host()`, the only profile with `wait_for_reply`). Design: [`docs/plans/messenger-mcp-standard.md`](docs/plans/messenger-mcp-standard.md).
+
 ## Architecture
 
 This is a Cargo workspace (virtual root manifest) and a reference implementation for any agent backend over Matrix + siwx-oidc — implement `MessageHandler` and call `run_daemon()` from `aqua-matrix-relay`. After the **physical repo split**, this repo is the **connector substrate: six crates** under `crates/`. The three backend crates + agent content now live in the sibling **`../aqua-agents`** repo, which path-deps back here (see "Repo boundary" below and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
