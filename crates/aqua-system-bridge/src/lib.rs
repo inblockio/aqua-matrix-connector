@@ -16,12 +16,14 @@
 //! the Scribe (2026-09-27), which is why the split is strict.
 //!
 //! This library holds the Matrix-free pieces both halves share: the socket
-//! protocol ([`proto`]), the allow-list ([`allowlist`]), the durable inbox
+//! protocol ([`proto`]), the allow-list of people and group rooms
+//! ([`allowlist`]), the `m.direct` repair ([`direct`]), the durable inbox
 //! ([`inbox`]), the per-recipient rate limit ([`ratelimit`]) and formatting
 //! helpers ([`format`]).
 
 pub mod allowlist;
 pub mod attachments;
+pub mod direct;
 pub mod format;
 pub mod inbox;
 pub mod jsonrpc;
@@ -42,7 +44,7 @@ pub const MAX_WAIT_SECS: u64 = 600;
 pub const MAX_MESSAGE_BYTES: usize = 20_000;
 /// Largest file accepted by `send_file`, in bytes (10 MiB).
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
-/// Per-recipient send budget: at most this many sends ...
+/// Per-recipient (person or room) send budget: at most this many sends ...
 pub const RATE_LIMIT_COUNT: usize = 20;
 /// ... per this many seconds (sliding window).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 600;

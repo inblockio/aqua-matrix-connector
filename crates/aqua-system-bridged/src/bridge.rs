@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use aqua_system_bridge::allowlist::{is_valid_mxid, AllowList};
+use aqua_system_bridge::allowlist::{is_valid_mxid, is_valid_room_id, AllowList, Target};
 use aqua_system_bridge::attachments::{AttachmentPolicy, AttachmentStore};
 use aqua_system_bridge::format;
 use aqua_system_bridge::inbox::{Inbox, MediaRef, Query};
@@ -55,8 +55,29 @@ pub enum CmdOk {
     },
 }
 
+/// Where a command goes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Dest {
+    /// A person: their 1:1 DM (resolved by the Matrix loop, never a listed
+    /// `[[rooms]]` entry), created if none exists.
+    Person(String),
+    /// A listed group room, by room id.
+    Room(String),
+    /// No destination (attachment fetches).
+    Nobody,
+}
+
+/// What the bridge knows about one joined room, refreshed on every connect
+/// (for `list_recipients` and the startup log).
+#[derive(Debug, Clone, Default)]
+pub struct SeenRoom {
+    pub display_name: Option<String>,
+    pub joined_members: u64,
+    pub is_direct: bool,
+}
+
 pub struct SendCmd {
-    pub to_mxid: String,
+    pub to: Dest,
     pub kind: SendKind,
     pub deadline: Instant,
     pub reply: oneshot::Sender<Result<CmdOk, String>>,
@@ -82,6 +103,8 @@ pub struct Shared {
     /// Event ids of dropped (non-allow-listed) messages already logged, so a
     /// backfill does not re-log them every cycle.
     pub dropped: Mutex<std::collections::HashSet<String>>,
+    /// Joined rooms as of the last connect (room id -> info).
+    pub joined_rooms: Mutex<std::collections::BTreeMap<String, SeenRoom>>,
     pub cmd_tx: mpsc::Sender<SendCmd>,
     pub attach_policy: AttachmentPolicy,
     pub attachments: AttachmentStore,
@@ -110,6 +133,7 @@ impl Shared {
             )),
             status: Mutex::new(Status::default()),
             dropped: Mutex::new(std::collections::HashSet::new()),
+            joined_rooms: Mutex::new(std::collections::BTreeMap::new()),
             cmd_tx,
         }
     }
@@ -237,29 +261,81 @@ fn sensitive_path(p: &Path, state_dir: &Path) -> Option<&'static str> {
     None
 }
 
-fn resolve_to(shared: &Shared, to: &str) -> Result<(String, String), String> {
+/// A resolved `to`: display name, rate-limit key and destination.
+#[derive(Debug)]
+struct Resolved {
+    name: String,
+    /// MXID for a person, room id for a room (also the rate-limit key).
+    id: String,
+    dest: Dest,
+}
+
+fn resolve_to(shared: &Shared, to: &str) -> Result<Resolved, String> {
     let mut allow = shared.allow.lock().unwrap();
     allow.reload(false);
-    match allow.resolve(to) {
-        Some(r) => Ok((r.name.clone(), r.mxid.clone())),
-        None => Err(allow.refusal(to)),
+    match allow.resolve_target(to) {
+        Some(Target::Person(r)) => Ok(Resolved {
+            name: r.name.clone(),
+            id: r.mxid.clone(),
+            dest: Dest::Person(r.mxid.clone()),
+        }),
+        Some(Target::Room(r)) => Ok(Resolved {
+            name: r.name.clone(),
+            id: r.room_id.clone(),
+            dest: Dest::Room(r.room_id.clone()),
+        }),
+        None => {
+            let t = to.trim();
+            if is_valid_room_id(t) && shared.joined_rooms.lock().unwrap().contains_key(t) {
+                return Err(format!(
+                    "REFUSED: the bridge has joined room {t} but it is not listed under [[rooms]] in {}; \
+                     unlisted rooms are not sendable. Add a [[rooms]] entry (only with Tim's approval).",
+                    allow.path().display()
+                ));
+            }
+            Err(allow.refusal(to))
+        }
     }
 }
 
-/// Resolve a `from` filter: an allow-listed name/MXID, or any well-formed MXID
-/// (entries of since-removed people stay readable).
-fn resolve_from(shared: &Shared, from: &str) -> Result<String, String> {
+/// An inbox filter from a `from` argument.
+#[derive(Debug)]
+enum FromFilter {
+    /// DMs from this MXID.
+    Sender(String),
+    /// Messages in this room.
+    Room(String),
+}
+
+/// Resolve a `from` filter: an allow-listed person (name/MXID), a listed room
+/// (name/room id), or any well-formed MXID / room id (entries of since-removed
+/// people and rooms stay readable).
+fn resolve_from(shared: &Shared, from: &str) -> Result<FromFilter, String> {
     let mut allow = shared.allow.lock().unwrap();
     allow.reload(false);
-    if let Some(r) = allow.resolve(from) {
-        return Ok(r.mxid.clone());
+    match allow.resolve_target(from) {
+        Some(Target::Person(r)) => return Ok(FromFilter::Sender(r.mxid.clone())),
+        Some(Target::Room(r)) => return Ok(FromFilter::Room(r.room_id.clone())),
+        None => {}
     }
-    if is_valid_mxid(from.trim()) {
-        return Ok(from.trim().to_string());
+    let f = from.trim();
+    if is_valid_mxid(f) {
+        return Ok(FromFilter::Sender(f.to_string()));
+    }
+    if is_valid_room_id(f) {
+        return Ok(FromFilter::Room(f.to_string()));
     }
     Err(format!(
-        "{from:?} is neither an allow-list name nor an MXID"
+        "{from:?} is neither an allow-list name, an MXID, a [[rooms]] name nor a room id"
     ))
+}
+
+fn apply_from(q: &mut Query, f: Option<FromFilter>) {
+    match f {
+        Some(FromFilter::Sender(s)) => q.sender = Some(s),
+        Some(FromFilter::Room(r)) => q.room_id = Some(r),
+        None => {}
+    }
 }
 
 async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
@@ -344,14 +420,37 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 .iter()
                 .map(|r| json!({"name": r.name, "mxid": r.mxid, "note": r.note, "sends_left_in_window": rate.remaining(&r.mxid, now)}))
                 .collect();
+            let joined = shared.joined_rooms.lock().unwrap();
+            let rooms: Vec<_> = allow
+                .rooms()
+                .iter()
+                .map(|r| {
+                    let seen = joined.get(&r.room_id);
+                    json!({
+                        "name": r.name,
+                        "room_id": r.room_id,
+                        "note": r.note,
+                        "joined": seen.is_some(),
+                        "display_name": seen.and_then(|s| s.display_name.clone()),
+                        "joined_members": seen.map(|s| s.joined_members),
+                        "sends_left_in_window": rate.remaining(&r.room_id, now),
+                    })
+                })
+                .collect();
+            let unlisted = joined
+                .iter()
+                .filter(|(id, s)| !s.is_direct && !allow.is_listed_room(id))
+                .count();
             Response::ok(json!({
                 "recipients": recips,
+                "rooms": rooms,
+                "unlisted_non_dm_rooms_joined": unlisted,
                 "allowlist_file": allow.path(),
                 "allowlist_error": allow.load_error(),
-                "rate_limit": format!("{RATE_LIMIT_COUNT} sends per {RATE_LIMIT_WINDOW_SECS}s per recipient"),
+                "rate_limit": format!("{RATE_LIMIT_COUNT} sends per {RATE_LIMIT_WINDOW_SECS}s per person or room"),
                 "max_message_bytes": MAX_MESSAGE_BYTES,
                 "max_file_bytes": MAX_FILE_BYTES,
-                "note": "Confirm with Tim before messaging anyone other than Tim, unless he asked for it."
+                "note": "Confirm with Tim before messaging anyone other than Tim, or posting in a room, unless he asked for it. A room post is read by everyone in that room."
             }))
         }
         Request::ReadInbox {
@@ -362,18 +461,20 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             mark_read,
             limit,
         } => {
-            let sender = match from.as_deref().map(|f| resolve_from(shared, f)).transpose() {
+            let filter = match from.as_deref().map(|f| resolve_from(shared, f)).transpose() {
                 Ok(s) => s,
                 Err(e) => return Response::err(e),
             };
-            let mut inbox = shared.inbox.lock().unwrap();
-            let entries = inbox.query(&Query {
-                sender,
+            let mut q = Query {
                 since_seq,
                 since_ts_ms,
                 unread_only,
                 limit,
-            });
+                ..Default::default()
+            };
+            apply_from(&mut q, filter);
+            let mut inbox = shared.inbox.lock().unwrap();
+            let entries = inbox.query(&q);
             if mark_read {
                 let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
                 inbox.mark_read(&seqs);
@@ -387,18 +488,18 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             timeout_s,
             after_seq,
         } => {
-            let sender = match resolve_from(shared, &from) {
+            let filter = match resolve_from(shared, &from) {
                 Ok(s) => s,
                 Err(e) => return Response::err(e),
             };
             let secs = timeout_s.clamp(1, MAX_WAIT_SECS);
             let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-            let q = Query {
-                sender: Some(sender),
+            let mut q = Query {
                 since_seq: after_seq,
                 unread_only: true,
                 ..Default::default()
             };
+            apply_from(&mut q, Some(filter));
             loop {
                 // Register interest BEFORE checking, so an ingest between the
                 // check and the await cannot be missed.
@@ -452,7 +553,11 @@ async fn send(
     info: serde_json::Value,
 ) -> Response {
     let origin = format::sanitize_origin(origin);
-    let (name, mxid) = match resolve_to(shared, to) {
+    let Resolved {
+        name,
+        id: key,
+        dest,
+    } = match resolve_to(shared, to) {
         Ok(v) => v,
         Err(refusal) => {
             tracing::warn!(to, origin, "send refused: not on the allow-list");
@@ -464,7 +569,7 @@ async fn send(
         .rate
         .lock()
         .unwrap()
-        .try_acquire(&mxid, Instant::now())
+        .try_acquire(&key, Instant::now())
     {
         shared.audit(json!({"event": "send_refused", "reason": "rate_limited", "to": name, "origin": origin}));
         return Response::err(format!(
@@ -475,14 +580,15 @@ async fn send(
     }
     let inbox_seq = shared.inbox.lock().unwrap().high_water();
     let (tx, rx) = oneshot::channel();
+    let is_room = matches!(dest, Dest::Room(_));
     let cmd = SendCmd {
-        to_mxid: mxid.clone(),
+        to: dest,
         kind,
         deadline: Instant::now() + SEND_DEADLINE,
         reply: tx,
     };
     if shared.cmd_tx.send(cmd).await.is_err() {
-        shared.rate.lock().unwrap().release(&mxid);
+        shared.rate.lock().unwrap().release(&key);
         return Response::err("bridge Matrix loop is not running");
     }
     let outcome = match tokio::time::timeout(SEND_DEADLINE + Duration::from_secs(10), rx).await {
@@ -499,18 +605,17 @@ async fn send(
     match outcome {
         Ok(event_id) => {
             tracing::info!(to = %name, origin = %origin, event_id = %event_id, "sent");
-            let mut a =
-                json!({"event": "sent", "to": name, "origin": origin, "event_id": event_id});
+            let mut a = json!({"event": "sent", "to": name, "room": is_room, "origin": origin, "event_id": event_id});
             if let (Some(a), Some(i)) = (a.as_object_mut(), info.as_object()) {
                 a.extend(i.clone());
             }
             shared.audit(a);
-            Response::ok(
-                json!({"event_id": event_id, "to_name": name, "to_mxid": mxid, "inbox_seq": inbox_seq}),
-            )
+            let mut data = json!({"event_id": event_id, "to_name": name, "to_kind": if is_room { "room" } else { "person" }, "inbox_seq": inbox_seq});
+            data[if is_room { "to_room_id" } else { "to_mxid" }] = json!(key);
+            Response::ok(data)
         }
         Err(e) => {
-            shared.rate.lock().unwrap().release(&mxid);
+            shared.rate.lock().unwrap().release(&key);
             tracing::warn!(to = %name, origin = %origin, "send failed: {e}");
             shared.audit(json!({"event": "send_failed", "to": name, "origin": origin, "error": e}));
             Response::err(format!("NOT delivered to {name}: {e}"))
@@ -554,7 +659,7 @@ async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
     }
     let (tx, rx) = oneshot::channel();
     let cmd = SendCmd {
-        to_mxid: String::new(),
+        to: Dest::Nobody,
         kind: SendKind::Fetch {
             event_id: entry.event_id.clone(),
             room_id: entry.room_id.clone(),
@@ -618,6 +723,74 @@ async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_with(allowlist: &str, tag: &str) -> Shared {
+        let dir = std::env::temp_dir().join(format!("asb-bridge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("allowlist.toml"), allowlist).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        Shared::new(&dir, tx, AttachmentPolicy::default())
+    }
+
+    const LIST: &str = r#"
+[[recipients]]
+name = "tim"
+mxid = "@tim:x"
+
+[[rooms]]
+name = "daily-updates"
+room_id = "!daily:x"
+"#;
+
+    #[test]
+    fn to_resolves_person_room_or_refuses() {
+        let sh = shared_with(LIST, "to");
+        let p = resolve_to(&sh, "tim").unwrap();
+        assert_eq!(p.dest, Dest::Person("@tim:x".into()));
+        assert_eq!(p.id, "@tim:x");
+        let r = resolve_to(&sh, "daily-updates").unwrap();
+        assert_eq!(r.dest, Dest::Room("!daily:x".into()));
+        assert_eq!(r.id, "!daily:x");
+        assert_eq!(resolve_to(&sh, "!daily:x").unwrap().name, "daily-updates");
+        assert!(resolve_to(&sh, "mallory")
+            .unwrap_err()
+            .starts_with("REFUSED"));
+        // a joined but unlisted room is refused with a specific reason
+        sh.joined_rooms
+            .lock()
+            .unwrap()
+            .insert("!internal:x".into(), SeenRoom::default());
+        let e = resolve_to(&sh, "!internal:x").unwrap_err();
+        assert!(e.contains("not listed under [[rooms]]"), "{e}");
+    }
+
+    #[test]
+    fn from_resolves_to_sender_or_room_filter() {
+        let sh = shared_with(LIST, "from");
+        assert!(matches!(resolve_from(&sh, "tim"), Ok(FromFilter::Sender(s)) if s == "@tim:x"));
+        assert!(
+            matches!(resolve_from(&sh, "daily-updates"), Ok(FromFilter::Room(r)) if r == "!daily:x")
+        );
+        // since-removed people/rooms stay readable by id
+        assert!(matches!(
+            resolve_from(&sh, "@old:x"),
+            Ok(FromFilter::Sender(_))
+        ));
+        assert!(matches!(
+            resolve_from(&sh, "!old:x"),
+            Ok(FromFilter::Room(_))
+        ));
+        assert!(resolve_from(&sh, "nobody").is_err());
+    }
+
+    #[test]
+    fn broken_allowlist_fails_closed_for_rooms_too() {
+        let bad = format!("{LIST}\n[[rooms]]\nname = \"x\"\nroom_id = \"not-a-room\"\n");
+        let sh = shared_with(&bad, "bad");
+        assert!(resolve_to(&sh, "tim").is_err());
+        assert!(resolve_to(&sh, "daily-updates").is_err());
+    }
 
     #[test]
     fn sensitive_paths_are_refused() {

@@ -226,20 +226,34 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
     }
     let d = &resp.data;
     let text = match name {
-        jsonrpc::T_SEND_MESSAGE | jsonrpc::T_SEND_FILE => format!(
-            "Delivered to {} ({}) as Matrix event {}. inbox_seq={} (pass as after_seq to wait_for_reply to wait for an answer to this message).",
-            d["to_name"].as_str().unwrap_or("?"),
-            d["to_mxid"].as_str().unwrap_or("?"),
-            d["event_id"].as_str().unwrap_or("?"),
-            d["inbox_seq"]
-        ),
+        jsonrpc::T_SEND_MESSAGE | jsonrpc::T_SEND_FILE => {
+            let room = d["to_kind"].as_str() == Some("room");
+            format!(
+                "Delivered to {}{} ({}) as Matrix event {}. inbox_seq={} (pass as after_seq to wait_for_reply to wait for an answer to this message).",
+                if room { "room " } else { "" },
+                d["to_name"].as_str().unwrap_or("?"),
+                if room { d["to_room_id"].as_str() } else { d["to_mxid"].as_str() }.unwrap_or("?"),
+                d["event_id"].as_str().unwrap_or("?"),
+                d["inbox_seq"]
+            )
+        }
         jsonrpc::T_LIST_RECIPIENTS => serde_json::to_string_pretty(d).unwrap_or_default(),
         jsonrpc::T_READ_INBOX => {
             let entries = entries_of(d);
             if entries.is_empty() {
-                format!("No matching messages in the Aqua System inbox (inbox high-water seq {}).", d["high_water"])
+                format!(
+                    "No matching messages in the Aqua System inbox (inbox high-water seq {}).",
+                    d["high_water"]
+                )
             } else {
-                format::frame_entries(&entries, &format!("{} message(s); inbox high-water seq {}.", entries.len(), d["high_water"]))
+                format::frame_entries(
+                    &entries,
+                    &format!(
+                        "{} message(s); inbox high-water seq {}.",
+                        entries.len(),
+                        d["high_water"]
+                    ),
+                )
             }
         }
         jsonrpc::T_WAIT_FOR_REPLY => {
@@ -250,7 +264,10 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
                 format::frame_entries(&entries, "Reply received (marked read).")
             }
         }
-        jsonrpc::T_FETCH_ATTACHMENT => d["framed"].as_str().map(String::from).unwrap_or_else(|| d.to_string()),
+        jsonrpc::T_FETCH_ATTACHMENT => d["framed"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| d.to_string()),
         _ => d.to_string(),
     };
     (text, false)

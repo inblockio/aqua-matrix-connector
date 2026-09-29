@@ -1663,6 +1663,22 @@ impl AgentClient {
         Ok(resp.response.event_id.to_string())
     }
 
+    /// [`send_dm_chunked`](Self::send_dm_chunked) aimed at a specific room (by
+    /// id) instead of the DM with a user: the message is split at clean
+    /// boundaries below Matrix's event size cap and each chunk is sent with the
+    /// same retry-until-acknowledged loop as
+    /// [`send_dm_reliable`](Self::send_dm_reliable). Resolves no `m.direct`
+    /// state and creates no room, so a caller that has picked the room itself
+    /// (a group room, or a DM it resolved under its own rules) gets exactly
+    /// that room. Returns the last delivered event id.
+    pub async fn send_to_room_chunked(&self, room_id: &str, message: &str) -> Result<String> {
+        let mut last = String::new();
+        for chunk in split_for_matrix(message, STREAM_ROLLOVER_BYTES) {
+            last = retry_finalize("send-room", || self.send_to_room(room_id, &chunk)).await?;
+        }
+        Ok(last)
+    }
+
     /// [`send_dm`] bounded by [`SEND_ATTEMPT_TIMEOUT`] so a server-5xx that
     /// matrix-sdk would otherwise retry internally for minutes can't silently
     /// consume the access token's whole lifetime. A timeout is surfaced as a

@@ -30,6 +30,10 @@ pub struct InboxEntry {
     /// Allow-list name of the sender at ingest time.
     #[serde(default)]
     pub sender_name: Option<String>,
+    /// `[[rooms]]` name of the group room the message was posted in (at
+    /// ingest time); `None` for a DM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
     /// Server timestamp (`origin_server_ts`), milliseconds since the epoch.
     pub ts_ms: u64,
     /// `text`, `notice`, `emote`, `file`, `image`, `audio`, `video`.
@@ -75,6 +79,8 @@ pub struct NewEntry {
     pub room_id: String,
     pub sender: String,
     pub sender_name: Option<String>,
+    /// `[[rooms]]` name for a group-room message, `None` for a DM.
+    pub room: Option<String>,
     pub ts_ms: u64,
     pub kind: String,
     pub body: String,
@@ -86,7 +92,12 @@ pub struct NewEntry {
 #[derive(Debug, Clone, Default)]
 pub struct Query {
     /// Sender MXID (already resolved from a name), ASCII case-insensitive.
+    /// Matches DIRECT messages only: a person's posts in group rooms are
+    /// found with `room_id` (so a group-room message is never taken for a
+    /// reply to a DM).
     pub sender: Option<String>,
+    /// Only messages posted in this room (exact room id).
+    pub room_id: Option<String>,
     pub since_seq: Option<u64>,
     pub since_ts_ms: Option<u64>,
     pub unread_only: bool,
@@ -167,6 +178,7 @@ impl Inbox {
             room_id: new.room_id,
             sender: new.sender,
             sender_name: new.sender_name,
+            room: new.room,
             ts_ms: new.ts_ms,
             kind: new.kind,
             body: new.body,
@@ -205,8 +217,9 @@ impl Inbox {
             .filter(|e| {
                 q.sender
                     .as_ref()
-                    .is_none_or(|s| e.sender.eq_ignore_ascii_case(s))
+                    .is_none_or(|s| e.room.is_none() && e.sender.eq_ignore_ascii_case(s))
             })
+            .filter(|e| q.room_id.as_ref().is_none_or(|r| &e.room_id == r))
             .filter(|e| q.since_seq.is_none_or(|s| e.seq > s))
             .filter(|e| q.since_ts_ms.is_none_or(|t| e.ts_ms > t))
             .filter(|e| !q.unread_only || !e.read)
@@ -295,6 +308,7 @@ mod tests {
             room_id: "!r:x".into(),
             sender: sender.into(),
             sender_name: Some("tim".into()),
+            room: None,
             ts_ms: ts,
             kind: "text".into(),
             body: format!("body {id}"),
@@ -354,5 +368,38 @@ mod tests {
         // read state survives reload
         let re = Inbox::load(p);
         assert_eq!(re.unread_count(), 2);
+    }
+
+    #[test]
+    fn room_filter_and_dm_only_sender_filter() {
+        let p = tmp_path("rooms");
+        let mut ib = Inbox::load(p.clone());
+        ib.ingest(msg("$dm", "@t:x", 1));
+        let mut g = msg("$grp", "@t:x", 2);
+        g.room_id = "!g:x".into();
+        g.room = Some("daily-updates".into());
+        ib.ingest(g);
+        let by_room = ib.query(&Query {
+            room_id: Some("!g:x".into()),
+            ..Default::default()
+        });
+        assert_eq!(by_room.len(), 1);
+        assert_eq!(by_room[0].room.as_deref(), Some("daily-updates"));
+        // a person filter matches their DMs, never their group-room posts
+        let by_sender = ib.query(&Query {
+            sender: Some("@t:x".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            by_sender
+                .iter()
+                .map(|e| e.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$dm"]
+        );
+        // the room field survives a reload; old lines without it load as DMs
+        let re = Inbox::load(p);
+        assert_eq!(re.get(2).unwrap().room.as_deref(), Some("daily-updates"));
+        assert!(re.get(1).unwrap().room.is_none());
     }
 }
