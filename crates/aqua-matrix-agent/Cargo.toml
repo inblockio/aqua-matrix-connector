@@ -39,3 +39,7 @@ dotenvy.workspace = true
 mime.workspace = true
 mime_guess.workspace = true
 imagesize.workspace = true
+
+[dev-dependencies]
+# Paused-clock tests of the RTC membership keeper (rtc_member.rs).
+tokio = { workspace = true, features = ["test-util"] }

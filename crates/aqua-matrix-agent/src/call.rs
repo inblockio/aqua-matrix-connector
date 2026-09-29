@@ -26,7 +26,7 @@ use matrix_sdk::ruma::events::call::member::{
 use matrix_sdk::ruma::events::call::notify::{ApplicationType, CallNotifyEventContent};
 use matrix_sdk::ruma::events::rtc::notification::NotificationType;
 use matrix_sdk::ruma::events::Mentions;
-use matrix_sdk::ruma::{OwnedUserId, RoomId, UserId};
+use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UserId};
 
 use crate::AgentClient;
 
@@ -90,7 +90,7 @@ impl AgentClient {
 impl AgentClient {
     /// Resolve a joined [`matrix_sdk::Room`] by id, or error if this agent is
     /// not in it. Membership state can only be written to a room we have joined.
-    fn rtc_room(&self, room_id: &str) -> Result<matrix_sdk::Room> {
+    pub(crate) fn rtc_room(&self, room_id: &str) -> Result<matrix_sdk::Room> {
         let room_id: &RoomId = room_id
             .try_into()
             .map_err(|e| anyhow!("invalid room_id: {e}"))?;
@@ -111,7 +111,7 @@ impl AgentClient {
     /// lets the sender set a state key embedding its own `@user` mxid; servers
     /// without MSC3757 reject it, so [`set_rtc_member`](Self::set_rtc_member)
     /// falls back to the unprefixed `{user_id}_{device_id}_m.call`.
-    fn rtc_member_state_key(&self, underscore: bool) -> Result<CallMemberStateKey> {
+    pub(crate) fn rtc_member_state_key(&self, underscore: bool) -> Result<CallMemberStateKey> {
         let user_id: OwnedUserId = self
             .user_id()
             .try_into()
@@ -119,14 +119,7 @@ impl AgentClient {
         let device_id = self
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot set RTC membership"))?;
-        // member_id = `{device_id}_m.call` (device + application), per the
-        // deployed Element Call. ruma renders the key as `_{user}_{member_id}`.
-        let member_id = format!("{device_id}_m.call");
-        Ok(CallMemberStateKey::new(
-            user_id,
-            Some(member_id),
-            underscore,
-        ))
+        Ok(rtc_member_state_key_for(user_id, &device_id, underscore))
     }
 
     /// Publish this agent's **MatrixRTC membership** (`org.matrix.msc3401.call.member`)
@@ -140,19 +133,17 @@ impl AgentClient {
     /// this device's `device_id`, a LiveKit `focus_active`
     /// (`focus_selection=oldest_membership`) and a single `foci_preferred`
     /// LiveKit focus carrying `livekit_alias` + `livekit_service_url`. The default
-    /// 4-hour membership expiry is left in place (no refresh — see the long-call
-    /// TODO below). `livekit_alias` should be the same `room_id` string the
-    /// lk-jwt handshake uses as its `room` param so the agent and Element X derive
-    /// the same LiveKit room.
+    /// 4-hour membership expiry is left in place and NOTHING refreshes it: this is
+    /// the one-shot form for short calls and tests. A call that may outlive 4 h
+    /// must use [`hold_rtc_member`](Self::hold_rtc_member) instead, which keeps the
+    /// membership alive and arms a server-side delayed leave. `livekit_alias`
+    /// should be the same `room_id` string the lk-jwt handshake uses as its `room`
+    /// param so the agent and Element X derive the same LiveKit room.
     ///
     /// Sent with the MSC3757 owned-state key (`_{user}_{device}`). If the
     /// homeserver lacks MSC3757 support it rejects the leading underscore with
     /// `M_FORBIDDEN`; we then transparently retry with the unprefixed key
     /// (`{user}_{device}`) and log which form the server accepted.
-    ///
-    /// TODO(long-presence): the membership expires after 4h by default. A call
-    /// held open longer than that needs the event re-sent before expiry (copying
-    /// the original `created_ts`); short calls need no refresh.
     pub async fn set_rtc_member(
         &self,
         room_id: &str,
@@ -164,20 +155,11 @@ impl AgentClient {
             .device_id()
             .ok_or_else(|| anyhow!("agent has no device_id; cannot set RTC membership"))?;
 
-        let content = CallMemberEventContent::new(
-            Application::Call(CallApplicationContent::new(String::new(), CallScope::Room)),
-            device_id.as_str().into(),
-            ActiveFocus::Livekit(ActiveLivekitFocus::new()),
-            vec![Focus::Livekit(LivekitFocus::new(
-                livekit_alias.to_owned(),
-                livekit_service_url.to_owned(),
-            ))],
-            // Initial join: created_ts is unknown client-side; the homeserver's
-            // origin_server_ts becomes the effective creation time.
-            None,
-            // None -> ruma defaults to the 4h Element Call membership expiry.
-            None,
-        );
+        // Initial join: created_ts is unknown client-side; the homeserver's
+        // origin_server_ts becomes the effective creation time. None expires ->
+        // ruma's 4h Element Call default.
+        let content =
+            rtc_member_content(&device_id, livekit_alias, livekit_service_url, None, None);
 
         // Prefer the MSC3757 owned-state key (leading underscore). Fall back to
         // the unprefixed key if the server rejects owned state events.
@@ -312,6 +294,48 @@ impl AgentClient {
     }
 }
 
+/// The call-member state key for `user_id` + `device_id` (see
+/// [`AgentClient::rtc_member_state_key`] for the format and the MSC3757
+/// leading-underscore rule).
+pub(crate) fn rtc_member_state_key_for(
+    user_id: OwnedUserId,
+    device_id: &str,
+    underscore: bool,
+) -> CallMemberStateKey {
+    // member_id = `{device_id}_m.call` (device + application), per the
+    // deployed Element Call. ruma renders the key as `_{user}_{member_id}`.
+    CallMemberStateKey::new(user_id, Some(format!("{device_id}_m.call")), underscore)
+}
+
+/// The `org.matrix.msc3401.call.member` content this agent publishes: a
+/// room-scoped `m.call` session membership for `device_id` with a LiveKit
+/// `oldest_membership` active focus and one preferred LiveKit focus.
+///
+/// `created_ts` / `expires` follow matrix-js-sdk `CallMembership`: a membership's
+/// absolute expiry is `(created_ts ?? origin_server_ts) + expires`. A refresh
+/// therefore re-sends the SAME `created_ts` (the first event's
+/// `origin_server_ts`) with a larger `expires`; a changed `created_ts` reads as a
+/// new membership (a rejoin) to Element Call's key-sharing logic.
+pub(crate) fn rtc_member_content(
+    device_id: &str,
+    livekit_alias: &str,
+    livekit_service_url: &str,
+    created_ts: Option<MilliSecondsSinceUnixEpoch>,
+    expires: Option<std::time::Duration>,
+) -> CallMemberEventContent {
+    CallMemberEventContent::new(
+        Application::Call(CallApplicationContent::new(String::new(), CallScope::Room)),
+        device_id.into(),
+        ActiveFocus::Livekit(ActiveLivekitFocus::new()),
+        vec![Focus::Livekit(LivekitFocus::new(
+            livekit_alias.to_owned(),
+            livekit_service_url.to_owned(),
+        ))],
+        created_ts,
+        expires,
+    )
+}
+
 /// A fresh, collision-resistant call id. We have no RNG in the default feature
 /// set, so derive it from the wall clock in nanoseconds — unique enough for a
 /// ring (a real MatrixRTC session id would come from the media layer we don't
@@ -322,4 +346,41 @@ fn new_call_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("aqua-{nanos}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wire shape of a refresh and of the (delayed) leave, as matrix-js-sdk
+    /// reads them: `created_ts` and `expires` in milliseconds, absolute expiry
+    /// = created_ts + expires; the leave is an empty object.
+    #[test]
+    fn member_content_carries_created_ts_and_expires_in_ms() {
+        let created = MilliSecondsSinceUnixEpoch(1_790_000_000_000u64.try_into().unwrap());
+        let content = rtc_member_content(
+            "AQUA_dev",
+            "!room:example.org",
+            "https://example.org/livekit/jwt",
+            Some(created),
+            Some(std::time::Duration::from_secs(5 * 3600)),
+        );
+        let v = serde_json::to_value(&content).unwrap();
+        assert_eq!(v["application"], "m.call");
+        assert_eq!(v["call_id"], "");
+        assert_eq!(v["scope"], "m.room");
+        assert_eq!(v["device_id"], "AQUA_dev");
+        assert_eq!(v["created_ts"], 1_790_000_000_000u64);
+        assert_eq!(v["expires"], 5 * 3600 * 1000);
+        assert_eq!(v["focus_active"]["type"], "livekit");
+        assert_eq!(v["foci_preferred"][0]["livekit_alias"], "!room:example.org");
+
+        let join = rtc_member_content("D", "a", "u", None, None);
+        let v = serde_json::to_value(&join).unwrap();
+        assert!(v.get("created_ts").is_none(), "a join starts a new chain");
+        assert_eq!(v["expires"], 4 * 3600 * 1000);
+
+        let leave = serde_json::to_value(CallMemberEventContent::new_empty(None)).unwrap();
+        assert_eq!(leave, serde_json::json!({}));
+    }
 }

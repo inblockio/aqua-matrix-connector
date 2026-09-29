@@ -136,6 +136,8 @@ impl AgentClient {
     /// they all land in the *same* room (splitting media into a second room
     /// would break Megolm key sharing with the peer).
     pub(crate) async fn ensure_dm_room(&self, target: &UserId) -> Result<matrix_sdk::Room> {
+        // `find_dm_room` returns only a true 1:1 (bug D1, see dm.rs); when none
+        // exists we create one rather than reuse any other shared room.
         let room = match self.find_dm_room(target).await {
             Some(room) => room,
             None => {
@@ -156,20 +158,17 @@ impl AgentClient {
                         }
                     }
                 }
-                room
+                // `create_room` with `is_direct` already recorded it in m.direct.
+                return Ok(room);
             }
         };
-        let already_marked = self
-            .client()
-            .get_dm_room(target)
-            .is_some_and(|r| r.room_id() == room.room_id());
-        if !already_marked {
-            if let Err(e) = self
-                .client()
-                .account()
-                .mark_as_dm(room.room_id(), &[target.to_owned()])
-                .await
-            {
+        // Record the resolved 1:1 in m.direct if the room info does not list it
+        // yet. `mark_dm` is dedup-aware (matrix-sdk's `mark_as_dm` appends
+        // unconditionally) and re-checks the 1:1 shape. The old check used
+        // `get_dm_room`, whose first match is in undefined order, so it
+        // appended duplicates whenever another room came first.
+        if !crate::dm::is_marked_direct(&room, target) {
+            if let Err(e) = self.mark_dm(room.room_id().as_str(), target.as_str()).await {
                 tracing::warn!("failed to mark room as DM (m.direct): {e:#}");
             }
         }
