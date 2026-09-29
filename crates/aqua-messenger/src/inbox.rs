@@ -47,6 +47,13 @@ pub struct InboxEntry {
     /// holds the file's decryption key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaRef>,
+    /// Event id this message replies to (`m.in_reply_to`; for a thread
+    /// message only when it is a genuine reply, not the thread fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// Root event id of the thread this message was posted in (`m.thread`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
     #[serde(default)]
     pub read: bool,
 }
@@ -96,6 +103,10 @@ pub struct NewEntry {
     pub body: String,
     pub filename: Option<String>,
     pub media: Option<MediaRef>,
+    /// See [`InboxEntry::in_reply_to`].
+    pub in_reply_to: Option<String>,
+    /// See [`InboxEntry::thread_root`].
+    pub thread_root: Option<String>,
 }
 
 /// Filter for [`Inbox::query`].
@@ -194,6 +205,8 @@ impl Inbox {
             body: new.body,
             filename: new.filename,
             media: new.media,
+            in_reply_to: new.in_reply_to,
+            thread_root: new.thread_root,
             read: false,
         });
         self.prune();
@@ -242,6 +255,11 @@ impl Inbox {
             }
         }
         out
+    }
+
+    /// The entry with this Matrix event id, if still in the inbox.
+    pub fn get_by_event_id(&self, event_id: &str) -> Option<&InboxEntry> {
+        self.entries.iter().find(|e| e.event_id == event_id)
     }
 
     /// The entry with this seq, if still in the inbox.
@@ -324,6 +342,8 @@ mod tests {
             body: format!("body {id}"),
             filename: None,
             media: None,
+            in_reply_to: None,
+            thread_root: None,
         }
     }
 
@@ -431,5 +451,26 @@ mod tests {
         let re = Inbox::load(p);
         assert_eq!(re.get(2).unwrap().room.as_deref(), Some("daily-updates"));
         assert!(re.get(1).unwrap().room.is_none());
+    }
+
+    #[test]
+    fn reply_fields_persist_and_old_lines_load() {
+        let p = tmp_path("reply");
+        let mut ib = Inbox::load(p.clone());
+        let mut m = msg("$r", "@t:x", 1);
+        m.in_reply_to = Some("$ours".into());
+        m.thread_root = Some("$root".into());
+        ib.ingest(m);
+        ib.ingest(msg("$plain", "@t:x", 2));
+        let re = Inbox::load(p.clone());
+        let e = re.get_by_event_id("$r").unwrap();
+        assert_eq!(e.in_reply_to.as_deref(), Some("$ours"));
+        assert_eq!(e.thread_root.as_deref(), Some("$root"));
+        // absent fields are not written, and a pre-reply line still parses
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("in_reply_to").count(), 1);
+        let old = r#"{"seq":9,"event_id":"$o","room_id":"!r:x","sender":"@t:x","ts_ms":1,"kind":"text","body":"b","read":false}"#;
+        let e: InboxEntry = serde_json::from_str(old).unwrap();
+        assert!(e.in_reply_to.is_none() && e.thread_root.is_none());
     }
 }
