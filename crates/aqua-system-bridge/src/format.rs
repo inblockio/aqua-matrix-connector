@@ -214,7 +214,7 @@ pub fn frame_attachment(
     f: &crate::attachments::Fetched,
     cached: bool,
 ) -> String {
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "inbox_seq": entry.seq,
         "from": entry.sender,
         "from_name": entry.sender_name,
@@ -227,6 +227,9 @@ pub fn frame_attachment(
         "sha256": f.sha256,
         "cached": cached,
     });
+    if let Some(r) = &entry.room {
+        v["room"] = serde_json::json!(r);
+    }
     format!(
         "{UNTRUSTED_FILE_HEADER}\n<untrusted-attachment>\n{}\n</untrusted-attachment>",
         serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())

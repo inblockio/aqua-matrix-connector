@@ -24,10 +24,17 @@ struct Args {
     siwx_url: String,
     #[arg(long)]
     matrix_url: String,
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     target: String,
     #[arg(long)]
-    file: PathBuf,
+    file: Option<PathBuf>,
+    /// Print this peer's MXID and exit (registers the account on first use).
+    #[arg(long)]
+    whoami: bool,
+    /// Send a text first and wait this long, so the target can join the DM
+    /// before the attachment is sent.
+    #[arg(long, default_value_t = 0)]
+    warmup_secs: u64,
 }
 
 #[tokio::main]
@@ -49,10 +56,24 @@ async fn main() -> anyhow::Result<()> {
         device_id: None,
     })
     .await?;
+    if a.whoami {
+        println!("mxid {}", agent.user_id());
+        return Ok(());
+    }
+    let file = a
+        .file
+        .ok_or_else(|| anyhow::anyhow!("--file is required"))?;
     agent.sync_once().await?;
     let _ = agent.join_invited_rooms().await;
     agent.sync_once().await?;
-    let id = agent.send_file(&a.target, &a.file, None).await?;
+    if a.warmup_secs > 0 {
+        agent.send_dm(&a.target, "hello (e2e warm-up)").await?;
+        for _ in 0..a.warmup_secs {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let _ = agent.sync_once_nowait().await;
+        }
+    }
+    let id = agent.send_file(&a.target, &file, None).await?;
     // One more sync so the room key reaches the bridge's device promptly.
     let _ = agent.sync_once_nowait().await;
     println!("sent {id}");

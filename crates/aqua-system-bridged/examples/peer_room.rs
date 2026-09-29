@@ -1,8 +1,8 @@
 //! Local-stack e2e helper for `[[rooms]]`: act as a PEER that creates an
 //! encrypted room and invites the bridge (`create`), posts in a room (`post`),
-//! or prints a room's recent messages (`read`). Never point this at production
-//! or at the bridge's own store: it is a separate identity with its own
-//! `--store-dir`.
+//! sends a file into a room (`post-file`), or prints a room's recent messages
+//! (`read`). Never point this at production or at the bridge's own store: it
+//! is a separate identity with its own `--store-dir`.
 //!
 //!   cargo run -p aqua-system-bridged --example peer_room -- \
 //!     --key-file ~/.cache/system-bridge-test/peer/peer.pem \
@@ -53,6 +53,13 @@ enum Cmd {
         #[arg(long)]
         text: String,
     },
+    /// Send a local file as an (E2EE) attachment into `room`.
+    PostFile {
+        #[arg(long)]
+        room: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Print the last messages in `room`.
     Read {
         #[arg(long)]
@@ -100,6 +107,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Post { room, text } => {
             let id = agent.send_to_room(&room, &text).await?;
+            let _ = agent.sync_once_nowait().await;
+            println!("sent {id}");
+        }
+        Cmd::PostFile { room, file } => {
+            let id = agent.send_media_to_room(&room, &file, None).await?;
             let _ = agent.sync_once_nowait().await;
             println!("sent {id}");
         }
