@@ -32,6 +32,7 @@ runs it via symlinks so there is a single source of truth (no drift):
 | `Skills/consultant-deploy/restore-agent-fleet.sh` | `~/restore-agent-fleet.sh` | boot-time fleet restore (see below) |
 | `Skills/consultant-deploy/consultant-config.template.json` | `~/.aqua-matrix-test/consultant-config.template.json` | config template |
 | `Skills/consultant-deploy/consultants.registry.example` | *(host state — not symlinked)* | format reference |
+| `Skills/consultant-deploy/consultant-persona.py`, `onboard-send.py` | *(none: found next to the symlink target)* | persona render, onboarding direct send |
 
 **Host state stays on the host** (not in the repo): the live registry
 `~/.aqua-matrix-test/consultants.registry`, and every consultant's `<label>-aqua-consultant-config.json`
@@ -55,13 +56,13 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 ## Add a new consultant
 
 One command. Renders the config from the template, launches with the hardened podman flags, wires
-a systemd activity-watcher, and (`--onboard`) DMs the operator a forward-ready onboarding message
-carrying the agent's self-minted MXID.
+a systemd activity-watcher, and (`--onboard`) sends the peer a welcome message directly (see
+"Onboarding" below), telling the operator whether it arrived or needs forwarding.
 
 **The consultant initiates the connection.** The template sets `"initiate_dm": true`, so on first
 connect (when no DM room exists yet) the agent creates the room, invites the peer, and delivers
-her greeting into it — the peer just accepts the invite. The onboarding block therefore says
-"expect an invite from <MXID>", not "DM this MXID". Delivery is tracked by the greeted-marker:
+her greeting into it — the peer just accepts the invite. The onboarding welcome therefore says
+"accept the chat invitation", not "DM this MXID". Delivery is tracked by the greeted-marker:
 a failed initiate retries on the next process start. **Sequencing invariant:** `initiate_dm` in a
 config requires an image whose binary knows the field (`deny_unknown_fields` hard-rejects unknown
 keys) — roll the image BEFORE rendering configs that carry it; never point an old image at a
@@ -72,10 +73,41 @@ existing configs, so already-deployed consultants are unaffected until re-render
 bash ~/spawn-consultant.sh \
   --label gawain \
   --target 'did:key:z6Mk…' \
-  --display 'Aqua Consultant (Gawain)' \
+  --persona Talia \
   --name Gawain \
   --onboard
 ```
+
+**Onboarding (`--onboard`).** Once the agent's MXID is known, spawn renders the peer welcome
+(what Aqua is, how to accept the invitation, example questions, "good to know"; persona wording
+with `--persona`, neutral "it" wording without; the "send her voice messages" line only when the
+config has `voice.enabled: true`, read from the config file so `--keep-config` spawns are right)
+and sends it to `--target` **directly** as the shared "Aqua System" identity, through the bridge's
+stdio MCP server (`~/.local/bin/aqua-system-bridge-mcp`, tool `send_message`, via
+`onboard-send.py`, hard cap 30 s). The bridge only messages people on
+`~/.aqua-system-bridge/allowlist.toml`; that Tim-approved list is what authorizes the direct
+send, so **add the peer there (with Tim's approval) before spawning** if the welcome should go out
+by itself. The operator then gets ONE DM:
+
+| Outcome | Level | Title | Body |
+|---|---|---|---|
+| delivered | INFO | `onboarding sent: <name or persona> (<container>)` | event id + the welcome as a quote, "Nothing to forward." |
+| peer not allow-listed | INFO | `onboarding to forward: …` | the welcome between two `----------` rules + the reason |
+| bridge error / timeout | WARN | `onboarding to forward: …` | same, reason carries the short error (a timeout says it may still arrive) |
+
+A failed direct send never fails the spawn. `--onboard-forward-only` (implies `--onboard`) skips
+the direct send (the old behaviour). Review the copy offline first, no token, network, config
+write, container or DM involved:
+
+```bash
+bash ~/spawn-consultant.sh --print-onboarding --label gawain --target '@…:matrix.inblock.io' \
+  --persona Talia --name Gawain --voice on
+```
+
+The MXID comes from the persisted session when there is one, else the placeholder
+`@<agent-mxid>:matrix.inblock.io`; the voice line follows `--voice` when given, else the existing
+config, else the template. With `--replace --keep-config --onboard`, also pass `--persona`/`--name`
+(the kept config does not record them), or the welcome falls back to the neutral wording.
 
 **MXIDs are never derived from DIDs (2026-09-27).** siwx-oidc gives every NEW DID an opaque
 localpart (16 base36 chars, e.g. `@1vo8g4vofiha69ua:matrix.inblock.io`) and keeps existing
@@ -173,7 +205,9 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 | `--replace` | `podman rm -f` + re-run, **reusing persist** → DID + memory PRESERVED (the image-roll path). |
 | `--keep-config` | Use the existing config verbatim (no re-render); derives id/target/display from it. |
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) |
-| `--onboard` | After connect, derive the agent MXID from logs and DM the operator a forward-ready onboarding message. |
+| `--onboard` | After connect, read the agent MXID from its persisted session, send the peer the welcome directly via the Aqua System bridge (allow-listed peers only), and DM the operator "onboarding sent" (INFO) or "onboarding to forward" (INFO when not allow-listed, WARN on a bridge error). Never fails the spawn. See "Onboarding". |
+| `--onboard-forward-only` | Implies `--onboard` but never sends directly: the operator gets the forward-ready copy (reason "direct send disabled"). |
+| `--print-onboarding` | Print the peer welcome and both operator notices to stdout and exit 0 before any token, network, config write, container or DM. Placeholder MXID when no session exists. |
 | `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
 | `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
 | `--voice on\|off` | Patch only `voice.enabled` in the rendered/kept config (idempotent, sibling voice keys preserved, `off` keeps the block). Without it the config's voice block is left exactly as it is. See "Voice messages". |
@@ -249,13 +283,24 @@ flips only that key; `--replace --keep-config` preserves the block; `inblockio.g
 persona re-render or `--refresh-prompt` keeps an existing config's `model` (and never injects one);
 the shims were never called.
 
+`tests/spawn-consultant-onboarding.sh` covers `--onboard`: `--print-onboarding` for persona +
+name, pseudonymous persona ("Hi there"), legacy wording, the voice line on/off (flag, existing
+config, `--keep-config`, template default), session MXID vs placeholder, no side effects, and no
+U+2014/U+2013 dash in any rendered text; `onboard-send.py` against a fake bridge (delivered,
+refusals, tool and JSON-RPC errors, timeout, garbage, missing binary); and whole `--onboard`
+spawns with podman shimmed, a recording notifier and the fake bridge (delivered = INFO "sent",
+not allow-listed = INFO "forward", bridge error/timeout = WARN, forward-only never calls the
+bridge, the spawn exits 0 throughout). No message leaves the machine.
+
 ```bash
 bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
+bash Skills/consultant-deploy/tests/spawn-consultant-onboarding.sh
 ```
 
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
 avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
-`CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`.
+`CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
+`CONSULTANT_NOTIFY`, `AQUA_SYSTEM_BRIDGE_MCP` and `ONBOARD_SEND_TIMEOUT`.
 
 ## Model pin (`model`)
 

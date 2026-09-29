@@ -6,8 +6,9 @@
 # per-instance config from ~/.aqua-matrix-test/consultant-config.template.json, launches
 # the container with the SAME hardened podman flags as the original scripts (verbatim -
 # the security posture must not drift), wires the systemd activity-watcher, DMs Tim
-# "channel up", and (with --onboard) DMs Tim a ready-to-forward onboarding message that
-# carries the agent's self-minted MXID. Since the template sets "initiate_dm": true,
+# "channel up", and (with --onboard) sends the peer a welcome message through the Aqua System
+# bridge (allow-listed peers only), telling Tim either "delivered" or "please forward this"
+# (see "Onboarding" below). Since the template sets "initiate_dm": true,
 # the consultant herself creates the DM room, invites the peer and delivers her
 # greeting (the peer just accepts the invite; no need to DM the MXID first).
 # SEQUENCING: a config carrying initiate_dm needs an image whose binary knows the
@@ -92,6 +93,22 @@
 # render/patch the config file and create the persist dirs, since those are the run's
 # inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
 #
+# Onboarding (--onboard): once the agent's MXID is known, the script renders the peer welcome
+# (persona or legacy wording; the voice line only when the config has voice.enabled == true, read
+# from the config file so --keep-config spawns are right too) and tries to send it to --target
+# DIRECTLY as the shared "Aqua System" identity, via the stdio MCP server
+# aqua-system-bridge-mcp (tool send_message, via onboard-send.py, hard 30 s cap). The bridge only
+# messages people on ~/.aqua-system-bridge/allowlist.toml, and that Tim-approved list is what
+# authorizes the direct send. Then Tim gets ONE DM: "onboarding sent" (with the quoted text) on
+# delivery, or "onboarding to forward" (the text between two lines, plus the reason) when the peer
+# is not allow-listed (INFO) or the bridge failed or timed out (WARN). A failed send never fails
+# the spawn. --onboard-forward-only (implies --onboard) skips the direct send: the old behaviour.
+#
+# --print-onboarding: print the peer welcome and both Tim notices to stdout and exit 0, before any
+# token, network, config write, container or DM (offline copy review). The MXID comes from the
+# persisted session when there is one, else the placeholder @<agent-mxid>:matrix.inblock.io; the
+# voice line follows --voice when given, else the existing config (else the template).
+#
 # Env overrides (all optional; the defaults are this host's live paths):
 #   CONSULTANT_TEST_DIR     dir holding configs/persist/avatars/template (default ~/.aqua-matrix-test)
 #   CONSULTANT_TEMPLATE     config template path (default $CONSULTANT_TEST_DIR/consultant-config.template.json)
@@ -99,6 +116,9 @@
 #   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
 #   AQUA_CLAUDE_TOKEN_FILE  OAuth token file (default ~/.aqua-matrix-heartbeat/claude-oauth-token)
 #   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
+#   AQUA_SYSTEM_BRIDGE_MCP  bridge MCP binary for --onboard (default ~/.local/bin/aqua-system-bridge-mcp)
+#   ONBOARD_SEND_TIMEOUT    seconds before a direct onboarding send counts as failed (default 30)
+#   CONSULTANT_NOTIFY       notifier used for Tim's DMs (default ~/.aqua-matrix-notify/notify-tim.sh; tests)
 #
 # Examples:
 #   # new consultant (fresh identity) with a female persona; DM Tim a forward-ready intro:
@@ -126,6 +146,10 @@
 #   # enable voice messages on an existing consultant (image already rolled to a voice-aware build):
 #   bash ~/spawn-consultant.sh --replace --keep-config --label zdnaez --voice on
 #
+#   # review the onboarding copy offline (peer welcome + both Tim notices), nothing started:
+#   bash ~/spawn-consultant.sh --print-onboarding --label andreas --target '@…:matrix.inblock.io' \
+#        --persona Pelagia --name Andreas --voice on
+#
 #   # preview the exact podman argument vector, nothing started:
 #   bash ~/spawn-consultant.sh --print-run --label zdnaez --target '@…:matrix.inblock.io' --persona Coralie
 #
@@ -142,7 +166,9 @@ PERSONA=""            # the consultant's FEMALE persona name (e.g. Talia); drive
 GENERIC=0             # target the UN-LABELED generic consultant instead of a --label one
 REPLACE=0             # rm -f an existing container first (image roll; DID preserved)
 FRESH=0               # wipe persist dir first (force a brand-new identity)
-ONBOARD=0             # after connect, DM Tim a forward-ready onboarding message
+ONBOARD=0             # after connect, send the peer the onboarding welcome (bridge) and tell Tim
+ONBOARD_DIRECT=1      # --onboard-forward-only sets 0: never send directly, DM Tim a forward-ready copy
+PRINT_ONBOARDING=0    # --print-onboarding: print the peer welcome + both Tim notices and exit 0
 KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never clobber customizations)
 REFRESH_REFS=1        # fast-forward the /refs repos before launch (--no-refresh-refs to skip)
 REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mounts into the config
@@ -160,6 +186,8 @@ IMAGE="${CONSULTANT_IMAGE:-localhost/aqua-matrix-agent:poc}"
 REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
 # Persona rendering helper, alongside this script (resolve through the ~/ symlink).
 PERSONA_HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/consultant-persona.py"
+# Onboarding direct-send client (Aqua System bridge, stdio MCP), alongside this script too.
+ONBOARD_SENDER="$(dirname "$PERSONA_HELPER")/onboard-send.py"
 # Grounding repos, mounted ro at /refs/<name>. This ONE list drives the presence check,
 # the freshness pass, and the podman -v flags, so the three can never drift apart.
 # Keep it in sync with ref_mounts in consultant-config.template.json.
@@ -184,6 +212,8 @@ while [ $# -gt 0 ]; do
     --replace) REPLACE=1; shift ;;
     --fresh)   FRESH=1; shift ;;
     --onboard) ONBOARD=1; shift ;;
+    --onboard-forward-only) ONBOARD=1; ONBOARD_DIRECT=0; shift ;;
+    --print-onboarding) PRINT_ONBOARDING=1; shift ;;
     --keep-config) KEEP_CONFIG=1; shift ;;
     --no-refresh-refs) REFRESH_REFS=0; shift ;;
     --refresh-prompt) REFRESH_PROMPT=1; shift ;;
@@ -299,6 +329,103 @@ fi
 # to the display name as before; in persona mode it stays exactly what --name gave, empty
 # means a pseudonymous peer, which the persona render greets without a name.
 [ -n "$PERSONA" ] || : "${HUMAN_NAME:=$DISPLAY_NAME}"
+
+# ---------------------------------------------------------------- onboarding copy
+# One source for the peer welcome and Tim's two notices, used by --onboard and by
+# --print-onboarding. No em/en dashes anywhere in the rendered text (tests enforce it).
+# config_voice_enabled <config.json>: exit 0 iff the config has voice.enabled == true.
+config_voice_enabled() {
+  [ -f "$1" ] || return 1
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("voice")
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(v, dict) and v.get("enabled") is True else 1)
+PY
+}
+
+# render_peer_welcome <agent-mxid> <voice 0|1>: the Markdown the peer reads.
+render_peer_welcome() {
+  local mxid="$1" voice="$2" hi="${HUMAN_NAME:-there}"
+  local intro who who_mid she she_lc obj poss
+  if [ -n "$PERSONA" ]; then
+    intro="You now have your own Aqua Consultant, **${PERSONA}**. She is an AI assistant who knows Aqua inside out, and she is there just for you whenever you have a question."
+    who="$PERSONA"; who_mid="$PERSONA"; she="She"; she_lc="she"; obj="her"; poss="her"
+  else
+    intro="You now have your own **Aqua Consultant**. It is an AI assistant who knows Aqua inside out, and it is there just for you whenever you have a question."
+    who="Your consultant"; who_mid="your consultant"; she="It"; she_lc="it"; obj="it"; poss="its"
+  fi
+  printf '%s\n' \
+    "Hi ${hi}! 👋" \
+    "" \
+    "$intro" \
+    "" \
+    "Aqua is inblock.io's protocol for trust that travels with your data: every signature, AI action and file carries its own proof, so anyone can check what happened." \
+    "" \
+    "**How to start**" \
+    "${who} has sent you a chat invitation in Element, your Matrix chat app. Accept it, and ${poss} welcome message is already waiting for you. If you ever need to find ${obj}, ${poss} address is \`${mxid}\`." \
+    "" \
+    "**What you can ask**" \
+    "Anything, in your own words. You don't need a technical background, and if you are a developer ${she_lc} will happily go deep. For example:" \
+    '- "What is Aqua, and why would I use it?"' \
+    '- "How could Aqua help in my work?"' \
+    '- "What is the difference between AquaFire, AquaNode and AquaAgents?"' \
+    '- "Walk me through signing and verifying a document, step by step."' \
+    '- "Show me where the SDK checks a signature."' \
+    "" \
+    "**Good to know**" \
+    "- The chat is one-to-one: ${who_mid} talks only with you."
+  if [ "$voice" = 1 ]; then printf '%s\n' "- You can type, or send ${obj} voice messages."; fi
+  printf '%s\n' \
+    "- ${she} explains and shows you where ${poss} answers come from. ${she} cannot change anything or act on your behalf." \
+    "- Like any AI, ${she_lc} can occasionally be wrong. When something matters, ask ${obj} for the source." \
+    "" \
+    "Enjoy! 🌊"
+}
+
+# render_notice_delivered <welcome> <event-id>: Tim's DM after a direct delivery (text quoted).
+render_notice_delivered() {
+  printf '✅ Onboarding delivered to %s directly (Aqua System DM, event %s). %s has also invited them to a chat. Nothing to forward.\n\nFor reference, this is what they received:\n\n' \
+    "${HUMAN_NAME:-the peer}" "$2" "${PERSONA:-The consultant}"
+  printf '%s\n' "$1" | sed -e 's/^/> /' -e 's/^> $/>/'
+}
+
+# render_notice_forward <welcome> <reason>: Tim's DM when the text was NOT sent directly. The
+# blank lines around the rules keep Markdown from reading "Enjoy! 🌊" + "----" as a heading.
+render_notice_forward() {
+  printf '📋 Onboarding for %s: please forward the text between the lines. It was not sent directly: %s.\n\n----------\n\n%s\n\n----------\n' \
+    "${HUMAN_NAME:-your contact}" "$2" "$1"
+}
+
+# Title fragment for Tim's notices: the served person, else the persona.
+ONBOARD_WHO="${HUMAN_NAME:-$PERSONA}"
+
+if [ "$PRINT_ONBOARDING" -eq 1 ]; then
+  # Offline copy review: no token, no network, no config write, no container, no DM.
+  PO_MXID="$(agent_mxid_from_store)" || PO_MXID="@<agent-mxid>:matrix.inblock.io"
+  case "$VOICE" in
+    on)  PO_VOICE=1 ;;
+    off) PO_VOICE=0 ;;
+    *)   PO_BASE="$TEMPLATE"; [ -f "$CFG" ] && PO_BASE="$CFG"
+         if config_voice_enabled "$PO_BASE"; then PO_VOICE=1; else PO_VOICE=0; fi ;;
+  esac
+  if [ "$ONBOARD_DIRECT" -eq 1 ]; then
+    PO_REASON="${TARGET} is not on the Aqua System allow-list"
+  else
+    PO_REASON="direct send disabled (--onboard-forward-only)"
+  fi
+  PO_WELCOME="$(render_peer_welcome "$PO_MXID" "$PO_VOICE")"
+  if [ "$PO_VOICE" = 1 ]; then PO_VOICE_WORD=on; else PO_VOICE_WORD=off; fi
+  printf '==== peer welcome (Aqua System DM to %s; voice line %s) ====\n' "$TARGET" "$PO_VOICE_WORD"
+  printf '%s\n' "$PO_WELCOME"
+  printf '\n==== Tim notice, delivered: INFO "onboarding sent: %s (%s)" ====\n' "$ONBOARD_WHO" "$NAME"
+  render_notice_delivered "$PO_WELCOME" '$<event-id>'
+  printf '\n==== Tim notice, not delivered: INFO "onboarding to forward: %s (%s)" (WARN if the bridge errored) ====\n' "$ONBOARD_WHO" "$NAME"
+  render_notice_forward "$PO_WELCOME" "$PO_REASON"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
 # `--target did:...` is resolved through siwx-oidc's public GET /resolve?did=, which applies
@@ -470,7 +597,7 @@ fi
 
 # ---------------------------------------------------------------- notify (best effort)
 # DM Tim from the host CLI identity (independent of any container), never fatal.
-NOTIFY=/home/waldknoten-01/.aqua-matrix-notify/notify-tim.sh
+NOTIFY="${CONSULTANT_NOTIFY:-/home/waldknoten-01/.aqua-matrix-notify/notify-tim.sh}"
 notify() {
   [ -x "$NOTIFY" ] || { echo "notify: $NOTIFY missing/not executable; skipping DM" >&2; return 0; }
   "$NOTIFY" "$@" || echo "notify: DM failed (non-fatal), see notify.log" >&2
@@ -615,12 +742,7 @@ fi
 
 # A config with voice on but no key still launches (the agent logs the missing key and
 # disables voice at runtime), but say so loudly: this is almost always a missing env file.
-if [ "${#DEEPGRAM_ENV_ARGS[@]}" -eq 0 ] && python3 - "$CFG" <<'PY'
-import json, sys
-v = json.load(open(sys.argv[1])).get("voice")
-sys.exit(0 if isinstance(v, dict) and v.get("enabled") is True else 1)
-PY
-then
+if [ "${#DEEPGRAM_ENV_ARGS[@]}" -eq 0 ] && config_voice_enabled "$CFG"; then
   echo "!! voice: enabled in config but DEEPGRAM_API_KEY is not available (no readable $DEEPGRAM_ENV_FILE?); launching anyway, the agent will disable voice at runtime" >&2
 fi
 
@@ -728,48 +850,59 @@ else
   echo "   read it later with: bash ~/spawn-consultant.sh --print-mxid $MXID_SEL" >&2
 fi
 
-# ---------------------------------------------------------------- onboarding DM
+# ---------------------------------------------------------------- onboarding
+# Direct first: send the peer the welcome as "Aqua System" (allow-listed peers only), then tell
+# Tim what happened. Every failure here is non-fatal: it degrades to a forward-ready DM to Tim.
 if [ "$ONBOARD" -eq 1 ]; then
   if [ -n "$MXID" ]; then
-    onboard_hi="${HUMAN_NAME:-there}"
-    onboard_for="${HUMAN_NAME:-them}"
-    if [ -n "$PERSONA" ]; then
-      ONBOARD_MSG="$(cat <<EOF
-📋 Onboarding for ${HUMAN_NAME:-your contact}, forward the block below to ${onboard_for}.
-
-----------
-Hi ${onboard_hi}! You've got your own dedicated Aqua Consultant. Her name is ${PERSONA}.
-
-She'll reach out to you herself: expect a Matrix chat invite from
-  ${MXID}
-Just accept it and say hi; her greeting is already waiting for you.
-
-${PERSONA} is a warm, read-only guide to everything Aqua: the protocol, the spec and Rust SDK, the wider ecosystem of projects around it, and the thinking and governance behind it, all grounded in the latest local Aqua sources. She'll greet you, get to know what you're after, and tailor everything to you. She only ever explains and cites; she never changes anything. Enjoy! 🌊
-----------
-EOF
-)"
+    if config_voice_enabled "$CFG"; then ONB_VOICE=1; else ONB_VOICE=0; fi
+    ONB_WELCOME="$(render_peer_welcome "$MXID" "$ONB_VOICE")"
+    ONB_LEVEL=INFO; ONB_EVENT=""; ONB_REASON=""
+    if [ "$ONBOARD_DIRECT" -eq 0 ]; then
+      ONB_REASON="direct send disabled (--onboard-forward-only)"
     else
-      ONBOARD_MSG="$(cat <<EOF
-📋 Onboarding for ${HUMAN_NAME}, forward the block below to them.
-
-----------
-Hi ${HUMAN_NAME}! You now have your own dedicated Aqua Consultant on Matrix.
-
-It will reach out to you itself: expect a chat invite from
-  ${MXID}
-Just accept the invite; the greeting is already waiting in the room.
-
-It's a read-only assistant that answers questions about the Aqua protocol, spec, and Rust SDK, plus the repository ecosystem around them and the governance principles behind them, grounded in the latest local Aqua sources. On first contact it'll greet you and ask a couple of quick questions (your name, background, what brings you to Aqua, and how deep you want to go), then tailor everything to you. It only explains and cites; it never modifies anything.
-----------
-EOF
-)"
+      echo ">> onboarding: sending the welcome to $TARGET via the Aqua System bridge"
+      if [ -f "$ONBOARD_SENDER" ]; then
+        set +e
+        ONB_OUT="$(python3 "$ONBOARD_SENDER" "$TARGET" <<<"$ONB_WELCOME" 2>&1)"
+        onb_rc=$?
+        set -e
+        ONB_OUT="${ONB_OUT##*$'\n'}"   # the sender's verdict is its one (last) line
+      else
+        onb_rc=4; ONB_OUT="ERROR onboarding sender $ONBOARD_SENDER is missing"
+      fi
+      ONB_DETAIL="${ONB_OUT#* }"
+      case "$onb_rc:$ONB_OUT" in
+        0:DELIVERED\ *) ONB_EVENT="$ONB_DETAIL" ;;
+        3:REFUSED\ *is\ not\ on\ the\ Aqua\ System\ allow-list*)
+          ONB_REASON="${TARGET} is not on the Aqua System allow-list" ;;
+        3:REFUSED\ *allow-list\ failed\ to\ load*)
+          ONB_LEVEL=WARN; ONB_REASON="the Aqua System bridge failed (${ONB_DETAIL})" ;;
+        3:REFUSED\ *)
+          ONB_REASON="the Aqua System bridge refused ${TARGET} (${ONB_DETAIL})" ;;
+        *)
+          ONB_LEVEL=WARN; ONB_REASON="the Aqua System bridge failed (${ONB_DETAIL:-exit $onb_rc})" ;;
+      esac
     fi
-    notify -s INFO -t "onboarding: ${HUMAN_NAME:-$PERSONA} (${NAME})" "$ONBOARD_MSG"
-    echo ">> onboarding message DM'd to Tim (forward-ready, carries $MXID)"
+    if [ -n "$ONB_EVENT" ]; then
+      echo ">> onboarding: delivered to $TARGET directly (event $ONB_EVENT)"
+      notify -s INFO -t "onboarding sent: ${ONBOARD_WHO} (${NAME})" \
+        "$(render_notice_delivered "$ONB_WELCOME" "$ONB_EVENT")"
+      echo ">> onboarding: told Tim (delivered, nothing to forward)"
+    else
+      if [ "$ONB_LEVEL" = WARN ]; then
+        echo "!! onboarding: direct send failed: $ONB_REASON" >&2
+      else
+        echo ">> onboarding: not sent directly: $ONB_REASON"
+      fi
+      notify -s "$ONB_LEVEL" -t "onboarding to forward: ${ONBOARD_WHO} (${NAME})" \
+        "$(render_notice_forward "$ONB_WELCOME" "$ONB_REASON")"
+      echo ">> onboarding: forward-ready copy DM'd to Tim (carries $MXID)"
+    fi
   else
-    echo "!! could not read the agent's MXID from its session within the timeout, onboarding DM skipped." >&2
+    echo "!! could not read the agent's MXID from its session within the timeout, onboarding skipped." >&2
     notify -s WARN -t "onboarding pending: ${NAME}" \
-      "Spawned '${NAME}' for ${HUMAN_NAME} but its first login has not completed yet, so its MXID is unknown. Read it with: bash ~/spawn-consultant.sh --print-mxid ${MXID_SEL}"
+      "Spawned '${NAME}' for ${ONBOARD_WHO:-its peer} but its first login has not completed yet, so its MXID is unknown and nothing was sent. Once it has logged in, get the text to forward with the same spawn flags plus --print-onboarding (it reads the MXID from the session)."
   fi
 fi
 
