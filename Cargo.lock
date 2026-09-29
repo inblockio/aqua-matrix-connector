@@ -237,10 +237,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqua-messenger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aqua-messenger-matrix"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-agent",
+ "aqua-messenger",
+ "async-trait",
+ "clap",
+ "matrix-sdk",
+ "matrix-sdk-base",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aqua-system-bridge"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aqua-messenger",
  "hex",
  "serde",
  "serde_json",
@@ -257,7 +291,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aqua-matrix-agent",
+ "aqua-messenger",
+ "aqua-messenger-matrix",
  "aqua-system-bridge",
+ "async-trait",
  "clap",
  "matrix-sdk",
  "matrix-sdk-base",

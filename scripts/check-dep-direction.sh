@@ -39,6 +39,10 @@ CONNECTOR_CRATES=(
   aqua-matrix-orchestrator
   aqua-matrix-gating
   aqua-activity-watch
+  aqua-system-bridge
+  aqua-system-bridged
+  aqua-messenger
+  aqua-messenger-matrix
 )
 
 # Anchored dependency-line regex (backend crate names only).
