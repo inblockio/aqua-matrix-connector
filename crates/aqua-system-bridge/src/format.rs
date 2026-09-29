@@ -7,14 +7,14 @@ use crate::inbox::InboxEntry;
 pub const MAX_ORIGIN_CHARS: usize = 48;
 
 /// Reduce a caller-supplied origin label to a short, inert tag: only
-/// `[A-Za-z0-9 ._@/:+-]`, collapsed whitespace, at most [`MAX_ORIGIN_CHARS`].
+/// `[A-Za-z0-9 ._@/:+(),-]`, collapsed whitespace, at most [`MAX_ORIGIN_CHARS`].
 /// No backticks, asterisks, brackets or newlines survive, so the tag cannot
 /// break out of its Markdown span or forge a second line.
 pub fn sanitize_origin(raw: &str) -> String {
     let mut out = String::new();
     let mut prev_space = false;
     for ch in raw.chars() {
-        let keep = ch.is_ascii_alphanumeric() || " ._@/:+-".contains(ch);
+        let keep = ch.is_ascii_alphanumeric() || " ._@/:+(),-".contains(ch);
         if !keep {
             continue;
         }

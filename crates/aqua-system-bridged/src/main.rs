@@ -60,6 +60,8 @@ fn ensure_private_dir(p: &std::path::Path) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        // journald under systemd: no ANSI colour codes in the journal.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,matrix_sdk=warn,matrix_sdk_crypto=warn,matrix_sdk_base=warn".into()),
