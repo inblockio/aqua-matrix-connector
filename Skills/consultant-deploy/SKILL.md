@@ -32,7 +32,7 @@ runs it via symlinks so there is a single source of truth (no drift):
 | `Skills/consultant-deploy/restore-agent-fleet.sh` | `~/restore-agent-fleet.sh` | boot-time fleet restore (see below) |
 | `Skills/consultant-deploy/consultant-config.template.json` | `~/.aqua-matrix-test/consultant-config.template.json` | config template |
 | `Skills/consultant-deploy/consultants.registry.example` | *(host state — not symlinked)* | format reference |
-| `Skills/consultant-deploy/consultant-persona.py`, `onboard-send.py`, `owner-allowlist.py` | *(none: found next to the symlink target)* | persona render, onboarding direct send, Owner allow-list step |
+| `Skills/consultant-deploy/consultant-persona.py`, `owner-allowlist.py` | *(none: found next to the symlink target)* | persona + welcome (hello) render, Owner allow-list step |
 
 **Host state stays on the host** (not in the repo): the live registry
 `~/.aqua-matrix-test/consultants.registry`, and every consultant's `<label>-aqua-consultant-config.json`
@@ -56,14 +56,14 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 ## Add a new consultant
 
 One command. Renders the config from the template, launches with the hardened podman flags, wires
-a systemd activity-watcher, and (`--onboard`) sends the peer a welcome message directly (see
-"Onboarding" below), telling the operator whether it arrived or needs forwarding.
+a systemd activity-watcher, and (`--onboard`) tells the operator once the consultant's own welcome
+has reached the peer (see "Onboarding" below).
 
 **The consultant initiates the connection.** The template sets `"initiate_dm": true`, so on first
 connect (when no DM room exists yet) the agent creates the room, invites the peer, and delivers
-her greeting into it — the peer just accepts the invite. The onboarding welcome therefore says
-"accept the chat invitation", not "DM this MXID". Delivery is tracked by the greeted-marker:
-a failed initiate retries on the next process start. **Sequencing invariant:** `initiate_dm` in a
+her greeting (the config's `hello`) into it; the peer just accepts the invite. That greeting IS
+the welcome: nobody else messages the peer. Delivery is tracked by the greeted marker: a failed
+initiate retries on the next process start. **Sequencing invariant:** `initiate_dm` in a
 config requires an image whose binary knows the field (`deny_unknown_fields` hard-rejects unknown
 keys) — roll the image BEFORE rendering configs that carry it; never point an old image at a
 freshly rendered config. (`--refresh-prompt` and `--keep-config` never inject the field into
@@ -110,35 +110,52 @@ failed and moves on. Fix the file (a bad file also silences the bridge itself) o
 re-run. `--print-run` and `--print-onboarding` only preview (`would add …` / `already present`) and
 never write.
 
-**Onboarding (`--onboard`).** Once the agent has logged in (its MXID is known), spawn renders the peer welcome
-(what Aqua is, "open your chat with <persona> and say hi", example questions, "good to know"; persona wording
-with `--persona`, neutral "it" wording without; the "send her voice messages" line only when the
-config has `voice.enabled: true`, read from the config file so `--keep-config` spawns are right)
-and sends it to `--target` **directly** as the shared "Aqua System" identity, through the bridge's
-stdio MCP server (`~/.local/bin/aqua-system-bridge-mcp`, tool `send_message`, via
-`onboard-send.py`, hard cap 30 s). The bridge only messages people on
-`~/.aqua-system-bridge/allowlist.toml`; that Tim-approved list is what authorizes the direct
-send, and the Owner rule above puts the peer there. The welcome carries no agent MXID and no
-app explanation (the reader is already in Element). The operator then gets ONE DM:
+**The welcome (Tim, 2026-09-29).** The peer's first contact is the consultant's OWN first message:
+the config's `hello`, which the relay sends into the DM room it creates (`initiate_dm`), rendered as
+Markdown. On first contact the agent appends its "What's new" list (`"\n\n" + WHATS_NEW`, in
+aqua-agents claude-p). There is **no** separate Aqua System onboarding DM to the peer (a second
+invite from a second unknown sender had no job left). With `--persona`, spawn renders the hello
+from `consultant-persona.py hello_for(persona, person, voice)`: who she is (an AI assistant, just
+for you), Aqua in one sentence, "Ask me anything" with five example questions, "Good to know"
+(one-to-one, the voice line, explains and cites but cannot act, can be wrong), and a closing
+question. Pseudonymous peers (no `--name`) get `Hi there!` and the closing
+`Before we start, what should I call you?`. The line "You can type, or send me a voice message."
+appears only when the config's FINAL `voice.enabled` is true: a render resolves `--voice` first,
+else the base config (existing config, else template), and the `--voice` step leaves the same value
+in the file. `--refresh-prompt` re-renders the hello to the canonical text with the config's voice
+state. `--keep-config` keeps the hello byte-identical (also with `--voice`), so existing
+consultants keep their old text; `derive()` reads persona and person from the old and the new text
+alike (`Hi <name>! ` / `Hi there! ` prefix, which must stay). Without `--persona` (legacy) the
+template's hello is used unchanged.
+
+**Onboarding (`--onboard`) confirms delivery to the operator.** After launch, spawn waits up to
+`ONBOARD_WAIT` s (default 180) for the agent's greeted marker: `.whats_new_seen` in the config's
+`memory.config_dir` (`/agent/memory`, bind-mounted from
+`~/.aqua-matrix-test/<label>-aqua-consultant-persist/memory/`), which claude-p writes only after the
+relay confirmed the hello send (`hello_delivered`). It also watches `podman logs` for the relay's
+failure lines (`initiate-DM hello failed (retries next process start)`, `no DM room yet; deferring
+hello`, `hello send failed`); one is printed on the terminal at once, but the wait continues, since
+a crash restart retries. The operator then gets ONE DM:
 
 | Outcome | Level | Title | Body |
 |---|---|---|---|
-| delivered | INFO | `onboarding sent: <name or persona> (<container>)` | event id + the welcome as a quote |
-| peer not allow-listed (unexpected since the Owner rule) | WARN | `onboarding to forward: …` | the welcome between two `----------` rules + the reason, flagged as unexpected ("check allowlist.toml") |
-| bridge error / timeout | WARN | `onboarding to forward: …` | same, reason carries the short error (a timeout says it may still arrive) |
+| marker appeared | INFO | `welcome delivered: <name or persona> (<container>)` | "✅ <persona> invited <name> and posted her welcome." + "This is what they see:" + the config's hello quoted line by line + `> *(followed by the "What's new" list)*` |
+| not confirmed within the wait | WARN | `welcome NOT confirmed: …` | "⚠️ <persona>'s welcome to <name> was not confirmed within <N> s." + the last relay failure line, if any + "It retries on the next process start: podman restart <container>." |
+| marker existed before launch (roll of an already-greeted consultant) | none | (no DM) | spawn prints `>> onboarding: <name> was already greeted earlier; nothing to send` |
 
-A failed direct send never fails the spawn. `--onboard-forward-only` (implies `--onboard`) skips
-the direct send (the old behaviour). Review the copy offline first, no token, network, config
-write, container or DM involved:
+A config with no `hello`, or a `memory.config_dir` outside `/agent/memory`, gets the WARN right
+away with that reason. Nothing here ever fails the spawn, and the "channel up" DM is unchanged.
+On a `--keep-config` spawn without `--persona`/`--name`, the notices take both from the kept config.
+Review the copy offline first (no token, network, config write, container or DM involved):
 
 ```bash
 bash ~/spawn-consultant.sh --print-onboarding --label gawain --target '@…:matrix.inblock.io' \
   --persona Talia --name Gawain --voice on
 ```
 
-It also previews the Owner step on stderr. The voice line follows `--voice` when given, else the
-existing config, else the template. With `--replace --keep-config --onboard`, also pass `--persona`/`--name`
-(the kept config does not record them), or the welcome falls back to the neutral wording.
+It prints the hello exactly as this spawn would leave it in the config (`--keep-config`: verbatim)
+plus both operator notices, and previews the Owner step on stderr. The voice line follows `--voice`
+when given, else the existing config, else the template.
 
 **MXIDs are never derived from DIDs (2026-09-27).** siwx-oidc gives every NEW DID an opaque
 localpart (16 base36 chars, e.g. `@1vo8g4vofiha69ua:matrix.inblock.io`) and keeps existing
@@ -236,9 +253,8 @@ list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 | `--replace` | `podman rm -f` + re-run, **reusing persist** → DID + memory PRESERVED (the image-roll path). |
 | `--keep-config` | Use the existing config verbatim (no re-render); derives id/target/display from it. |
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) |
-| `--onboard` | After the agent's first login, send the peer (the Owner, allow-listed at spawn) the welcome directly via the Aqua System bridge and DM the operator "onboarding sent" (INFO) or "onboarding to forward" (WARN on a refusal or bridge error; INFO for forward-only). Never fails the spawn. See "Onboarding". |
-| `--onboard-forward-only` | Implies `--onboard` but never sends directly: the operator gets the forward-ready copy (reason "direct send disabled"). |
-| `--print-onboarding` | Print the peer welcome and both operator notices to stdout and exit 0 before any token, network, config write, container or DM; previews the Owner allow-list step on stderr. |
+| `--onboard` | After launch, wait (`ONBOARD_WAIT`, default 180 s) for the consultant's own welcome to be delivered (greeted marker) and DM the operator "welcome delivered" (INFO, hello quoted) or "welcome NOT confirmed" (WARN, last relay failure line). Nothing when the peer was greeted before. Never fails the spawn. See "Onboarding". |
+| `--print-onboarding` | Print the consultant's hello as this spawn would render it and both operator notices to stdout and exit 0 before any token, network, config write, container or DM; previews the Owner allow-list step on stderr. |
 | `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
 | `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
 | `--voice on\|off` | Patch only `voice.enabled` in the rendered/kept config (idempotent, sibling voice keys preserved, `off` keeps the block). Without it the config's voice block is left exactly as it is. See "Voice messages". |
@@ -314,18 +330,23 @@ flips only that key; `--replace --keep-config` preserves the block; `inblockio.g
 persona re-render or `--refresh-prompt` keeps an existing config's `model` (and never injects one);
 the shims were never called.
 
-`tests/spawn-consultant-onboarding.sh` covers `--onboard`: `--print-onboarding` for persona +
-name, pseudonymous persona ("Hi there"), legacy wording, the voice line on/off (flag, existing
-config, `--keep-config`, template default), no agent MXID or app explanation in the peer text, no side effects, and no
-U+2014/U+2013 dash in any rendered text; `onboard-send.py` against a fake bridge (delivered,
-refusals, tool and JSON-RPC errors, timeout, garbage, missing binary); and whole `--onboard`
-spawns with podman shimmed, a recording notifier and the fake bridge (delivered = INFO "sent",
-not allow-listed = WARN "forward" (unexpected), bridge error/timeout = WARN, forward-only never
-calls the bridge, the spawn exits 0 throughout). The Owner step: added when missing (name, note,
-mode 600, one backup), no-op when present (also by case), `<label>-owner` on a clash, abort before
-any podman call (also with `--replace`) when both names are taken or the file is invalid or
-missing, print modes write nothing, generic never auto-added, concurrent applies serialize. No
-message leaves the machine and the real allow-list is never read or written.
+`tests/spawn-consultant-onboarding.sh` covers the welcome and `--onboard`: `hello_for` copy
+(persona + name exact, pseudonymous "Hi there" ending with the name question, voice line on/off,
+no U+2014/U+2013 dash), `derive()` on the new and the old hello texts, the hello's voice line
+following the final `voice.enabled` on a render, `--keep-config` leaving the hello byte-identical
+(also with `--voice on`), `--refresh-prompt` re-rendering it; `--print-onboarding` for persona +
+name, pseudonymous, legacy and `--keep-config` (hello verbatim, persona/person derived for the
+notices), with no side effects; whole `--onboard` spawns with podman shimmed (the shim writes the
+greeted marker or serves canned relay logs) and a recording notifier: marker appears = INFO
+"welcome delivered" quoting the config's hello, relay failure line = WARN carrying the line
+(ANSI stripped), plain timeout = WARN, marker already there = no onboarding DM, exit 0 throughout;
+and that no script references the bridge MCP or the removed direct send. The Owner step: added
+when missing (name, note, mode 600, one backup), no-op when present (also by case),
+`<label>-owner` on a clash, abort before any podman call (also with `--replace`) when both names
+are taken or the file is invalid or missing, print modes write nothing, generic never auto-added,
+concurrent applies serialize. No message leaves the machine and the real allow-list is never read
+or written. `spawn-consultant-args.sh` hashes configs with the hello's voice line removed, since
+that line now legitimately follows `--voice`.
 
 ```bash
 bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
@@ -335,7 +356,7 @@ bash Skills/consultant-deploy/tests/spawn-consultant-onboarding.sh
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
 avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
 `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
-`CONSULTANT_NOTIFY`, `AQUA_SYSTEM_BRIDGE_MCP`, `ONBOARD_SEND_TIMEOUT` and `AQUA_SYSTEM_ALLOWLIST`.
+`CONSULTANT_NOTIFY`, `ONBOARD_WAIT` and `AQUA_SYSTEM_ALLOWLIST`.
 
 ## Model pin (`model`)
 

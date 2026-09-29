@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 #
-# spawn-consultant-onboarding.sh, offline tests for the --onboard flow of spawn-consultant.sh.
+# spawn-consultant-onboarding.sh, offline tests for the welcome + --onboard flow of
+# spawn-consultant.sh and consultant-persona.py, and for the Owner allow-list step.
 #
 # Nothing live is touched: HOME, the config/persist dir and the refs base point into a temp
-# dir, the Aqua System bridge is a fake stdio MCP server (onboard-fake-bridge.py semantics
-# inline below), Tim's notifier is a recorder (CONSULTANT_NOTIFY), and podman/systemctl are
-# shims. No message leaves the machine.
+# dir, Tim's notifier is a recorder (CONSULTANT_NOTIFY), and podman/systemctl are shims (the
+# podman shim can play the agent: write the greeted marker after `run`, or serve canned
+# `logs`). No message leaves the machine.
 #
 # Covers:
-#   - --print-onboarding: persona + name, persona pseudonymous ("Hi there"), legacy no-persona
-#     wording, voice line on/off (flag, existing config, --keep-config config, template default),
-#     MXID from the persisted session vs the placeholder, --onboard-forward-only reason, no side
-#     effects (no config written, shims never called)
-#   - no rendered text (peer welcome, both Tim notices) contains U+2014 or U+2013
-#   - onboard-send.py against the fake bridge: delivered (event id parsed, arguments passed
-#     verbatim), allow-list refusal, other refusal, tool error, JSON-RPC error, timeout,
-#     garbage output, missing binary
-#   - full --onboard spawn (podman shimmed): delivered -> INFO "onboarding sent", not
-#     allow-listed (now unexpected) -> WARN "onboarding to forward", bridge error -> WARN,
-#     forward-only never calls the bridge; the spawn exits 0 in every case
+#   - hello_for: persona + name, pseudonymous ("Hi there", ends with the name question), voice
+#     line on/off, exact copy, no U+2014/U+2013; derive() on the new AND the old hello texts
+#   - render/refresh: the hello's voice line follows the config's final voice.enabled (--voice,
+#     else the base config); --keep-config leaves the hello byte-identical (also with --voice)
+#   - --print-onboarding: hello + both Tim notices for persona+name, pseudonymous, legacy,
+#     --keep-config (hello verbatim, persona/person derived for the notices), voice sources; no
+#     side effects (no config written, shims never called)
+#   - full --onboard spawns (podman shimmed): marker appears -> INFO "welcome delivered" with
+#     the hello quoted; relay failure line -> WARN "welcome NOT confirmed" carrying the line;
+#     plain timeout -> WARN; marker already there before launch -> no onboarding notice at
+#     all; the spawn exits 0 in every case
+#   - no code path references the Aqua System bridge MCP / the removed direct send any more
 #   - Owner allow-list step: add when missing (name, note, mode, backup), no-op when present
 #     (also by case), label clash -> <label>-owner, both taken / invalid / missing file -> abort
 #     before any podman call (also with --replace), print modes write nothing, generic never
@@ -31,7 +33,7 @@ set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 SPAWN="$SKILL_DIR/spawn-consultant.sh"
-SENDER="$SKILL_DIR/onboard-send.py"
+HELPER="$SKILL_DIR/consultant-persona.py"
 TEMPLATE="$SKILL_DIR/consultant-config.template.json"
 
 PASS=0; FAIL=0
@@ -44,7 +46,7 @@ hasnt()  { ! grep -qF -- "$2" "$1"; }
 SB="$(mktemp -d "${TMPDIR:-/tmp}/spawn-onboard-test.XXXXXX")"
 trap 'rm -rf "$SB"' EXIT
 FAKE_HOME="$SB/home"; TEST_DIR="$SB/aqua-matrix-test"; REFS_BASE="$SB/refs"; SHIM_BIN="$SB/bin"
-SIDE_EFFECTS="$SB/side-effects.log"; NOTIFY_LOG="$SB/notify.jsonl"; BRIDGE_LOG="$SB/bridge.jsonl"
+SIDE_EFFECTS="$SB/side-effects.log"; NOTIFY_LOG="$SB/notify.jsonl"
 TOKEN_FILE="$FAKE_HOME/.aqua-matrix-heartbeat/claude-oauth-token"
 mkdir -p "$FAKE_HOME/.aqua-matrix-heartbeat" "$TEST_DIR" "$REFS_BASE" "$SHIM_BIN" "$SB/out"
 echo fake-token > "$TOKEN_FILE"
@@ -71,20 +73,34 @@ EOF
 chmod 600 "$AL"
 
 # podman/systemctl: in "print" mode any call is a failure; in "spawn" mode podman pretends
-# (container exists -> no, run -> fake id) and systemctl succeeds. Every call is logged.
-for tool in podman systemctl; do
-  cat > "$SHIM_BIN/$tool" <<EOF
+# (container exists -> no, run -> fake id, logs -> $SHIM_LOGS) and systemctl succeeds. With
+# SHIM_HELLO=deliver, `podman run` plays the agent: one second later it writes the greeted
+# marker into the host dir mounted at /agent/memory. Every call is logged.
+cat > "$SHIM_BIN/podman" <<'EOF'
 #!/bin/sh
-echo "$tool \$*" >> "$SIDE_EFFECTS"
-[ "\${SHIM_MODE:-print}" = spawn ] || { echo "!! shim: $tool must not be called" >&2; exit 1; }
-case "$tool \$1 \$2" in
-  "podman container exists") exit 1 ;;
-  "podman run -d") echo 0123456789abcdef0123; exit 0 ;;
+echo "podman $*" >> "@SIDE@"
+[ "${SHIM_MODE:-print}" = spawn ] || { echo "!! shim: podman must not be called" >&2; exit 1; }
+case "$1 $2" in
+  "container exists") exit 1 ;;
+  "run -d")
+    if [ "${SHIM_HELLO:-}" = deliver ]; then
+      mem=""
+      for a in "$@"; do case "$a" in *:/agent/memory:U) mem="${a%:/agent/memory:U}" ;; esac; done
+      ( sleep 1; echo 1 > "$mem/.whats_new_seen" ) >/dev/null 2>&1 </dev/null &
+    fi
+    echo 0123456789abcdef0123; exit 0 ;;
+  logs*) [ -z "${SHIM_LOGS:-}" ] || cat "$SHIM_LOGS"; exit 0 ;;
 esac
 exit 0
 EOF
-  chmod +x "$SHIM_BIN/$tool"
-done
+cat > "$SHIM_BIN/systemctl" <<'EOF'
+#!/bin/sh
+echo "systemctl $*" >> "@SIDE@"
+[ "${SHIM_MODE:-print}" = spawn ] || { echo "!! shim: systemctl must not be called" >&2; exit 1; }
+exit 0
+EOF
+sed -i "s|@SIDE@|$SIDE_EFFECTS|" "$SHIM_BIN/podman" "$SHIM_BIN/systemctl"
+chmod +x "$SHIM_BIN/podman" "$SHIM_BIN/systemctl"
 
 # Recorder for Tim's notifier: one JSON array of its argv per call.
 cat > "$SB/notify" <<EOF
@@ -94,39 +110,117 @@ open("$NOTIFY_LOG", "a").write(json.dumps(sys.argv[1:]) + "\n")
 EOF
 chmod +x "$SB/notify"
 
-# Fake bridge MCP server. Mode from FAKE_BRIDGE_MODE; logs every request it reads.
-cat > "$SB/fake-bridge" <<EOF
-#!/usr/bin/env python3
-import json, os, sys, time
-mode = os.environ.get("FAKE_BRIDGE_MODE", "delivered")
-def out(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
-def result(i, text, err): out({"jsonrpc": "2.0", "id": i, "result": {"content": [{"type": "text", "text": text}], "isError": err}})
-for line in sys.stdin:
-    req = json.loads(line)
-    open("$BRIDGE_LOG", "a").write(json.dumps(req) + "\n")
-    if req.get("method") == "initialize":
-        out({"jsonrpc": "2.0", "id": req["id"], "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}})
-    elif req.get("method") == "tools/call":
-        i, to = req["id"], req["params"]["arguments"]["to"]
-        if mode == "delivered":
-            result(i, f"Delivered to peer ({to}) as Matrix event \$AbC-123_xyz. inbox_seq=7 (pass as after_seq to wait_for_reply to wait for an answer to this message).", False)
-        elif mode == "refused":
-            result(i, f'REFUSED: "{to}" is not on the Aqua System allow-list. Allowed recipients: [tim]; allowed rooms: []. To add someone, append a [[recipients]] entry.', True)
-        elif mode == "refused-load":
-            result(i, "REFUSED: the allow-list failed to load (parse error); no one can be messaged until /x/allowlist.toml is fixed", True)
-        elif mode == "refused-other":
-            result(i, f"REFUSED: {to} is a room the bridge never sends to.", True)
-        elif mode == "tool-error":
-            result(i, "bridge daemon not reachable at /run/user/1000/bridge.sock: connection refused", True)
-        elif mode == "rpc-error":
-            out({"jsonrpc": "2.0", "id": i, "error": {"code": -32602, "message": "unknown tool"}})
-        elif mode == "hang":
-            time.sleep(60)
-        elif mode == "garbage":
-            print("this is not json"); sys.exit(2)
-EOF
-chmod +x "$SB/fake-bridge"
+EMDASH="$(printf '\xe2\x80\x94')"; ENDASH="$(printf '\xe2\x80\x93')"   # U+2014, U+2013 (locale-independent)
+no_dashes() { ! grep -qF -e "$EMDASH" -e "$ENDASH" "$@"; }
+cfg_of() { echo "$TEST_DIR/$1-aqua-consultant-config.json"; }
+cfg_hello() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("hello") or "")' "$(cfg_of "$1")"; }
+export -f cfg_of cfg_hello; export TEST_DIR
 
+echo "== hello_for / derive (consultant-persona.py)"
+check "hello copy: persona + name + voice, exact" python3 - "$HELPER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+want = """Hi Andreas! \U0001F30A I'm Pelagia, your own Aqua Consultant. I'm an AI assistant, and I'm here just for you whenever you have a question about Aqua.
+
+In one sentence: Aqua is inblock.io's protocol for trust that travels with your data. Every signature, AI action and file carries its own proof, so anyone can check what happened.
+
+**Ask me anything, in your own words.** You don't need a technical background, and if you're a developer I'm happy to go deep. For example:
+- "What is Aqua, and why would I use it?"
+- "How could Aqua help in my work?"
+- "What's the difference between AquaFire, AquaNode and AquaAgents?"
+- "Walk me through signing and verifying a document, step by step."
+- "Show me where the SDK checks a signature."
+
+**Good to know**
+- I only talk with you; this chat is one-to-one.
+- You can type, or send me a voice message.
+- I explain things and show you where my answers come from. I can't change anything or act on your behalf.
+- Like any AI, I can occasionally be wrong. When something matters, ask me for the source.
+
+So, what would you like to explore first?"""
+got = m.hello_for("Pelagia", "Andreas", True)
+assert got == want, got
+PY
+check "hello: voice off drops exactly the voice line" python3 - "$HELPER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+on, off = m.hello_for("Pelagia", "Andreas", True), m.hello_for("Pelagia", "Andreas", False)
+assert "voice" not in off.lower(), off
+assert on.replace("- You can type, or send me a voice message.\n", "") == off
+assert m.hello_for("Pelagia", "Andreas") == off   # default: voice off
+PY
+check "hello: pseudonymous greets 'there' and ends with the name question" python3 - "$HELPER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+h = m.hello_for("Pelagia", "", True)
+assert h.startswith("Hi there! \U0001F30A I'm Pelagia, your own Aqua Consultant."), h
+assert h.splitlines()[-1] == "Before we start, what should I call you?", h
+assert "explore first" not in h
+PY
+check "hello: no em/en dash in any variant" python3 - "$HELPER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+for p in ("Andreas", ""):
+    for v in (True, False):
+        h = m.hello_for("Pelagia", p, v)
+        assert "—" not in h and "–" not in h, h
+PY
+check "derive(): new and old hello texts, named and pseudonymous" python3 - "$HELPER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cp", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = "Pelagia (Aqua Consultant)"
+old_named = "Hi Andreas! \U0001F30A I'm Pelagia, your very own Aqua Consultant, and I'm genuinely happy you're here. So, whenever you're ready, what would you like to explore first?"
+old_pseudo = "Hi there! \U0001F30A I'm Pelagia, your very own Aqua Consultant, and I'm genuinely happy you're here. First, though, what should I call you?"
+cases = [
+    (m.hello_for("Pelagia", "Andreas", True), ("Pelagia", "Andreas")),
+    (m.hello_for("Pelagia", "Andreas", False), ("Pelagia", "Andreas")),
+    (m.hello_for("Pelagia", "", True), ("Pelagia", "")),
+    (old_named, ("Pelagia", "Andreas")),
+    (old_pseudo, ("Pelagia", "")),
+]
+for h, want in cases:
+    got = m.derive({"display_name": d, "hello": h})
+    assert got == want, (h[:40], got)
+assert m.derive({"display_name": "Aqua Consultant", "hello": "Hello {user_id}, I am"}) == ("", "")
+PY
+
+echo "== render / refresh: voice line follows the final voice.enabled; --keep-config verbatim"
+# run_print <name> [spawn args...]: --print-run (renders the config, starts nothing)
+run_print() {
+  local name="$1"; shift; local rc=0
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" \
+    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+    AQUA_SYSTEM_ALLOWLIST="$AL" \
+    bash "$SPAWN" --print-run "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
+  echo "$rc" > "$SB/out/$name.rc"
+}
+run_print r1 --label rv --target "$TARGET" --persona Pelagia --name Andreas --voice on
+check "fresh render --voice on: voice.enabled true and hello has the voice line" bash -c '[ "$(cat "$1")" = 0 ] && cfg_hello rv | grep -qxF -- "- You can type, or send me a voice message." && python3 -c "import json,sys; assert json.load(open(sys.argv[1]))[\"voice\"][\"enabled\"] is True" "$(cfg_of rv)"' _ "$SB/out/r1.rc"
+check "fresh render: hello starts with the new copy" bash -c 'cfg_hello rv | head -n1 | grep -qF "Hi Andreas! 🌊 I'"'"'m Pelagia, your own Aqua Consultant."'
+run_print r2 --label rv --target "$TARGET" --persona Pelagia --name Andreas
+check "re-render without --voice: voice read from the existing config, line kept" bash -c 'cfg_hello rv | grep -qF "send me a voice message"'
+run_print r3 --label rv --target "$TARGET" --persona Pelagia --name Andreas --voice off
+check "re-render --voice off: line gone" bash -c '! cfg_hello rv | grep -q "voice message"'
+run_print r4 --label rvt --target "$TARGET" --persona Pelagia
+check "template render (no voice block): no voice line, pseudonymous ending" bash -c '! cfg_hello rvt | grep -q "voice message" && [ "$(cfg_hello rvt | tail -n1)" = "Before we start, what should I call you?" ]'
+# --keep-config: an existing consultant's hello (old copy) stays byte-identical, even with --voice on
+python3 - "$(cfg_of kc)" "$TARGET" <<'PY'
+import json, sys
+json.dump({"id": "kc-aqua-consultant-1", "target": sys.argv[2], "display_name": "Pelagia (Aqua Consultant)",
+           "hello": "Hi Andreas! \U0001F30A I'm Pelagia, your very own Aqua Consultant, and I'm genuinely happy you're here.",
+           "memory": {"config_dir": "/agent/memory"}}, open(sys.argv[1], "w"), indent=2, ensure_ascii=True)
+PY
+KC_BEFORE="$(cfg_hello kc)"
+run_print k1 --label kc --keep-config
+check "--keep-config: hello byte-identical" [ "$(cfg_hello kc)" = "$KC_BEFORE" ]
+run_print k2 --label kc --keep-config --voice on
+check "--keep-config --voice on: voice patched, hello still byte-identical" bash -c '[ "$(cfg_hello kc)" = "$1" ] && grep -q "\"enabled\": true" "$(cfg_of kc)"' _ "$KC_BEFORE"
+cp "$(cfg_of kc)" "$SB/kc.json"
+run_print k3 --label kc --keep-config --refresh-prompt
+check "--refresh-prompt: canonical hello, voice line from the config (on)" bash -c 'cfg_hello kc | head -n1 | grep -qF "your own Aqua Consultant." && cfg_hello kc | grep -qF "send me a voice message"'
+cp "$SB/kc.json" "$(cfg_of kc)"   # back to the old hello for the print tests below
+
+echo "== --print-onboarding"
 # print_onb <name> [spawn args...]: --print-onboarding in the sandbox (shims in print mode).
 print_onb() {
   local name="$1"; shift; local rc=0
@@ -135,162 +229,118 @@ print_onb() {
     bash "$SPAWN" --print-onboarding "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
   # Split the three sections for targeted assertions.
-  awk -v d="$SB/out/$name" '/^==== peer welcome/{f=d".peer";next} /^==== Tim notice, delivered/{f=d".delivered";next} /^==== Tim notice, not delivered/{f=d".forward";next} f{print > f}' "$SB/out/$name.out"
+  awk -v d="$SB/out/$name" '/^==== consultant hello/{f=d".hello";next} /^==== Tim notice, delivered/{f=d".delivered";next} /^==== Tim notice, not confirmed/{f=d".unconfirmed";next} f{print > f}' "$SB/out/$name.out"
   return "$rc"
 }
-EMDASH="$(printf '\xe2\x80\x94')"; ENDASH="$(printf '\xe2\x80\x93')"   # U+2014, U+2013 (locale-independent)
-no_dashes() { ! grep -qF -e "$EMDASH" -e "$ENDASH" "$@"; }
-
-echo "== --print-onboarding: persona + name, voice on"
+rm -f "$SIDE_EFFECTS"
 print_onb a --label andreas --target "$TARGET" --persona Pelagia --name Andreas --voice on
 check "exit 0" [ "$(cat "$SB/out/a.rc")" = 0 ]
-check "greets by name" has "$SB/out/a.peer" "Hi Andreas! 👋"
-check "persona intro" has "$SB/out/a.peer" "You now have your own Aqua Consultant, **Pelagia**. She is an AI assistant who knows Aqua inside out, and she is there just for you whenever you have a question."
-check "how to start (persona)" bash -c 'grep -A1 -xF "**How to start**" "$1" | tail -n1 | grep -qxF "Open your chat with Pelagia and say hi. If it still shows as an invitation, accept it first; her welcome is already waiting there."' _ "$SB/out/a.peer"
-check "peer text: no MXID, no app explanation" bash -c '! grep -qE "@[^ ]*:matrix\.inblock\.io|agent-mxid|Matrix chat app|address is" "$1"' _ "$SB/out/a.peer"
-check "voice line present" has "$SB/out/a.peer" "- You can type, or send her voice messages."
-check "one-to-one line" has "$SB/out/a.peer" "- The chat is one-to-one: Pelagia talks only with you."
-check "ends with Enjoy" bash -c '[ "$(grep -v "^$" "$1" | tail -n1)" = "Enjoy! 🌊" ]' _ "$SB/out/a.peer"
-check "delivered notice head" has "$SB/out/a.delivered" "✅ Onboarding delivered to Andreas directly (Aqua System DM, event \$<event-id>). Pelagia has also invited them to a chat."
-check "delivered notice: no 'Nothing to forward'" hasnt "$SB/out/a.delivered" "Nothing to forward"
-check "delivered notice quotes the welcome" has "$SB/out/a.delivered" "> Hi Andreas! 👋"
-check "quoted blank lines are bare >" bash -c 'grep -qx ">" "$1" && ! grep -q "^> $" "$1"' _ "$SB/out/a.delivered"
-check "forward notice head (example reason)" has "$SB/out/a.forward" "📋 Onboarding for Andreas: please forward the text between the lines. It was not sent directly: the Aqua System bridge failed (<short error>)."
+check "hello = hello_for(Pelagia, Andreas, voice on)" bash -c 'diff <(sed "\$d" "$1") <(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location(\"cp\",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.hello_for(\"Pelagia\",\"Andreas\",True))" "$2") >/dev/null' _ "$SB/out/a.hello" "$HELPER"
+check "section title names the voice line" has "$SB/out/a.out" "voice line on;"
+check "delivered notice head" bash -c '[ "$(head -n1 "$1")" = "✅ Pelagia invited Andreas and posted her welcome." ]' _ "$SB/out/a.delivered"
+check "delivered notice: 'This is what they see:' then the quote" bash -c 'sed -n 3p "$1" | grep -qxF "This is what they see:" && sed -n 5p "$1" | grep -qF "> Hi Andreas! 🌊 I'"'"'m Pelagia"' _ "$SB/out/a.delivered"
+check "delivered notice: quoted blank lines are bare >" bash -c 'grep -qx ">" "$1" && ! grep -q "^> $" "$1"' _ "$SB/out/a.delivered"
+check "delivered notice: voice line quoted" has "$SB/out/a.delivered" "> - You can type, or send me a voice message."
+check "delivered notice: ends with the What's new marker" bash -c '[ "$(grep -v "^$" "$1" | tail -n1)" = "> *(followed by the \"What'"'"'s new\" list)*" ]' _ "$SB/out/a.delivered"
+check "unconfirmed notice head" has "$SB/out/a.unconfirmed" "⚠️ Pelagia's welcome to Andreas was not confirmed within 180 s."
+check "unconfirmed notice: retry hint" has "$SB/out/a.unconfirmed" "It retries on the next process start: podman restart aqua-agent-andreas-aqua-consultant-1."
+check "section titles" bash -c 'grep -qF "INFO \"welcome delivered: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1" && grep -qF "WARN \"welcome NOT confirmed: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1"' _ "$SB/out/a.out"
 check "print-onboarding previews the Owner step (already present)" has "$SB/out/a.err" "owner allow-list: Owner $TARGET already present as 'peer'"
-check "forward notice has the text between two rules" bash -c '[ "$(grep -cx -- "----------" "$1")" = 2 ]' _ "$SB/out/a.forward"
-check "section titles" bash -c 'grep -qF "\"onboarding sent: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1" && grep -qF "\"onboarding to forward: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1"' _ "$SB/out/a.out"
 check "no em/en dash" no_dashes "$SB/out/a.out"
 
-echo "== --print-onboarding: persona, pseudonymous peer, voice off"
 print_onb b --label pseudo --target "$TARGET" --persona Pelagia --voice off
-check "exit 0" [ "$(cat "$SB/out/b.rc")" = 0 ]
-check "Hi there" has "$SB/out/b.peer" "Hi there! 👋"
-check "no voice line" hasnt "$SB/out/b.peer" "voice messages"
-check "delivered notice falls back to the peer" has "$SB/out/b.delivered" "✅ Onboarding delivered to the peer directly"
-check "forward notice falls back to your contact" has "$SB/out/b.forward" "📋 Onboarding for your contact: please forward"
-check "title falls back to the persona" has "$SB/out/b.out" '"onboarding sent: Pelagia (aqua-agent-pseudo-aqua-consultant-1)"'
+check "pseudonymous: exit 0, Hi there, name question, no voice line" bash -c '[ "$(cat "$1.rc")" = 0 ] && head -n1 "$1.hello" | grep -qF "Hi there! 🌊" && grep -qxF "Before we start, what should I call you?" "$1.hello" && ! grep -q "voice message" "$1.hello"' _ "$SB/out/b"
+check "pseudonymous: notices fall back to the peer" bash -c 'head -n1 "$1.delivered" | grep -qxF "✅ Pelagia invited the peer and posted her welcome." && grep -qF "Pelagia'"'"'s welcome to the peer was not" "$1.unconfirmed"' _ "$SB/out/b"
+check "pseudonymous: title falls back to the persona" has "$SB/out/b.out" '"welcome delivered: Pelagia (aqua-agent-pseudo-aqua-consultant-1)"'
 check "no em/en dash" no_dashes "$SB/out/b.out"
 
-echo "== --print-onboarding: legacy (no persona)"
 print_onb c --label legacy --target "$TARGET" --display "Aqua Consultant" --name Bob
-check "exit 0" [ "$(cat "$SB/out/c.rc")" = 0 ]
-check "legacy intro" has "$SB/out/c.peer" "You now have your own **Aqua Consultant**. It is an AI assistant who knows Aqua inside out, and it is there just for you whenever you have a question."
-check "legacy how to start" bash -c 'grep -A1 -xF "**How to start**" "$1" | tail -n1 | grep -qxF "Open your chat with your consultant and say hi. If it still shows as an invitation, accept it first; its welcome is already waiting there."' _ "$SB/out/c.peer"
-check "legacy: no MXID, no app explanation" bash -c '! grep -qE "@[^ ]*:matrix\.inblock\.io|agent-mxid|Matrix chat app|address is" "$1"' _ "$SB/out/c.peer"
-check "legacy go deep" has "$SB/out/c.peer" "if you are a developer it will happily go deep"
-check "legacy one-to-one" has "$SB/out/c.peer" "- The chat is one-to-one: your consultant talks only with you."
-check "legacy explains" has "$SB/out/c.peer" "- It explains and shows you where its answers come from. It cannot change anything or act on your behalf."
-check "legacy source" has "$SB/out/c.peer" "- Like any AI, it can occasionally be wrong. When something matters, ask it for the source."
-check "legacy: no she/her" bash -c '! grep -qwE "She|she|her" "$1"' _ "$SB/out/c.peer"
-check "legacy: template has no voice -> no voice line" hasnt "$SB/out/c.peer" "voice messages"
-check "legacy delivered notice" has "$SB/out/c.delivered" "The consultant has also invited them to a chat."
-check "no em/en dash" no_dashes "$SB/out/c.out"
+check "legacy: exit 0, the template hello (unchanged path)" bash -c '[ "$(cat "$1.rc")" = 0 ] && head -n1 "$1.hello" | grep -qF "Hello {user_id}, I am the Aqua Consultant"' _ "$SB/out/c"
+check "legacy: neutral notices" bash -c 'head -n1 "$1.delivered" | grep -qxF "✅ The consultant invited Bob and posted its welcome." && grep -qF "The consultant'"'"'s welcome to Bob" "$1.unconfirmed"' _ "$SB/out/c"
 
-echo "== voice from the config, session MXID, --keep-config, forward-only"
-mkdir -p "$TEST_DIR/kept-aqua-consultant-persist/store"
-cat > "$TEST_DIR/kept-aqua-consultant-config.json" <<EOF
-{"id": "kept-aqua-consultant-1", "target": "$TARGET", "display_name": "Pelagia (Aqua Consultant)", "voice": {"enabled": true}}
-EOF
-printf '[session]\nuser_id = "%s"\naccess_token = "mat_FAKE-SECRET"\n' "$AGENT_MXID" > "$TEST_DIR/kept-aqua-consultant-persist/store/config.toml"
-print_onb d --label kept --keep-config --persona Pelagia --name Andreas
-check "keep-config: exit 0" [ "$(cat "$SB/out/d.rc")" = 0 ]
-check "keep-config: voice line from the config" has "$SB/out/d.peer" "- You can type, or send her voice messages."
-check "keep-config: the session MXID stays out of the peer text" hasnt "$SB/out/d.peer" "$AGENT_MXID"
-check "keep-config: no token material printed" hasnt "$SB/out/d.out" "FAKE-SECRET"
-print_onb d2 --label kept --target "$TARGET" --persona Pelagia --name Andreas
-check "re-render: voice line from the existing config" has "$SB/out/d2.peer" "send her voice messages"
-print_onb d3 --label kept --target "$TARGET" --persona Pelagia --name Andreas --voice off
-check "--voice off overrides the existing config" hasnt "$SB/out/d3.peer" "voice messages"
-print_onb e --label fwd --target "$TARGET" --persona Pelagia --name Andreas --onboard-forward-only
-check "forward-only reason" has "$SB/out/e.forward" "It was not sent directly: direct send disabled (--onboard-forward-only)."
-check "no em/en dash" no_dashes "$SB/out/d.out" "$SB/out/e.out"
-check "print-onboarding wrote no config" bash -c '! ls "$1"/andreas-* "$1"/pseudo-* "$1"/legacy-* "$1"/fwd-* >/dev/null 2>&1' _ "$TEST_DIR"
+print_onb d --label kc --keep-config
+check "--keep-config: hello verbatim from the config" bash -c '[ "$(sed "\$d" "$1.hello")" = "$2" ]' _ "$SB/out/d" "$KC_BEFORE"
+check "--keep-config: persona/person derived for the notices" bash -c 'head -n1 "$1.delivered" | grep -qxF "✅ Pelagia invited Andreas and posted her welcome." && grep -qF "\"welcome delivered: Andreas (aqua-agent-kc-aqua-consultant-1)\"" "$1.out"' _ "$SB/out/d"
+check "--keep-config: section title says verbatim" has "$SB/out/d.out" "kept config, hello verbatim"
+print_onb d2 --label rv --target "$TARGET" --persona Pelagia --name Andreas --voice on
+print_onb d3 --label rv --target "$TARGET" --persona Pelagia --name Andreas
+check "voice from the existing config (rv has it off now)" bash -c '! grep -q "voice message" "$1"' _ "$SB/out/d3.hello"
+check "--voice on overrides the existing config" has "$SB/out/d2.hello" "- You can type, or send me a voice message."
+check "print-onboarding wrote no config" bash -c '! ls "$1"/andreas-* "$1"/pseudo-* "$1"/legacy-* >/dev/null 2>&1' _ "$TEST_DIR"
 check "print-onboarding called no podman/systemctl" [ ! -e "$SIDE_EFFECTS" ]
 
-echo "== onboard-send.py against the fake bridge"
-send() { # send <mode> [env...]: runs the sender, prints "<rc> <line>"
-  local mode="$1"; shift; local rc=0 out
-  out="$(printf 'Hi Andreas! 👋\n\n"quoted" \\ back`tick`\n' | env AQUA_SYSTEM_BRIDGE_MCP="$SB/fake-bridge" FAKE_BRIDGE_MODE="$mode" "$@" python3 "$SENDER" "$TARGET")" || rc=$?
-  printf '%s %s\n' "$rc" "$out"
-}
-rm -f "$BRIDGE_LOG"
-check "delivered: rc 0 + event id" [ "$(send delivered)" = '0 DELIVERED $AbC-123_xyz' ]
-check "delivered: send_message args verbatim" python3 - "$BRIDGE_LOG" "$TARGET" <<'PY'
-import json, sys
-reqs = [json.loads(l) for l in open(sys.argv[1])]
-assert [r.get("method") for r in reqs] == ["initialize", "notifications/initialized", "tools/call"], reqs
-p = reqs[2]["params"]
-assert p["name"] == "send_message"
-assert p["arguments"] == {"to": sys.argv[2], "markdown": 'Hi Andreas! 👋\n\n"quoted" \\ back`tick`\n', "from_label": "consultant onboarding"}, p
-PY
-check "allow-list refusal: rc 3 REFUSED" bash -c '[[ "$1" == "3 REFUSED \""*"is not on the Aqua System allow-list"* ]]' _ "$(send refused)"
-check "other refusal: rc 3" bash -c '[[ "$1" == "3 REFUSED "* ]]' _ "$(send refused-other)"
-check "tool error: rc 4 ERROR" bash -c '[[ "$1" == "4 ERROR bridge daemon not reachable"* ]]' _ "$(send tool-error)"
-check "JSON-RPC error: rc 4" bash -c '[[ "$1" == "4 ERROR unknown tool" ]]' _ "$(send rpc-error)"
-check "timeout: rc 4, says it may still arrive" bash -c '[[ "$1" == "4 ERROR no answer within 2s, it may still arrive"* ]]' _ "$(send hang ONBOARD_SEND_TIMEOUT=2)"
-check "garbage: rc 4" bash -c '[[ "$1" == "4 ERROR no answer to send_message"* ]]' _ "$(send garbage)"
-check "missing binary: rc 4" bash -c '[[ "$1" == "4 ERROR bridge client"*"missing"* ]]' _ "$(send delivered AQUA_SYSTEM_BRIDGE_MCP="$SB/nope")"
-
-echo "== full --onboard spawn (podman shimmed, fake bridge, notifier recorded)"
-# spawn_onb <name> <bridge-mode> [spawn args...]: a whole spawn; the agent session pre-exists.
+echo "== full --onboard spawn (podman shimmed, notifier recorded)"
+# spawn_onb <name> [VAR=value...] -- [spawn args...]: a whole spawn; the agent session pre-exists.
 spawn_onb() {
-  local name="$1" mode="$2"; shift 2; local rc=0 label="s-$name"
+  local name="$1"; shift; local rc=0 label="s-$name" envs=()
+  while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
-  rm -f "$NOTIFY_LOG" "$BRIDGE_LOG"
+  rm -f "$NOTIFY_LOG"
   env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
-    CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_BRIDGE_MCP="$SB/fake-bridge" FAKE_BRIDGE_MODE="$mode" \
-    ONBOARD_SEND_TIMEOUT=5 AQUA_SYSTEM_ALLOWLIST="$AL" \
-    bash "$SPAWN" --label "$label" --target "$TARGET" --persona Pelagia --name Andreas --no-refresh-refs "$@" \
+    CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$AL" ONBOARD_WAIT=10 "${envs[@]}" \
+    bash "$SPAWN" --label "$label" --target "$TARGET" --no-refresh-refs "$@" \
     > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
-  # The onboarding notice = the last recorded notify call.
+  # The onboarding notice = the last recorded notify call (the first is "channel up").
   tail -n1 "$NOTIFY_LOG" > "$SB/out/$name.notify" 2>/dev/null || true
+  wc -l < "$NOTIFY_LOG" > "$SB/out/$name.count" 2>/dev/null || echo 0 > "$SB/out/$name.count"
 }
 onb_field() { python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); print(a[int(sys.argv[2])])' "$SB/out/$1.notify" "$2"; }
 export -f onb_field; export SB
 
-spawn_onb f1 delivered --onboard --voice on
-check "delivered: spawn exit 0" [ "$(cat "$SB/out/f1.rc")" = 0 ]
-check "delivered: INFO + sent title" bash -c '[ "$(onb_field f1 1)" = INFO ] && [ "$(onb_field f1 3)" = "onboarding sent: Andreas (aqua-agent-s-f1-aqua-consultant-1)" ]'
-check "delivered: body names the event" bash -c 'onb_field f1 4 | head -n1 | grep -qF "✅ Onboarding delivered to Andreas directly (Aqua System DM, event \$AbC-123_xyz). Pelagia has also invited them to a chat."'
-check "delivered: quoted welcome has the new how-to-start and the voice line (config voice on), no MXID" \
-  bash -c 'b="$(onb_field f1 4)"; [[ "$b" == *"> Open your chat with Pelagia and say hi."* && "$b" == *"> - You can type, or send her voice messages."* && "$b" != *"$0"* && "$b" != *"Nothing to forward"* ]]' "$AGENT_MXID"
-check "delivered: the bridge got the same welcome" python3 - "$BRIDGE_LOG" "$AGENT_MXID" <<'PY'
+T0=$SECONDS
+spawn_onb f1 SHIM_HELLO=deliver -- --persona Pelagia --name Andreas --onboard --voice on
+check "delivered: spawn exit 0, 2 notices (channel up + welcome), well before the wait cap" bash -c '[ "$(cat "$SB/out/f1.rc")" = 0 ] && [ "$(cat "$SB/out/f1.count")" = 2 ] && [ "$1" -lt 8 ]' _ "$((SECONDS - T0))"
+check "delivered: INFO + title" bash -c '[ "$(onb_field f1 1)" = INFO ] && [ "$(onb_field f1 3)" = "welcome delivered: Andreas (aqua-agent-s-f1-aqua-consultant-1)" ]'
+check "delivered: body head" bash -c '[ "$(onb_field f1 4 | head -n1)" = "✅ Pelagia invited Andreas and posted her welcome." ]'
+check "delivered: quotes the config hello line by line (voice on) + What's new marker" python3 - "$SB/out/f1.notify" "$(cfg_of s-f1)" <<'PY'
 import json, sys
-md = [json.loads(l) for l in open(sys.argv[1])][2]["params"]["arguments"]["markdown"]
-assert md.startswith("Hi Andreas! 👋\n") and sys.argv[2] not in md and "send her voice messages" in md, md
-assert "Matrix chat app" not in md and "Open your chat with Pelagia and say hi." in md, md
-assert "\u2014" not in md and "\u2013" not in md
+body = json.load(open(sys.argv[1]))[4]
+hello = json.load(open(sys.argv[2]))["hello"]
+quoted = "\n".join(">" if l == "" else "> " + l for l in hello.split("\n"))
+assert body == ("✅ Pelagia invited Andreas and posted her welcome.\n\nThis is what they see:\n\n"
+                + quoted + "\n>\n> *(followed by the \"What's new\" list)*"), body
+assert "> - You can type, or send me a voice message." in body
+assert "—" not in body and "–" not in body
 PY
-check "delivered notice body extracted" bash -c 'onb_field f1 4 > "$SB/out/f1.body"'
-check "delivered notice body has no em/en dash" no_dashes "$SB/out/f1.body"
+check "delivered: stdout says so" has "$SB/out/f1.out" ">> onboarding: welcome delivered after"
 
-spawn_onb f2 refused --onboard
-check "not allow-listed (unexpected): spawn exit 0" [ "$(cat "$SB/out/f2.rc")" = 0 ]
-check "not allow-listed (unexpected): WARN + forward title" bash -c '[ "$(onb_field f2 1)" = WARN ] && [ "$(onb_field f2 3)" = "onboarding to forward: Andreas (aqua-agent-s-f2-aqua-consultant-1)" ]'
-check "not allow-listed (unexpected): reason" bash -c 'onb_field f2 4 | head -n1 | grep -qF "It was not sent directly: $0 is not on the Aqua System allow-list (unexpected: the owner is added automatically at spawn; check allowlist.toml)."' "$TARGET"
-check "not allow-listed: no voice line (template has none)" bash -c '! onb_field f2 4 | grep -q "voice messages"'
+FAILLOG="$SB/relay-fail.log"
+printf '2026-09-29T12:00:00Z  INFO aqua_matrix_relay: claude-p: client cycle starting\n\033[33m2026-09-29T12:00:01Z  WARN\033[0m aqua_matrix_relay: claude-p: initiate-DM hello failed (retries next process start): M_FORBIDDEN `invite` refused\n' > "$FAILLOG"
+spawn_onb f2 SHIM_LOGS="$FAILLOG" ONBOARD_WAIT=3 -- --persona Pelagia --name Andreas --onboard
+check "relay failure line: spawn exit 0, reported on the terminal once" bash -c '[ "$(cat "$SB/out/f2.rc")" = 0 ] && [ "$(grep -c "relay reports a failed hello" "$1")" = 1 ]' _ "$SB/out/f2.err"
+check "relay failure line: WARN + title" bash -c '[ "$(onb_field f2 1)" = WARN ] && [ "$(onb_field f2 3)" = "welcome NOT confirmed: Andreas (aqua-agent-s-f2-aqua-consultant-1)" ]'
+check "relay failure line: body head, the line (ANSI stripped, backticks neutralised), retry hint" python3 - "$SB/out/f2.notify" <<'PY'
+import json, sys
+b = json.load(open(sys.argv[1]))[4].split("\n")
+assert b[0] == "\u26a0\ufe0f Pelagia's welcome to Andreas was not confirmed within 3 s.", b[0]
+assert b[2] == "Last relay log line: `2026-09-29T12:00:01Z  WARN aqua_matrix_relay: claude-p: initiate-DM hello failed (retries next process start): M_FORBIDDEN 'invite' refused`", b[2]
+assert b[-1] == "It retries on the next process start: podman restart aqua-agent-s-f2-aqua-consultant-1.", b[-1]
+assert "\x1b" not in "\n".join(b)
+PY
 
-spawn_onb f3 tool-error --onboard
-check "bridge error: spawn exit 0" [ "$(cat "$SB/out/f3.rc")" = 0 ]
-check "bridge error: WARN + forward title" bash -c '[ "$(onb_field f3 1)" = WARN ] && [[ "$(onb_field f3 3)" == "onboarding to forward: "* ]]'
-check "bridge error: reason carries the short error" bash -c 'onb_field f3 4 | head -n1 | grep -qF "It was not sent directly: the Aqua System bridge failed (bridge daemon not reachable at /run/user/1000/bridge.sock: connection refused)."'
+spawn_onb f3 ONBOARD_WAIT=2 -- --persona Pelagia --name Andreas --onboard
+check "timeout, no failure line: spawn exit 0, WARN, 'within 2 s', no log line" bash -c '[ "$(cat "$SB/out/f3.rc")" = 0 ] && [ "$(onb_field f3 1)" = WARN ] && b="$(onb_field f3 4)" && [ "$(printf "%s\n" "$b" | head -n1)" = "⚠️ Pelagia'"'"'s welcome to Andreas was not confirmed within 2 s." ] && [[ "$b" != *"Last relay log line"* ]]'
 
-spawn_onb f4 hang --onboard
-check "bridge timeout: spawn exit 0, WARN" bash -c '[ "$(cat "$SB/out/f4.rc")" = 0 ] && [ "$(onb_field f4 1)" = WARN ]'
+# already greeted: the marker exists before launch (roll of a greeted consultant) -> no onboarding notice
+spawn_onb f4 -- --persona Pelagia --name Andreas
+echo 1 > "$TEST_DIR/s-f4-aqua-consultant-persist/memory/.whats_new_seen"
+H_BEFORE="$(cfg_hello s-f4)"
+spawn_onb f4 SHIM_HELLO=deliver -- --replace --keep-config --onboard
+check "already greeted: exit 0, only the channel-up notice" bash -c '[ "$(cat "$SB/out/f4.rc")" = 0 ] && [ "$(cat "$SB/out/f4.count")" = 1 ] && [[ "$(onb_field f4 3)" == "channel up: "* ]]'
+check "already greeted: says nothing to send" has "$SB/out/f4.out" ">> onboarding: Andreas was already greeted earlier; nothing to send"
+check "already greeted: --keep-config left the hello byte-identical" [ "$(cfg_hello s-f4)" = "$H_BEFORE" ]
 
-spawn_onb f5 refused-load --onboard
-check "allow-list load failure: WARN" bash -c '[ "$(onb_field f5 1)" = WARN ] && onb_field f5 4 | head -n1 | grep -qF "the Aqua System bridge failed (the allow-list failed to load"'
+spawn_onb f5 SHIM_HELLO=deliver -- --persona Pelagia --name Andreas
+check "no --onboard: only channel-up notified" [ "$(cat "$SB/out/f5.count")" = 1 ]
+check "no em/en dash in any spawn output or notice" no_dashes "$SB"/out/f*.out "$SB"/out/f*.err "$NOTIFY_LOG"
 
-spawn_onb f6 delivered --onboard-forward-only
-check "forward-only: spawn exit 0" [ "$(cat "$SB/out/f6.rc")" = 0 ]
-check "forward-only: bridge never called" [ ! -e "$BRIDGE_LOG" ]
-check "forward-only: INFO + reason" bash -c '[ "$(onb_field f6 1)" = INFO ] && onb_field f6 4 | head -n1 | grep -qF "It was not sent directly: direct send disabled (--onboard-forward-only)."'
-
-spawn_onb f7 delivered
-check "no --onboard: bridge never called, only channel-up notified" bash -c '[ ! -e "$1" ] && [ "$(wc -l < "$2")" = 1 ]' _ "$BRIDGE_LOG" "$NOTIFY_LOG"
+echo "== the Aqua System peer send is gone"
+check "onboard-send.py deleted" [ ! -e "$SKILL_DIR/onboard-send.py" ]
+check "no script references the bridge MCP or the direct send" bash -c '! grep -nE "aqua-system-bridge-mcp|AQUA_SYSTEM_BRIDGE_MCP|onboard-send|ONBOARD_SEND_TIMEOUT|onboard-forward-only|send_message|ONBOARD_DIRECT" "$1"/*.sh "$1"/*.py' _ "$SKILL_DIR"
+check "--onboard-forward-only is now an unknown flag" bash -c '! env -i HOME="$1" PATH=/usr/bin:/bin bash "$2" --print-onboarding --label x --target "$3" --persona P --onboard-forward-only >/dev/null 2>&1' _ "$FAKE_HOME" "$SPAWN" "$TARGET"
 
 echo "== Owner allow-list (owner-allowlist.py; real spawns with podman shimmed)"
 OWNER_HELPER="$SKILL_DIR/owner-allowlist.py"
@@ -311,7 +361,7 @@ spawn_owner() {
   rm -f "$SIDE_EFFECTS"
   env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
-    CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_BRIDGE_MCP="$SB/fake-bridge" AQUA_SYSTEM_ALLOWLIST="$al" \
+    CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$al" \
     bash "$SPAWN" --label "$label" --target "$OWNER" --persona Pelagia --name Andreas --no-refresh-refs "$@" \
     > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"

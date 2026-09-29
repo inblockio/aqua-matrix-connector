@@ -3,8 +3,8 @@
 
 Every consultant has exactly ONE authoritative Owner: its single target peer (--target, or the
 kept config's target; for --generic that is Tim). Tim's standing rule (2026-09-29): the Owner is
-always on ~/.aqua-system-bridge/allowlist.toml, so the direct onboarding send never falls back
-for an allow-list reason. The automatic addition covers Owners only, nothing else.
+always on ~/.aqua-system-bridge/allowlist.toml, so the Aqua System identity can always reach it.
+The automatic addition covers Owners only, nothing else.
 
 Usage:
   owner-allowlist.py check|apply --path FILE --mxid OWNER --container NAME --who TEXT

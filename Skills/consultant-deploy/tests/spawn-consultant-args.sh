@@ -130,10 +130,12 @@ else: c["model"] = v
 json.dump(c, open(p, "w"), indent=2, ensure_ascii=True); open(p, "a").write("\n")
 PY
 }
-cfg_without_voice_sha() { # everything except the voice key, canonicalised, hashed
+cfg_without_voice_sha() { # everything except the voice key, canonicalised, hashed; the hello's
+  # voice line follows voice.enabled on a render (by design), so it is removed before hashing
   python3 - "$TEST_DIR/$1-aqua-consultant-config.json" <<'PY'
 import json, sys, hashlib
 c = json.load(open(sys.argv[1])); c.pop("voice", None)
+c["hello"] = c.get("hello", "").replace("- You can type, or send me a voice message.\n", "")
 print(hashlib.sha256(json.dumps(c, sort_keys=True).encode()).hexdigest())
 PY
 }
@@ -203,7 +205,8 @@ PY
 rc=0; run c2 --label alpha --target "$TARGET" --persona Thalia --name Tester --voice off || rc=$?
 check "--voice off exits 0" [ "$rc" -eq 0 ]
 check "--voice off: enabled false, sibling key kept" [ "$(cfg_voice alpha)" = '{"enabled": false, "tts_voice": "aura-2-thalia-en"}' ]
-check "--voice off: no other key changed" [ "$(cfg_without_voice_sha alpha)" = "$before" ]
+check "--voice off: no other key changed (hello voice line aside)" [ "$(cfg_without_voice_sha alpha)" = "$before" ]
+check "--voice off: the re-rendered hello dropped its voice line" bash -c '! grep -q "send me a voice message" "$1"' _ "$TEST_DIR/alpha-aqua-consultant-config.json"
 check "--voice off: no warning when disabled" bash -c '! grep -q "enabled in config but DEEPGRAM_API_KEY" "$1"' _ "$SB/out/c2.err"
 rc=0; run c3 --label alpha --target "$TARGET" --persona Thalia --name Tester --voice off || rc=$?
 check "--voice off again is idempotent (nothing written)" grep -q 'voice: already off' "$SB/out/c3.out"
