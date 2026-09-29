@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 mod call;
+mod dm;
 mod durable;
 mod media;
 pub mod net_retry;
@@ -1146,30 +1147,46 @@ fn is_server_internal_error(err: &anyhow::Error) -> bool {
 /// token clock, decides what happens next.
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How [`AgentClient::reconcile_owner_dms`] treats one `m.direct[owner]` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectEntry {
+    /// Keep in `m.direct` (live, or uncertain: never evict on a sync gap).
+    Keep,
+    /// The owner positively LEFT or was banned: drop from `m.direct`, and the
+    /// caller leaves + forgets the room (2026-06-06 liveness rule).
+    OwnerLeft,
+    /// Positively a group room (an authoritative member list shows someone
+    /// besides the agent and the owner): drop from `m.direct` ONLY, never leave
+    /// it. Bug D1 (2026-09-29) let `ensure_dm_room` and consumers record group
+    /// call rooms as the owner DM; this undoes that pollution.
+    NotOneToOne,
+}
+
 /// Pure classification used by [`AgentClient::reconcile_owner_dms`]: given the
-/// owner's recorded DM rooms (in `m.direct` order, possibly with duplicates) and a
-/// predicate reporting whether a room is positively STALE (the owner has Left /
-/// been banned), return `(kept, dropped)` — both deduped, first-seen order
-/// preserved. Conservative by design: only positively-stale rooms are dropped, so
-/// a transient sync gap ("member unknown") never evicts a live DM.
+/// owner's recorded DM rooms (in `m.direct` order, possibly with duplicates) and
+/// a per-room verdict, return `(kept, owner_left, not_one_to_one)`, each deduped
+/// with first-seen order preserved. Conservative by design: only positively
+/// classified rooms are dropped, so a transient sync gap ("member unknown")
+/// never evicts a live DM.
 fn partition_dm_rooms(
     original: &[OwnedRoomId],
-    is_stale: &dyn Fn(&OwnedRoomId) -> bool,
-) -> (Vec<OwnedRoomId>, Vec<OwnedRoomId>) {
+    classify: &dyn Fn(&OwnedRoomId) -> DirectEntry,
+) -> (Vec<OwnedRoomId>, Vec<OwnedRoomId>, Vec<OwnedRoomId>) {
     let mut seen = std::collections::HashSet::new();
     let mut kept = Vec::new();
-    let mut dropped = Vec::new();
+    let mut left = Vec::new();
+    let mut not_dm = Vec::new();
     for r in original {
         if !seen.insert(r.clone()) {
             continue; // duplicate
         }
-        if is_stale(r) {
-            dropped.push(r.clone());
-        } else {
-            kept.push(r.clone());
+        match classify(r) {
+            DirectEntry::Keep => kept.push(r.clone()),
+            DirectEntry::OwnerLeft => left.push(r.clone()),
+            DirectEntry::NotOneToOne => not_dm.push(r.clone()),
         }
     }
-    (kept, dropped)
+    (kept, left, not_dm)
 }
 
 /// Best-effort: after a store-wipe re-bootstrap minted a NEW device_id, delete the
@@ -1213,63 +1230,6 @@ async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
 }
 
 impl AgentClient {
-    /// Resolve THE 1:1 direct room for `target`, deterministically and liveness-checked.
-    ///
-    /// A DM is only usable if the OTHER party is still present: a room the target
-    /// LEFT (or was banned/kicked from) can no longer exchange Megolm keys, so its
-    /// events become permanently undecryptable. matrix-sdk's `get_dm_room()` returns
-    /// the first `m.direct` match in *undefined order* and never checks the peer's
-    /// membership — so a stale/duplicate `m.direct` entry silently bound `#shell` +
-    /// delivery to a dead room in the 2026-06-06 transcript-agent incident.
-    ///
-    /// Instead we scan joined rooms, keep only small (≤2 joined) rooms where the
-    /// target's membership is `Join` (or `Invite` — a freshly created DM the peer
-    /// hasn't accepted yet), and pick deterministically: prefer `Join` over
-    /// `Invite`, then the most-recently-active room, then a stable room-id order.
-    async fn find_dm_room(&self, target: &UserId) -> Option<matrix_sdk::Room> {
-        // (room, rank): rank 2 = target Join, 1 = target Invite. Leave/Ban/Knock excluded.
-        let mut candidates: Vec<(matrix_sdk::Room, u8)> = Vec::new();
-        for room in self.client.joined_rooms() {
-            if room.joined_members_count() > 2 {
-                continue; // group room, not a 1:1 DM
-            }
-            let Some(member) = room.get_member(target).await.ok().flatten() else {
-                continue;
-            };
-            let rank = match member.membership() {
-                MembershipState::Join => 2u8,
-                MembershipState::Invite => 1u8,
-                _ => continue, // Leave / Ban / Knock → stale, never select
-            };
-            candidates.push((room, rank));
-        }
-        match candidates.len() {
-            0 => None,
-            1 => candidates.into_iter().next().map(|(r, _)| r),
-            _ => {
-                // Genuine multiple live DMs (rare): break ties by newest activity.
-                // Cheap (limit=1) and only on the multi-candidate path.
-                let mut scored: Vec<(matrix_sdk::Room, u8, u64)> =
-                    Vec::with_capacity(candidates.len());
-                for (room, rank) in candidates {
-                    let ts = self
-                        .messages(room.room_id().as_str(), 1)
-                        .await
-                        .ok()
-                        .and_then(|m| m.iter().map(|x| x.timestamp_ms).max())
-                        .unwrap_or(0);
-                    scored.push((room, rank, ts));
-                }
-                scored.sort_by(|a, b| {
-                    b.1.cmp(&a.1)
-                        .then(b.2.cmp(&a.2))
-                        .then(a.0.room_id().cmp(b.0.room_id()))
-                });
-                scored.into_iter().next().map(|(r, _, _)| r)
-            }
-        }
-    }
-
     pub async fn connect(config: AgentConfig) -> Result<Self> {
         let key = if config.key_file.exists() {
             tracing::info!("loading key from {}", config.key_file.display());
@@ -1564,6 +1524,10 @@ impl AgentClient {
     /// message (e.g. a hello) reuses the shared room the peer created, instead
     /// of `create_dm` spawning a duplicate room (which splits the two sides into
     /// separate rooms and breaks Megolm key exchange). Best-effort by the caller.
+    ///
+    /// Errors (and writes nothing) unless `room_id` is a room this client knows
+    /// whose active members are exactly this agent and `target`: a group room is
+    /// never recorded as a DM (bug D1).
     pub async fn mark_dm(&self, room_id: &str, target: &str) -> Result<()> {
         let room_id: OwnedRoomId = room_id
             .try_into()
@@ -1571,6 +1535,28 @@ impl AgentClient {
         let target: &UserId = target
             .try_into()
             .map_err(|e| anyhow!("invalid target: {e}"))?;
+        // Bug D1 (2026-09-29): never record a room that is not a true 1:1 with
+        // `target`. Consumers used `joined_members_count() <= 2` as the group
+        // guard, which reads 0 on this connector's non-lazy sync, so group call
+        // rooms were written into m.direct. Checked here from the member list so
+        // every caller (relay auto-join, Scribe owner invites) is covered.
+        let room = self
+            .client
+            .get_room(&room_id)
+            .ok_or_else(|| anyhow!("room {room_id} unknown to this client; not marking as DM"))?;
+        match self.dm_verdict(&room, target).await {
+            Some((v, _)) if v.rank().is_some() => {}
+            Some((v, _)) => {
+                return Err(anyhow!(
+                    "refusing to mark {room_id} as the DM with {target}: not a 1:1 ({v:?})"
+                ))
+            }
+            None => {
+                return Err(anyhow!(
+                    "cannot read the members of {room_id}; not marking it as a DM"
+                ))
+            }
+        }
         // Dedup-aware: matrix-sdk's `mark_as_dm` appends unconditionally, so over
         // repeated joins/marks it accumulates duplicate `m.direct` entries (which,
         // with the order-undefined `get_dm_room`, bound `#shell`/delivery to a dead
@@ -1612,6 +1598,11 @@ impl AgentClient {
     /// or `Invite`. Rooms where the owner has Left/been-banned are dropped from
     /// `m.direct` and (if the agent is still joined) left+forgotten so they stop
     /// generating undecryptable-event churn on every poll.
+    ///
+    /// Rooms an authoritative member list shows to be GROUP rooms (someone
+    /// besides the agent and the owner is joined or invited) are dropped from
+    /// `m.direct` but never left: bug D1 (2026-09-29) recorded group call rooms
+    /// as the owner DM, and this startup pass undoes that pollution.
     pub async fn reconcile_owner_dms(&self, owner: &str) -> Result<()> {
         let owner: &UserId = owner
             .try_into()
@@ -1641,34 +1632,50 @@ impl AgentClient {
             .map(|r| r.room_id().to_owned())
             .collect();
 
-        // Determine, per unique room, whether the owner is POSITIVELY gone
-        // (membership Leave/Ban). Unknown membership / unknown room → NOT stale, so
-        // a transient sync gap can never evict the live DM. Then classify via a
-        // pure fn (deduped, order-preserving).
-        let mut stale_map: std::collections::HashMap<OwnedRoomId, bool> =
+        // Classify each unique room. Owner POSITIVELY gone (membership
+        // Leave/Ban) -> OwnerLeft. An AUTHORITATIVE member list with someone
+        // besides the agent and the owner -> NotOneToOne (bug D1 pollution).
+        // Unknown room / unknown membership / store-only member list -> Keep,
+        // so a transient sync gap can never evict the live DM.
+        let mut verdicts: std::collections::HashMap<OwnedRoomId, DirectEntry> =
             std::collections::HashMap::new();
         for room_id in &original {
-            if stale_map.contains_key(room_id) {
+            if verdicts.contains_key(room_id) {
                 continue;
             }
-            let positively_stale = match self.client.get_room(room_id) {
-                Some(room) => matches!(
-                    room.get_member(owner)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|m| m.membership().clone()),
-                    Some(MembershipState::Leave) | Some(MembershipState::Ban)
-                ),
-                None => false, // unknown room → keep (don't drop on uncertainty)
+            let entry = match self.client.get_room(room_id) {
+                Some(room) => {
+                    // Group check first: a room that still has other members is
+                    // only unlisted, never left, even when the owner left it.
+                    if matches!(
+                        self.dm_verdict(&room, owner).await,
+                        Some((dm::DmVerdict::NotOneToOne, true))
+                    ) {
+                        DirectEntry::NotOneToOne
+                    } else if matches!(
+                        room.get_member(owner)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|m| m.membership().clone()),
+                        Some(MembershipState::Leave) | Some(MembershipState::Ban)
+                    ) {
+                        DirectEntry::OwnerLeft
+                    } else {
+                        DirectEntry::Keep
+                    }
+                }
+                None => DirectEntry::Keep, // unknown room -> keep (don't drop on uncertainty)
             };
-            stale_map.insert(room_id.clone(), positively_stale);
+            verdicts.insert(room_id.clone(), entry);
         }
-        let (kept, dropped) =
-            partition_dm_rooms(&original, &|r| *stale_map.get(r).unwrap_or(&false));
+        let (kept, dropped, not_dm) = partition_dm_rooms(&original, &|r| {
+            *verdicts.get(r).unwrap_or(&DirectEntry::Keep)
+        });
 
         // Leave + forget rooms the owner abandoned but the agent is still in, so
-        // they stop generating undecryptable-event churn on every poll.
+        // they stop generating undecryptable-event churn on every poll. Group
+        // rooms in `not_dm` are only unlisted from m.direct, never left.
         for room_id in &dropped {
             if !joined.contains(room_id) {
                 continue;
@@ -1684,6 +1691,12 @@ impl AgentClient {
                 tracing::info!(%room_id, "reconcile: left+forgot stale DM (owner had left)");
             }
         }
+        for room_id in &not_dm {
+            tracing::warn!(
+                %room_id,
+                "reconcile: m.direct listed a GROUP room as the owner DM; unlisting it (room kept)"
+            );
+        }
 
         if kept == original {
             return Ok(()); // already clean (no dups, no positively-stale entries)
@@ -1698,7 +1711,8 @@ impl AgentClient {
             owner = %owner,
             kept = kept.len(),
             dropped = dropped.len(),
-            "reconcile: m.direct rewritten (duplicates + owner-left rooms removed)"
+            unlisted_group_rooms = not_dm.len(),
+            "reconcile: m.direct rewritten (duplicates, owner-left and group rooms removed)"
         );
         Ok(())
     }
@@ -2991,9 +3005,47 @@ mod tests {
         let ejp = RoomId::parse("!EjpPLRYTPVsWdqrtGc:matrix.inblock.io").unwrap();
         let original = vec![bnd.clone(), bnd.clone(), ejp.clone()];
         let stale_set: std::collections::HashSet<OwnedRoomId> = [ejp.clone()].into_iter().collect();
-        let (kept, dropped) = partition_dm_rooms(&original, &|r| stale_set.contains(r));
+        let (kept, dropped, not_dm) = partition_dm_rooms(&original, &|r| {
+            if stale_set.contains(r) {
+                DirectEntry::OwnerLeft
+            } else {
+                DirectEntry::Keep
+            }
+        });
         assert_eq!(kept, vec![bnd], "kept holds the single live DM, deduped");
         assert_eq!(dropped, vec![ejp], "dropped holds the room the owner left");
+        assert!(not_dm.is_empty());
+    }
+
+    #[test]
+    fn partition_dm_rooms_unlists_group_rooms_without_leaving() {
+        // Bug D1 pollution: m.direct[owner] = [dm, call, dead, call]. The group
+        // call room is unlisted (not_dm, never left), the room the owner left
+        // goes to the leave list, the true DM stays.
+        let dm = RoomId::parse("!dm:matrix.inblock.io").unwrap();
+        let call = RoomId::parse("!rvKzMvUBBaewXApthx:matrix.inblock.io").unwrap();
+        let dead = RoomId::parse("!dead:matrix.inblock.io").unwrap();
+        let original = vec![dm.clone(), call.clone(), dead.clone(), call.clone()];
+        let (kept, left, not_dm) = partition_dm_rooms(&original, &|r| {
+            if *r == call {
+                DirectEntry::NotOneToOne
+            } else if *r == dead {
+                DirectEntry::OwnerLeft
+            } else {
+                DirectEntry::Keep
+            }
+        });
+        assert_eq!(kept, vec![dm]);
+        assert_eq!(
+            left,
+            vec![dead],
+            "only the owner-left room is left+forgotten"
+        );
+        assert_eq!(
+            not_dm,
+            vec![call],
+            "the group room is unlisted once, not left"
+        );
     }
 
     #[test]
@@ -3002,7 +3054,8 @@ mod tests {
         let a = RoomId::parse("!aaa:matrix.inblock.io").unwrap();
         let b = RoomId::parse("!bbb:matrix.inblock.io").unwrap();
         let original = vec![a.clone(), b.clone(), a.clone()];
-        let (kept, dropped) = partition_dm_rooms(&original, &|_| false);
+        let (kept, dropped, not_dm) = partition_dm_rooms(&original, &|_| DirectEntry::Keep);
+        assert!(not_dm.is_empty());
         assert_eq!(
             kept,
             vec![a, b],
