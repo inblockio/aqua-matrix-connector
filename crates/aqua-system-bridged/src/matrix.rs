@@ -135,9 +135,10 @@ async fn run_cycle(
     shutdown: &Notify,
 ) -> &'static str {
     let own = agent.user_id().to_string();
-    let mut handles: Vec<EventHandlerHandle> = Vec::new();
-    handles.push(register_message_handler(agent, shared.clone(), own.clone()));
-    handles.push(register_invite_handler(agent, shared.clone(), own.clone()));
+    let handles: Vec<EventHandlerHandle> = vec![
+        register_message_handler(agent, shared.clone(), own.clone()),
+        register_invite_handler(agent, shared.clone(), own.clone()),
+    ];
 
     backfill(agent, shared, &own).await;
 
@@ -216,16 +217,24 @@ async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<S
     let fut = async {
         match &cmd.kind {
             SendKind::Text(md) => {
-                let room_id = destination_room(agent, shared, &cmd.to).await?;
+                let room_id = destination_room(agent, shared, &cmd.to, MissingDm::Create).await?;
                 agent
                     .send_to_room_chunked(&room_id, md)
                     .await
                     .map(CmdOk::Sent)
             }
             SendKind::File { path, caption } => {
-                let room_id = destination_room(agent, shared, &cmd.to).await?;
+                let room_id = destination_room(agent, shared, &cmd.to, MissingDm::Create).await?;
                 agent
                     .send_media_to_room(&room_id, path, Some(caption))
+                    .await
+                    .map(CmdOk::Sent)
+            }
+            SendKind::Edit { original, content } => {
+                let room_id = destination_room(agent, shared, &cmd.to, MissingDm::Refuse).await?;
+                crate::edit::ensure_editable(agent.client(), &room_id, original).await?;
+                agent
+                    .send_content_to_room(&room_id, (**content).clone())
                     .await
                     .map(CmdOk::Sent)
             }
@@ -339,13 +348,24 @@ async fn handle_invite(
     }
 }
 
+/// What a command does when the person has no DM with the bridge yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingDm {
+    /// Create one (a new message).
+    Create,
+    /// Fail (an edit: without a DM there is nothing to edit).
+    Refuse,
+}
+
 /// The room a send goes to. A listed room must already be joined. A person's
 /// DM is resolved here (never through `m.direct` alone, never to a listed
-/// `[[rooms]]` entry or a group room), and created when none exists.
+/// `[[rooms]]` entry or a group room), and created when none exists if
+/// `missing` allows it.
 async fn destination_room(
     agent: &AgentClient,
     shared: &Shared,
     dest: &Dest,
+    missing: MissingDm,
 ) -> anyhow::Result<String> {
     match dest {
         Dest::Room(id) => {
@@ -361,17 +381,22 @@ async fn destination_room(
                 ),
             }
         }
-        Dest::Person(mxid) => dm_room_for(agent, shared, mxid).await,
+        Dest::Person(mxid) => dm_room_for(agent, shared, mxid, missing).await,
         Dest::Nobody => anyhow::bail!("internal error: send without a destination"),
     }
 }
 
-/// Resolve (or create) the 1:1 DM with `mxid`. Candidates: joined rooms with
-/// at most two joined members, not listed under `[[rooms]]`, where the person
-/// is joined (or invited). Preference: rooms recorded in `m.direct`, then the
-/// person joined over invited, then the connector's own pick (most recent
-/// activity), then room id order.
-async fn dm_room_for(agent: &AgentClient, shared: &Shared, mxid: &str) -> anyhow::Result<String> {
+/// Resolve (or create, if `missing` allows) the 1:1 DM with `mxid`.
+/// Candidates: joined rooms with at most two joined members, not listed under
+/// `[[rooms]]`, where the person is joined (or invited). Preference: rooms
+/// recorded in `m.direct`, then the person joined over invited, then the
+/// connector's own pick (most recent activity), then room id order.
+async fn dm_room_for(
+    agent: &AgentClient,
+    shared: &Shared,
+    mxid: &str,
+    missing: MissingDm,
+) -> anyhow::Result<String> {
     let target =
         OwnedUserId::try_from(mxid).map_err(|e| anyhow::anyhow!("invalid MXID {mxid}: {e}"))?;
     let listed = listed_room_ids(shared);
@@ -406,6 +431,9 @@ async fn dm_room_for(agent: &AgentClient, shared: &Shared, mxid: &str) -> anyhow
     }
     if let Some((_, id)) = best {
         return Ok(id);
+    }
+    if missing == MissingDm::Refuse {
+        anyhow::bail!("the bridge has no DM with {mxid}, so there is no message there to edit");
     }
     let room = agent
         .client()

@@ -18,6 +18,8 @@ use aqua_system_bridge::ratelimit::RateLimiter;
 use aqua_system_bridge::{
     MAX_FILE_BYTES, MAX_MESSAGE_BYTES, MAX_WAIT_SECS, RATE_LIMIT_COUNT, RATE_LIMIT_WINDOW_SECS,
 };
+use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::OwnedEventId;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -34,6 +36,12 @@ pub enum SendKind {
     File {
         path: PathBuf,
         caption: String,
+    },
+    /// Replace `original` (checked on the live Client to be the bridge's own
+    /// text message in the destination room) with `content`.
+    Edit {
+        original: OwnedEventId,
+        content: Box<RoomMessageEventContent>,
     },
     /// Download + decrypt an inbound attachment (`to_mxid` unused).
     Fetch {
@@ -345,11 +353,8 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             markdown,
             origin,
         } => {
-            if markdown.len() > MAX_MESSAGE_BYTES {
-                return Response::err(format!(
-                    "message is {} bytes; the cap is {MAX_MESSAGE_BYTES}. Send long content with send_file instead.",
-                    markdown.len()
-                ));
+            if let Err(e) = check_message_size(&markdown) {
+                return Response::err(e);
             }
             let body = format::tag_markdown(&markdown, &origin);
             let bytes = markdown.len();
@@ -362,6 +367,12 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             )
             .await
         }
+        Request::EditMessage {
+            to,
+            event_id,
+            markdown,
+            origin,
+        } => edit_message(shared, &to, &event_id, &markdown, &origin).await,
         Request::SendFile {
             to,
             path,
@@ -545,8 +556,51 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
     }
 }
 
-/// Validate recipient + rate limit, queue the send for the Matrix loop and
-/// wait for its outcome.
+fn check_message_size(markdown: &str) -> Result<(), String> {
+    if markdown.len() > MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "message is {} bytes; the cap is {MAX_MESSAGE_BYTES}. Send long content with send_file instead.",
+            markdown.len()
+        ));
+    }
+    Ok(())
+}
+
+/// `edit_message`: validate and build the replacement here (size caps before
+/// any rate-limit slot is taken), then deliver it like a send. Whether the
+/// original may be edited is checked on the live Client in the destination
+/// room ([`crate::edit::ensure_editable`]).
+async fn edit_message(
+    shared: &Arc<Shared>,
+    to: &str,
+    event_id: &str,
+    markdown: &str,
+    origin: &str,
+) -> Response {
+    if let Err(e) = check_message_size(markdown) {
+        return Response::err(e);
+    }
+    let original = match OwnedEventId::try_from(event_id.trim()) {
+        Ok(id) => id,
+        Err(e) => return Response::err(format!("invalid event id {event_id:?}: {e}")),
+    };
+    let content =
+        crate::edit::replacement(&format::tag_markdown(markdown, origin), original.clone());
+    if let Err(e) = crate::edit::check_size(&content) {
+        return Response::err(e);
+    }
+    let info = json!({"kind": "edit", "bytes": markdown.len(), "replaces": original.as_str()});
+    let kind = SendKind::Edit {
+        original: original.clone(),
+        content: Box::new(content),
+    };
+    match deliver(shared, to, kind, origin, info).await {
+        Ok(d) => Response::ok(json!({"event_id": d.event_id, "replaces": original.as_str()})),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// [`deliver`] a new message and answer with the send response shape.
 async fn send(
     shared: &Arc<Shared>,
     to: &str,
@@ -554,6 +608,36 @@ async fn send(
     origin: &str,
     info: serde_json::Value,
 ) -> Response {
+    let d = match deliver(shared, to, kind, origin, info).await {
+        Ok(d) => d,
+        Err(e) => return Response::err(e),
+    };
+    let mut data = json!({"event_id": d.event_id, "to_name": d.name, "to_kind": if d.is_room { "room" } else { "person" }, "inbox_seq": d.inbox_seq});
+    data[if d.is_room { "to_room_id" } else { "to_mxid" }] = json!(d.id);
+    Response::ok(data)
+}
+
+/// A command the Matrix loop executed.
+struct Delivered {
+    event_id: String,
+    name: String,
+    /// MXID for a person, room id for a room.
+    id: String,
+    is_room: bool,
+    /// Inbox high-water mark when the command was queued.
+    inbox_seq: u64,
+}
+
+/// Validate recipient + rate limit, queue the command for the Matrix loop and
+/// wait for its outcome. Every outcome is audited; a failure releases the
+/// rate-limit slot and comes back as the caller-facing error text.
+async fn deliver(
+    shared: &Arc<Shared>,
+    to: &str,
+    kind: SendKind,
+    origin: &str,
+    info: serde_json::Value,
+) -> Result<Delivered, String> {
     let origin = format::sanitize_origin(origin);
     let Resolved {
         name,
@@ -564,7 +648,7 @@ async fn send(
         Err(refusal) => {
             tracing::warn!(to, origin, "send refused: not on the allow-list");
             shared.audit(json!({"event": "send_refused", "reason": "not_allowlisted", "to": to, "origin": origin}));
-            return Response::err(refusal);
+            return Err(refusal);
         }
     };
     if let Err(wait) = shared
@@ -574,7 +658,7 @@ async fn send(
         .try_acquire(&key, Instant::now())
     {
         shared.audit(json!({"event": "send_refused", "reason": "rate_limited", "to": name, "origin": origin}));
-        return Response::err(format!(
+        return Err(format!(
             "RATE LIMITED: {RATE_LIMIT_COUNT} messages per {} minutes to {name} already used; next slot in {}s. Batch your updates into fewer messages.",
             RATE_LIMIT_WINDOW_SECS / 60,
             wait.as_secs() + 1
@@ -591,7 +675,7 @@ async fn send(
     };
     if shared.cmd_tx.send(cmd).await.is_err() {
         shared.rate.lock().unwrap().release(&key);
-        return Response::err("bridge Matrix loop is not running");
+        return Err("bridge Matrix loop is not running".to_string());
     }
     let outcome = match tokio::time::timeout(SEND_DEADLINE + Duration::from_secs(10), rx).await {
         Ok(Ok(r)) => r,
@@ -607,22 +691,35 @@ async fn send(
     match outcome {
         Ok(event_id) => {
             tracing::info!(to = %name, origin = %origin, event_id = %event_id, "sent");
-            let mut a = json!({"event": "sent", "to": name, "room": is_room, "origin": origin, "event_id": event_id});
-            if let (Some(a), Some(i)) = (a.as_object_mut(), info.as_object()) {
-                a.extend(i.clone());
-            }
-            shared.audit(a);
-            let mut data = json!({"event_id": event_id, "to_name": name, "to_kind": if is_room { "room" } else { "person" }, "inbox_seq": inbox_seq});
-            data[if is_room { "to_room_id" } else { "to_mxid" }] = json!(key);
-            Response::ok(data)
+            shared.audit(with_info(
+                json!({"event": "sent", "to": name, "room": is_room, "origin": origin, "event_id": event_id}),
+                &info,
+            ));
+            Ok(Delivered {
+                event_id,
+                name,
+                id: key,
+                is_room,
+                inbox_seq,
+            })
         }
         Err(e) => {
             shared.rate.lock().unwrap().release(&key);
             tracing::warn!(to = %name, origin = %origin, "send failed: {e}");
-            shared.audit(json!({"event": "send_failed", "to": name, "origin": origin, "error": e}));
-            Response::err(format!("NOT delivered to {name}: {e}"))
+            shared.audit(with_info(
+                json!({"event": "send_failed", "to": name, "origin": origin, "error": e}),
+                &info,
+            ));
+            Err(format!("NOT delivered to {name}: {e}"))
         }
     }
+}
+
+fn with_info(mut record: serde_json::Value, info: &serde_json::Value) -> serde_json::Value {
+    if let (Some(r), Some(i)) = (record.as_object_mut(), info.as_object()) {
+        r.extend(i.clone());
+    }
+    record
 }
 
 /// Whether an entry's attachment may be fetched now: it was posted in a
@@ -753,13 +850,131 @@ async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
 mod tests {
     use super::*;
 
-    fn shared_with(allowlist: &str, tag: &str) -> Shared {
+    fn state_dir_with(allowlist: &str, tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("asb-bridge-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("allowlist.toml"), allowlist).unwrap();
+        dir
+    }
+
+    fn shared_with(allowlist: &str, tag: &str) -> Shared {
         let (tx, _rx) = mpsc::channel(1);
-        Shared::new(&dir, tx, AttachmentPolicy::default())
+        Shared::new(
+            &state_dir_with(allowlist, tag),
+            tx,
+            AttachmentPolicy::default(),
+        )
+    }
+
+    /// A Shared whose Matrix loop is a stub: every edit is answered with event
+    /// `$new:x`, except originals named `$foreign...`, which it refuses the
+    /// way `edit::check_editable` does. Returns what the loop was asked to do.
+    fn shared_with_stub_loop(allowlist: &str, tag: &str) -> (Arc<Shared>, Arc<Mutex<Vec<String>>>) {
+        let (tx, mut rx) = mpsc::channel::<SendCmd>(4);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let SendKind::Edit { original, content } = &cmd.kind else {
+                    let _ = cmd.reply.send(Err("stub only handles edits".into()));
+                    continue;
+                };
+                log.lock()
+                    .unwrap()
+                    .push(format!("{original} in {:?}: {}", cmd.to, content.body()));
+                let outcome = if original.as_str().starts_with("$foreign") {
+                    Err(format!("REFUSED: event {original} was sent by @tim:x"))
+                } else {
+                    Ok(CmdOk::Sent("$new:x".into()))
+                };
+                let _ = cmd.reply.send(outcome);
+            }
+        });
+        let sh = Shared::new(
+            &state_dir_with(allowlist, tag),
+            tx,
+            AttachmentPolicy::default(),
+        );
+        (Arc::new(sh), seen)
+    }
+
+    fn edit(to: &str, event_id: &str, markdown: &str) -> Request {
+        Request::EditMessage {
+            to: to.into(),
+            event_id: event_id.into(),
+            markdown: markdown.into(),
+            origin: "trains@nuc10".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_answers_with_the_contract_and_counts_as_one_send() {
+        let (sh, seen) = shared_with_stub_loop(LIST, "edit-ok");
+        let r = handle(edit("daily-updates", "$orig:x", "# Report v2"), &sh).await;
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.data, json!({"event_id": "$new:x", "replaces": "$orig:x"}));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["$orig:x in Room(\"!daily:x\"): * # Report v2\n\n<sub>via `trains@nuc10`</sub>"]
+        );
+        let left = sh
+            .rate
+            .lock()
+            .unwrap()
+            .remaining("!daily:x", Instant::now());
+        assert_eq!(left, RATE_LIMIT_COUNT - 1);
+        let audit = std::fs::read_to_string(sh.state_dir.join("audit.jsonl")).unwrap();
+        let last: serde_json::Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+        assert_eq!(last["event"], "sent");
+        assert_eq!(last["kind"], "edit");
+        assert_eq!(last["event_id"], "$new:x");
+        assert_eq!(last["replaces"], "$orig:x");
+        assert!(
+            !audit.contains("Report v2"),
+            "audit holds no bodies: {audit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_edits_take_no_rate_slot() {
+        let (sh, seen) = shared_with_stub_loop(LIST, "edit-refused");
+        let e = handle(edit("mallory", "$o:x", "x"), &sh)
+            .await
+            .error
+            .unwrap();
+        assert!(e.starts_with("REFUSED"), "{e}");
+        let e = handle(edit("tim", "not-an-event-id", "x"), &sh)
+            .await
+            .error
+            .unwrap();
+        assert!(e.contains("invalid event id"), "{e}");
+        let too_long = "x".repeat(MAX_MESSAGE_BYTES + 1);
+        let e = handle(edit("tim", "$o:x", &too_long), &sh)
+            .await
+            .error
+            .unwrap();
+        assert!(e.contains("the cap is 20000"), "{e}");
+        // within the send_message cap, but too large as one edit event
+        let prose = "word ".repeat(MAX_MESSAGE_BYTES / 5);
+        let e = handle(edit("tim", "$o:x", &prose), &sh)
+            .await
+            .error
+            .unwrap();
+        assert!(e.contains("the edit would be"), "{e}");
+        assert!(seen.lock().unwrap().is_empty());
+        // refused on the Matrix side: the slot is released again
+        let e = handle(edit("daily-updates", "$foreign:x", "x"), &sh)
+            .await
+            .error
+            .unwrap();
+        assert!(
+            e.starts_with("NOT delivered to daily-updates: REFUSED"),
+            "{e}"
+        );
+        let mut rate = sh.rate.lock().unwrap();
+        assert_eq!(rate.remaining("!daily:x", Instant::now()), RATE_LIMIT_COUNT);
+        assert_eq!(rate.remaining("@tim:x", Instant::now()), RATE_LIMIT_COUNT);
     }
 
     const LIST: &str = r#"
