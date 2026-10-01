@@ -631,10 +631,22 @@ fn register_message_handler(
         })
 }
 
+/// True for the msgtypes that carry a file.
+fn is_media(msgtype: &MessageType) -> bool {
+    matches!(
+        msgtype,
+        MessageType::File(_)
+            | MessageType::Image(_)
+            | MessageType::Audio(_)
+            | MessageType::Video(_)
+    )
+}
+
 /// Record one inbound message: any member's message in a listed `[[rooms]]`
 /// room (tagged with the room name), or a DM from an allow-listed sender.
 /// Messages in unlisted group rooms (`group`: more than two joined members)
-/// are dropped, logged once per room. Returns true when newly added.
+/// are dropped, logged once per room; so are media messages when the instance
+/// refuses inbound media. Returns true when newly added.
 fn ingest(
     shared: &Shared,
     own: &str,
@@ -677,6 +689,17 @@ fn ingest(
             return false;
         }
     };
+    // An instance configured to refuse inbound media records nothing for a
+    // media message (so no media reference or E2EE key is stored) and never
+    // downloads it. Logged once per event, metadata only.
+    if is_media(&ev.content.msgtype) && !shared.inbox.lock().unwrap().policy().accept_media {
+        let event_id = ev.event_id.to_string();
+        if shared.dropped.lock().unwrap().insert(event_id.clone()) {
+            tracing::info!(%sender, room = %room_id, "dropped a media message (inbound media is refused on this bridge)");
+            shared.audit(json!({"event": "inbound_dropped_media", "from": sender, "room": room_id, "event_id": event_id, "msgtype": ev.content.msgtype.msgtype()}));
+        }
+        return false;
+    }
     let (kind, body, filename) = match &ev.content.msgtype {
         MessageType::Text(t) => ("text", t.body.clone(), None),
         MessageType::Notice(n) => ("notice", n.body.clone(), None),
@@ -792,5 +815,35 @@ async fn backfill(agent: &AgentClient, shared: &Arc<Shared>, own: &str) {
     }
     if added > 0 {
         tracing::info!("backfill added {added} message(s) to the inbox");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk::ruma::events::room::message::{
+        AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
+        VideoMessageEventContent,
+    };
+    use matrix_sdk::ruma::{mxc_uri, OwnedMxcUri};
+
+    #[test]
+    fn only_file_carrying_msgtypes_count_as_media() {
+        let mxc: OwnedMxcUri = mxc_uri!("mxc://x/y").to_owned();
+        for m in [
+            MessageType::File(FileMessageEventContent::plain("a.pdf".into(), mxc.clone())),
+            MessageType::Image(ImageMessageEventContent::plain("a.png".into(), mxc.clone())),
+            MessageType::Video(VideoMessageEventContent::plain("a.mp4".into(), mxc.clone())),
+            MessageType::Audio(AudioMessageEventContent::plain("a.ogg".into(), mxc)),
+        ] {
+            assert!(is_media(&m), "{}", m.msgtype());
+        }
+        for m in [
+            MessageType::text_plain("hello"),
+            MessageType::notice_plain("note"),
+            MessageType::emote_plain("waves"),
+        ] {
+            assert!(!is_media(&m), "{}", m.msgtype());
+        }
     }
 }
