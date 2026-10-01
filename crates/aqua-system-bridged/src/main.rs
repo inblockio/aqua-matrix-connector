@@ -18,6 +18,7 @@
 #![recursion_limit = "256"]
 
 mod bridge;
+mod edit;
 mod matrix;
 mod media;
 

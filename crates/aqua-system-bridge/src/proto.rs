@@ -20,6 +20,17 @@ pub enum Request {
         /// caller-supplied label).
         origin: String,
     },
+    /// Replace (`m.replace`) the text of a message the bridge itself sent
+    /// earlier in the room `to` resolves to. `markdown` is the full new body;
+    /// the origin tag is appended as for `send_message`.
+    EditMessage {
+        /// Allow-list name or MXID, or a `[[rooms]]` name or room id.
+        to: String,
+        /// Event id of the original message (not of an earlier edit).
+        event_id: String,
+        markdown: String,
+        origin: String,
+    },
     /// Upload a local file (absolute path, read by the daemon) as an attachment.
     SendFile {
         to: String,
@@ -115,6 +126,25 @@ mod tests {
         };
         let line = encode_line(&r);
         assert!(line.contains("\"op\":\"send_message\""));
+        let back: Request = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn edit_message_roundtrip_matches_the_wire_contract() {
+        let wire = r##"{"op":"edit_message","to":"daily-updates","event_id":"$orig:x","markdown":"# Train Report","origin":"trains@nuc10"}"##;
+        let r: Request = serde_json::from_str(wire).unwrap();
+        assert_eq!(
+            r,
+            Request::EditMessage {
+                to: "daily-updates".into(),
+                event_id: "$orig:x".into(),
+                markdown: "# Train Report".into(),
+                origin: "trains@nuc10".into(),
+            }
+        );
+        let line = encode_line(&r);
+        assert!(line.contains("\"op\":\"edit_message\""));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(back, r);
     }
