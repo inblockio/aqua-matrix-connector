@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqua_system_bridge::allowlist::{is_valid_mxid, is_valid_room_id, AllowList, Target};
 use aqua_system_bridge::attachments::{AttachmentPolicy, AttachmentStore};
 use aqua_system_bridge::format;
-use aqua_system_bridge::inbox::{Inbox, InboxEntry, MediaRef, Query};
+use aqua_system_bridge::inbox::{Inbox, InboxEntry, InboxPolicy, MediaRef, Query};
 use aqua_system_bridge::proto::{self, Request, Response};
 use aqua_system_bridge::ratelimit::RateLimiter;
 use aqua_system_bridge::{
@@ -126,6 +126,7 @@ impl Shared {
         state_dir: &Path,
         cmd_tx: mpsc::Sender<SendCmd>,
         attach_policy: AttachmentPolicy,
+        inbox_policy: InboxPolicy,
     ) -> Self {
         Self {
             attach_policy,
@@ -133,7 +134,11 @@ impl Shared {
             fetch_lock: tokio::sync::Mutex::new(()),
             state_dir: state_dir.to_path_buf(),
             allow: Mutex::new(AllowList::new(state_dir.join("allowlist.toml"))),
-            inbox: Mutex::new(Inbox::load(state_dir.join("inbox.jsonl"))),
+            inbox: Mutex::new(Inbox::load_with(
+                state_dir.join("inbox.jsonl"),
+                inbox_policy,
+                aqua_system_bridge::inbox::now_ms(),
+            )),
             inbox_changed: Notify::new(),
             rate: Mutex::new(RateLimiter::new(
                 RATE_LIMIT_COUNT,
@@ -167,6 +172,23 @@ impl Shared {
         if let Err(e) = res {
             tracing::warn!("audit write failed: {e}");
         }
+    }
+}
+
+/// How often the inbox policy is enforced while no request or message
+/// triggers it (so an idle inbox still ages out).
+pub const RETENTION_SWEEP: Duration = Duration::from_secs(300);
+
+/// Enforce the inbox policy on a timer. Only worth running when an age bound is
+/// configured: everything else is already enforced on load, on every ingest and
+/// before every read.
+pub async fn retention_loop(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(RETENTION_SWEEP);
+    // After a Modern Standby the missed ticks collapse into one sweep.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        shared.inbox.lock().unwrap().enforce();
     }
 }
 
@@ -485,6 +507,8 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             };
             apply_from(&mut q, filter);
             let mut inbox = shared.inbox.lock().unwrap();
+            // Never hand out what the inbox policy already dropped.
+            inbox.enforce();
             let entries = inbox.query(&q);
             if mark_read {
                 let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
@@ -520,6 +544,7 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 notified.as_mut().enable();
                 {
                     let mut inbox = shared.inbox.lock().unwrap();
+                    inbox.enforce();
                     let entries = inbox.query(&q);
                     if !entries.is_empty() {
                         let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
@@ -549,6 +574,10 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 "device_id": st.device_id,
                 "last_error": st.last_error,
                 "inbox_entries": inbox.len(),
+                "inbox_max_entries": inbox.policy().max_entries,
+                "inbox_max_age_hours": inbox.policy().max_age.map(|a| a.as_secs() / 3600),
+                "inbox_hard_cap": inbox.policy().hard_cap,
+                "inbox_accept_media": inbox.policy().accept_media,
                 "inbox_unread": inbox.unread_count(),
                 "inbox_high_water": inbox.high_water(),
             }))
@@ -748,6 +777,12 @@ fn fetch_permitted(shared: &Shared, entry: &InboxEntry) -> Result<(), String> {
 /// `fetch_attachment`: serve the cached copy, or download + decrypt + verify
 /// on the live Client and store it (mode 600) under `<state>/attachments/`.
 async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
+    if !shared.inbox.lock().unwrap().policy().accept_media {
+        return Response::err(
+            "REFUSED: this bridge is configured not to accept inbound media \
+             (AQUA_SYSTEM_BRIDGE_INBOUND_MEDIA=refuse); there is nothing to fetch",
+        );
+    }
     let _guard = shared.fetch_lock.lock().await;
     let entry = match shared.inbox.lock().unwrap().get(inbox_seq).cloned() {
         Some(e) => e,
@@ -864,6 +899,7 @@ mod tests {
             &state_dir_with(allowlist, tag),
             tx,
             AttachmentPolicy::default(),
+            InboxPolicy::default(),
         )
     }
 
@@ -895,6 +931,7 @@ mod tests {
             &state_dir_with(allowlist, tag),
             tx,
             AttachmentPolicy::default(),
+            InboxPolicy::default(),
         );
         (Arc::new(sh), seen)
     }
@@ -1112,6 +1149,96 @@ room_id = "!daily:x"
             !out.contains("SECRETKEY") && !out.contains("secretmedia"),
             "{out}"
         );
+    }
+
+    fn shared_with_inbox_policy(policy: InboxPolicy, tag: &str) -> Arc<Shared> {
+        let (tx, _rx) = mpsc::channel(1);
+        Arc::new(Shared::new(
+            &state_dir_with(LIST, tag),
+            tx,
+            AttachmentPolicy::default(),
+            policy,
+        ))
+    }
+
+    fn read_all() -> Request {
+        Request::ReadInbox {
+            from: None,
+            since_seq: None,
+            since_ts_ms: None,
+            unread_only: false,
+            mark_read: false,
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn media_refusing_instance_refuses_fetch_and_reports_it() {
+        let refuse = InboxPolicy {
+            accept_media: false,
+            ..InboxPolicy::default()
+        };
+        let sh = shared_with_inbox_policy(refuse, "nomedia");
+        let e = fetch_attachment(&sh, 1).await.error.unwrap();
+        assert!(
+            e.starts_with("REFUSED") && e.contains("not to accept inbound media"),
+            "{e}"
+        );
+        let data = handle(Request::Status, &sh).await.data;
+        assert_eq!(data["inbox_accept_media"], false);
+        // the default instance reports media accepted and keeps the fetch path
+        let open = Arc::new(shared_with(LIST, "media-default"));
+        assert_eq!(
+            handle(Request::Status, &open).await.data["inbox_accept_media"],
+            true
+        );
+        let e = fetch_attachment(&open, 1).await.error.unwrap();
+        assert!(e.contains("no inbox entry"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn read_inbox_never_returns_entries_past_the_age_bound() {
+        use aqua_system_bridge::inbox::{now_ms, NewEntry};
+        const H: u64 = 3_600_000;
+        let policy = InboxPolicy {
+            max_age: Some(Duration::from_secs(24 * 3600)),
+            ..InboxPolicy::default()
+        };
+        let sh = shared_with_inbox_policy(policy, "age");
+        let now = now_ms();
+        let entry = |id: &str, age_ms: u64| NewEntry {
+            event_id: id.into(),
+            room_id: "!dm:x".into(),
+            sender: "@tim:x".into(),
+            sender_name: Some("tim".into()),
+            room: None,
+            ts_ms: now - age_ms,
+            kind: "text".into(),
+            body: id.into(),
+            filename: None,
+            media: None,
+        };
+        {
+            let mut ib = sh.inbox.lock().unwrap();
+            // already past 24 h: refused outright
+            assert_eq!(ib.ingest(entry("$stale", 30 * H)), None);
+            assert!(ib.ingest(entry("$fresh", H)).is_some());
+            // 30 h old, but ingested "as of" 29 h ago, i.e. inside the bound
+            // then and aged out since (what happens between two sweeps)
+            assert!(ib
+                .ingest_at(entry("$aging", 30 * H), now - 29 * H)
+                .is_some());
+            assert_eq!(ib.len(), 2);
+        }
+        let out = serde_json::to_string(&handle(read_all(), &sh).await).unwrap();
+        assert!(out.contains("$fresh") && !out.contains("$aging"), "{out}");
+        assert_eq!(sh.inbox.lock().unwrap().len(), 1);
+        let data = handle(Request::Status, &sh).await.data;
+        assert_eq!(data["inbox_max_age_hours"], 24);
+        assert_eq!(data["inbox_max_entries"], 5000);
+        // the default instance has no age bound
+        let open = Arc::new(shared_with(LIST, "age-default"));
+        assert!(handle(Request::Status, &open).await.data["inbox_max_age_hours"].is_null());
     }
 
     #[test]

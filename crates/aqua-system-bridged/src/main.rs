@@ -69,9 +69,35 @@ struct Args {
     /// Fetched attachments older than this many days are deleted (default 14).
     #[arg(long, env = "AQUA_SYSTEM_BRIDGE_ATTACHMENT_RETENTION_DAYS", default_value_t = aqua_system_bridge::attachments::DEFAULT_RETENTION_DAYS)]
     attachment_retention_days: u64,
+    /// Inbox: drop messages older than this many hours, read or not
+    /// (0 = no age bound, the default).
+    #[arg(
+        long,
+        env = "AQUA_SYSTEM_BRIDGE_INBOX_MAX_AGE_HOURS",
+        default_value_t = 0
+    )]
+    inbox_max_age_hours: u64,
+    /// Inbox: hold at most this many messages.
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_INBOX_MAX_ENTRIES", default_value_t = aqua_system_bridge::inbox::MAX_ENTRIES as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    inbox_max_entries: u64,
+    /// Inbox: over the cap, evict the oldest messages read or not (default:
+    /// only read messages are evicted, unread ones are kept until read).
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_INBOX_HARD_CAP")]
+    inbox_hard_cap: bool,
+    /// What to do with inbound files, images, audio and video: `fetch` records
+    /// them and lets a session download one on request (default), `refuse`
+    /// records nothing and downloads nothing.
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_INBOUND_MEDIA", value_enum, default_value_t = InboundMedia::Fetch)]
+    inbound_media: InboundMedia,
     /// Print the identity (DID, and MXID once logged in) and exit.
     #[arg(long)]
     print_identity: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum InboundMedia {
+    Fetch,
+    Refuse,
 }
 
 fn ensure_private_dir(p: &std::path::Path) -> anyhow::Result<()> {
@@ -139,7 +165,22 @@ async fn main() -> anyhow::Result<()> {
         max_bytes: args.attachment_max_bytes,
         retention_days: args.attachment_retention_days,
     };
-    let shared = Arc::new(bridge::Shared::new(&state, cmd_tx, policy));
+    let inbox_policy = aqua_system_bridge::inbox::InboxPolicy {
+        max_entries: usize::try_from(args.inbox_max_entries).unwrap_or(usize::MAX),
+        max_age: (args.inbox_max_age_hours > 0)
+            .then(|| std::time::Duration::from_secs(args.inbox_max_age_hours.saturating_mul(3600))),
+        hard_cap: args.inbox_hard_cap,
+        accept_media: args.inbound_media == InboundMedia::Fetch,
+    };
+    let shared = Arc::new(bridge::Shared::new(&state, cmd_tx, policy, inbox_policy));
+    tracing::info!(
+        max_entries = inbox_policy.max_entries,
+        max_age_hours = args.inbox_max_age_hours,
+        hard_cap = inbox_policy.hard_cap,
+        accept_media = inbox_policy.accept_media,
+        held = shared.inbox.lock().unwrap().len(),
+        "inbox policy in force"
+    );
     let pruned = shared
         .attachments
         .prune(policy.retention_days, std::time::SystemTime::now());
@@ -150,6 +191,9 @@ async fn main() -> anyhow::Result<()> {
     let listener = bridge::bind_socket(&sock)?;
     tracing::info!(sock = %sock.display(), state = %state.display(), matrix = %args.matrix_url, "aqua-system-bridged starting");
     let server = tokio::spawn(bridge::serve(listener, shared.clone()));
+    let sweeper = inbox_policy
+        .max_age
+        .map(|_| tokio::spawn(bridge::retention_loop(shared.clone())));
 
     let shutdown = Arc::new(Notify::new());
     spawn_shutdown_listener(shutdown.clone());
@@ -165,6 +209,9 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     server.abort();
+    if let Some(h) = sweeper {
+        h.abort();
+    }
     let _ = std::fs::remove_file(&sock);
     tracing::info!("aqua-system-bridged stopped");
     Ok(())
