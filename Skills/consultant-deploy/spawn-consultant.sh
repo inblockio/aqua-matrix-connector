@@ -30,6 +30,27 @@
 # a loud warning and is mounted as-is (never destructive). Skip the freshness pass
 # (presence stays fatal) with --no-refresh-refs.
 #
+# Extra refs (per consultant, opt-in): REFS_REPOS is fleet-wide, every consultant mounts it. A
+# consultant that needs MORE repos (private ones included) lists them in
+# <test-dir>/<key>-extra-refs.list (key = the label, or "generic" for --generic): one repo name
+# per line, `#` comments and blank lines ignored, names limited to [A-Za-z0-9._-] with no "..";
+# an invalid line aborts the spawn before anything changes. Each listed repo is mounted
+# read-only at /refs/<repo> into THAT consultant only, from a CLEAN single-branch clone of
+# GitHub's default branch at <mirror>/<repo>, never from a working checkout (untracked .env or
+# target/ would ride along). <mirror> = ${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs},
+# on disk, never /tmp (RAM-backed tmpfs here). A missing mirror is cloned, a present one
+# fast-forwarded. FAIL-CLOSED, unlike the fleet pass: a clone/fetch failure, a non-fast-forward,
+# or ANY local change in a mirror (modified, untracked or ignored files) aborts the spawn.
+# --no-refresh-refs (and so --print-run) mounts the mirrors as-is: no clone, no fetch, but a
+# missing or dirty mirror still aborts. A listed repo that is already in REFS_REPOS is skipped
+# with a note (the fleet mount wins).
+#
+# Rooms (per consultant, opt-in): when the directory <test-dir>/<key>-rooms/ exists it is
+# mounted read-only at /agent/rooms, and <test-dir>/<key>-room-state/ (created when missing,
+# never wiped, not even by --fresh) is mounted WRITABLE at /agent/room-state with the same `:U`
+# as /agent/memory: the room turns' own Claude config, transcripts and notes, kept apart from
+# the owner's DM memory. No rooms dir = neither mount, no warning.
+#
 # A template prompt change reaches EXISTING consultants via --refresh-prompt: it adopts
 # the template's system_prompt/description/ref_mounts into the kept config, preserving
 # hello/homeserver customizations and identity. Fleet-wide:
@@ -90,8 +111,9 @@
 #
 # --print-run: assemble everything, print the `podman run` argument vector one arg per line,
 # exit 0. Stops BEFORE any container, systemd unit, DM, --replace removal or --fresh wipe,
-# and implies --no-refresh-refs (presence of every refs repo is still checked). It DOES
-# render/patch the config file and create the persist dirs, since those are the run's
+# and implies --no-refresh-refs (presence of every refs repo is still checked; extra-refs
+# mirrors must also be clean). It DOES render/patch the config file and create the persist
+# dirs (and a rooms consultant's room-state dir), since those are the run's
 # inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
 #
 # Owner rule (Tim, 2026-09-29): every consultant has exactly ONE authoritative Owner, its single
@@ -121,6 +143,8 @@
 #   CONSULTANT_TEST_DIR     dir holding configs/persist/avatars/template (default ~/.aqua-matrix-test)
 #   CONSULTANT_TEMPLATE     config template path (default $CONSULTANT_TEST_DIR/consultant-config.template.json)
 #   CONSULTANT_REFS_BASE    parent dir of the REFS_REPOS checkouts (default /home/waldknoten-01)
+#   CONSULTANT_REFS_MIRROR  root of the extra-refs mirrors (default $HOME/.local/share/consultant-refs; never /tmp)
+#   CONSULTANT_REFS_REMOTE  clone base of the extra refs, <base>/<repo>.git (default https://github.com/inblockio)
 #   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
 #   AQUA_CLAUDE_TOKEN_FILE  OAuth token file (default ~/.aqua-matrix-heartbeat/claude-oauth-token)
 #   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
@@ -197,6 +221,10 @@ PERSONA_HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/consultant-perso
 # the freshness pass, and the podman -v flags, so the three can never drift apart.
 # Keep it in sync with ref_mounts in consultant-config.template.json.
 REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
+# Per-consultant extra refs (<key>-extra-refs.list): clean clones live under REFS_MIRROR, one
+# dir per repo, cloned from REFS_REMOTE/<repo>.git. Disk only: /tmp is RAM-backed on this host.
+REFS_MIRROR="${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs}"
+REFS_REMOTE="${CONSULTANT_REFS_REMOTE:-https://github.com/inblockio}"
 
 # Print the leading comment block (line 2 through the line before `set -euo pipefail`),
 # so this stays correct as the header grows.
@@ -263,6 +291,9 @@ else
   esac
   STEM="${LABEL}-aqua-consultant"
 fi
+# KEY names the per-consultant host assets in TEST_DIR (<key>-avatar.jpg, <key>-extra-refs.list,
+# <key>-rooms/): the label, or "generic" for the un-labeled consultant.
+if [ "$GENERIC" -eq 1 ]; then KEY="generic"; else KEY="$LABEL"; fi
 
 NAME="aqua-agent-${STEM}-1"
 CFG="$TEST_DIR/${STEM}-config.json"
@@ -437,6 +468,41 @@ if [ "$PRINT_ONBOARDING" -eq 1 ]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------- extra refs: read the list
+# <key>-extra-refs.list is parsed and validated HERE, before the Owner step, the config render
+# or any clone, so a bad line aborts with nothing changed. Names are plain GitHub repo names:
+# [A-Za-z0-9._-] only, so no slash and no ".." can steer the mirror path or the /refs mount.
+# A name already in REFS_REPOS is skipped (the fleet mount wins), a repeated one is dropped.
+EXTRA_REFS_LIST="$TEST_DIR/${KEY}-extra-refs.list"
+EXTRA_REFS=()
+read_extra_refs() {
+  local line name n=0 r
+  [ -f "$EXTRA_REFS_LIST" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n+1))
+    name="${line%%#*}"
+    name="${name#"${name%%[![:space:]]*}"}"   # trim leading whitespace
+    name="${name%"${name##*[![:space:]]}"}"   # trim trailing whitespace (also a CR)
+    [ -n "$name" ] || continue
+    if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$name" = . ] || [[ "$name" == *..* ]]; then
+      echo "!! extra refs: $EXTRA_REFS_LIST line $n: invalid repo name '$name'" >&2
+      echo "   one plain repo name per line: [A-Za-z0-9._-] only, no slash, no '..'" >&2
+      return 1
+    fi
+    for r in "${REFS_REPOS[@]}"; do
+      if [ "$r" = "$name" ]; then
+        echo ">> extra refs: $name is already fleet-mounted (REFS_REPOS), skipped"
+        continue 2
+      fi
+    done
+    for r in "${EXTRA_REFS[@]}"; do
+      [ "$r" != "$name" ] || continue 2
+    done
+    EXTRA_REFS+=( "$name" )
+  done < "$EXTRA_REFS_LIST"
+}
+read_extra_refs || { echo "!! aborting: fix $EXTRA_REFS_LIST (nothing was changed)" >&2; exit 2; }
+
 # ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
 # `--target did:...` is resolved through siwx-oidc's public GET /resolve?did=, which applies
 # the server's own grandfathering rule. Any failure is FATAL: a guessed legacy MXID for a DID
@@ -600,20 +666,93 @@ for repo in "${REFS_REPOS[@]}"; do
   REF_MOUNT_ARGS+=( -v "$REFS_BASE/$repo:/refs/$repo:ro" )
 done
 
+# Extra refs (EXTRA_REFS, from <key>-extra-refs.list): clean single-branch clones of each
+# repo's default branch under REFS_MIRROR. The whole tree is readable in the container, so the
+# mirror must be exactly what upstream has: FAIL-CLOSED on a missing mirror under
+# --no-refresh-refs, a failed clone or fetch, a non-fast-forward, and ANY local change
+# (modified, untracked OR ignored files). Never prompts for credentials (GIT_TERMINAL_PROMPT=0);
+# private repos authenticate through the host's git credential helper.
+sync_extra_refs() {
+  local repo dir st before
+  for repo in "${EXTRA_REFS[@]}"; do
+    dir="$REFS_MIRROR/$repo"
+    if [ ! -e "$dir" ]; then
+      if [ "$REFRESH_REFS" -eq 0 ]; then
+        echo "!! extra refs: mirror MISSING: $dir (nothing is cloned under --no-refresh-refs / --print-run)" >&2
+        echo "   run once without --no-refresh-refs, or:  git clone --single-branch $REFS_REMOTE/${repo}.git $dir" >&2
+        return 1
+      fi
+      mkdir -p "$REFS_MIRROR"
+      if ! GIT_TERMINAL_PROMPT=0 git clone --quiet --single-branch "$REFS_REMOTE/${repo}.git" "$dir"; then
+        echo "!! extra refs: clone FAILED for $repo ($REFS_REMOTE/${repo}.git)" >&2
+        return 1
+      fi
+      echo ">> extra refs: $repo cloned ($(git -C "$dir" rev-parse --abbrev-ref HEAD) at $(git -C "$dir" rev-parse --short HEAD))"
+      continue
+    fi
+    if [ ! -d "$dir/.git" ]; then
+      echo "!! extra refs: $dir is not a git clone; refusing to mount it" >&2
+      return 1
+    fi
+    if ! st="$(git -C "$dir" status --porcelain --ignored 2>&1)"; then
+      echo "!! extra refs: cannot read the status of $dir: $st" >&2
+      return 1
+    fi
+    if [ -n "$st" ]; then
+      echo "!! extra refs: mirror $dir has LOCAL CHANGES (modified, untracked or ignored files); refusing to mount it" >&2
+      echo "   inspect: git -C $dir status --ignored   (or delete the dir; the next spawn re-clones it)" >&2
+      return 1
+    fi
+    [ "$REFRESH_REFS" -eq 1 ] || continue
+    before="$(git -C "$dir" rev-parse HEAD)"
+    if ! GIT_TERMINAL_PROMPT=0 git -C "$dir" pull --ff-only --quiet; then
+      echo "!! extra refs: fetch / fast-forward FAILED for $repo (offline, or the mirror diverged from upstream)" >&2
+      return 1
+    fi
+    if [ "$(git -C "$dir" rev-parse HEAD)" != "$before" ]; then
+      echo ">> extra refs: $repo fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
+    fi
+  done
+}
+if [ "${#EXTRA_REFS[@]}" -gt 0 ]; then
+  sync_extra_refs || { echo "!! aborting: extra refs mirror not usable, see above (nothing was launched)" >&2; exit 1; }
+  for repo in "${EXTRA_REFS[@]}"; do
+    REF_MOUNT_ARGS+=( -v "$REFS_MIRROR/$repo:/refs/$repo:ro" )
+  done
+  if [ "$REFRESH_REFS" -eq 1 ]; then EXTRA_MODE="up to date with upstream"; else EXTRA_MODE="as-is, freshness pass skipped"; fi
+  echo ">> extra refs: ${#EXTRA_REFS[@]} repo(s) from $REFS_MIRROR ($EXTRA_MODE), ro at /refs: ${EXTRA_REFS[*]}"
+fi
+
 # ---------------------------------------------------------------- avatar mount
 # Each consultant has a female profile picture at <test-dir>/<key>-avatar.jpg, bind-mounted
 # read-only at /agent/avatar.png (the fixed path the agent reads to set its Matrix avatar;
 # the agent re-uploads only when the file fingerprint changes). key = the label, or "generic"
 # for the un-labeled consultant. Override the source with --avatar PATH. A missing asset is a
 # non-fatal warning so a consultant without one still launches (just with no avatar).
-if [ "$GENERIC" -eq 1 ]; then AVATAR_KEY="generic"; else AVATAR_KEY="$LABEL"; fi
-AVATAR_SRC="${AVATAR:-$TEST_DIR/${AVATAR_KEY}-avatar.jpg}"
+AVATAR_SRC="${AVATAR:-$TEST_DIR/${KEY}-avatar.jpg}"
 AVATAR_MOUNT_ARGS=()
 if [ -f "$AVATAR_SRC" ]; then
   AVATAR_MOUNT_ARGS+=( -v "$AVATAR_SRC:/agent/avatar.png:ro" )
   echo ">> avatar: mounting $AVATAR_SRC at /agent/avatar.png"
 else
-  echo "!! avatar: no asset at $AVATAR_SRC; launching without an avatar (drop a ${AVATAR_KEY}-avatar.jpg there, or pass --avatar PATH)" >&2
+  echo "!! avatar: no asset at $AVATAR_SRC; launching without an avatar (drop a ${KEY}-avatar.jpg there, or pass --avatar PATH)" >&2
+fi
+
+# ---------------------------------------------------------------- rooms mounts (optional)
+# A consultant with a <test-dir>/<key>-rooms/ directory gets it read-only at /agent/rooms, plus
+# its own WRITABLE <test-dir>/<key>-room-state/ at /agent/room-state: the room turns' Claude
+# config dir, transcripts and notes, kept physically apart from /agent/memory (the owner's DM
+# transcripts, which room turns must never read). room-state is durable like the persist dir:
+# created when missing, never wiped (not even by --fresh), and mounted exactly like
+# /agent/memory (`mkdir -p` here, `:U` so podman chowns it to the container's agent user).
+# No rooms dir = neither mount and no warning, so every other consultant's argv is unchanged.
+ROOMS_SRC="$TEST_DIR/${KEY}-rooms"
+ROOM_STATE="$TEST_DIR/${KEY}-room-state"
+ROOMS_MOUNT_ARGS=()
+if [ -d "$ROOMS_SRC" ]; then
+  mkdir -p "$ROOM_STATE"
+  ROOMS_MOUNT_ARGS+=( -v "$ROOMS_SRC:/agent/rooms:ro" -v "$ROOM_STATE:/agent/room-state:U" )
+  echo ">> rooms: mounting $ROOMS_SRC read-only at /agent/rooms, room state $ROOM_STATE writable at /agent/room-state"
 fi
 
 # ---------------------------------------------------------------- notify (best effort)
@@ -797,6 +936,7 @@ RUN_ARGS=( \
   -v "$MEM:/agent/memory:U" \
   "${REF_MOUNT_ARGS[@]}" \
   "${AVATAR_MOUNT_ARGS[@]}" \
+  "${ROOMS_MOUNT_ARGS[@]}" \
   "$IMAGE" \
 )
 

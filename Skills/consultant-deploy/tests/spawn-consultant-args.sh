@@ -24,6 +24,14 @@
 #     FAIL with no legacy-form fallback), --siwx-url/--matrix-url reach the argv only when set,
 #     --print-mxid reads [session] user_id and nothing else, and the script holds no DID->MXID
 #     string derivation
+#   - extra refs (case I): <key>-extra-refs.list parsing (comments, blanks, CR, duplicates, a
+#     fleet repo skipped with a note), every bad name aborts with exit 2 before any render, mounts
+#     land :ro at /refs/<repo> from the default mirror root; the script's own sync_extra_refs
+#     (extracted) clones single-branch, fast-forwards, and aborts on untracked / ignored /
+#     modified files, a failed clone, a diverged mirror and a missing mirror under no-refresh
+#   - rooms (case I): <key>-rooms -> /agent/rooms:ro plus <key>-room-state (created, kept across
+#     re-spawns) at /agent/room-state with the same option as /agent/memory; --generic uses the
+#     key "generic"; a consultant with neither file gets exactly today's argv
 #   - the podman/systemctl shims were never called
 #
 # Usage:  bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
@@ -354,6 +362,143 @@ check "--print-mxid with no session: exit 1" [ "$rc" -eq 1 ]
 
 check "spawn-consultant.sh holds no DID->MXID string derivation" \
   bash -c '! grep -nE "did-key-%s|did-pkh-%s|tr .\[:upper:\]. .\[:lower:\].|tr .:. .-." "$1"' _ "$SPAWN"
+
+echo "== case I: per-consultant extra refs (<key>-extra-refs.list) + rooms"
+# Mirrors go to the DEFAULT root under the sandbox HOME; the "GitHub" remote is a local dir of
+# bare repos (CONSULTANT_REFS_REMOTE). --print-run never clones, so the clone/fetch half is
+# exercised by running the script's own sync_extra_refs (extracted verbatim) in a subshell.
+MIRROR="$FAKE_HOME/.local/share/consultant-refs"
+REMOTE="$SB/remote"
+GITC=(git -c user.name=test -c user.email=test@example.invalid)
+mk_remote() {     # mk_remote <repo>: bare repo at $REMOTE/<repo>.git, main + a side branch
+  local w="$SB/work/$1"
+  git init -q -b main "$w"
+  printf 'hello %s\n' "$1" > "$w/README.md"
+  "${GITC[@]}" -C "$w" add README.md
+  "${GITC[@]}" -C "$w" commit -q -m init
+  "${GITC[@]}" -C "$w" branch side
+  git clone -q --bare "$w" "$REMOTE/$1.git"
+}
+upstream_commit() { # upstream_commit <repo>: one more commit on main, pushed to the bare remote
+  local w="$SB/work/$1"
+  date +%s%N >> "$w/README.md"
+  "${GITC[@]}" -C "$w" commit -q -am more
+  git -C "$w" push -q "$REMOTE/$1.git" main
+}
+mkdir -p "$REMOTE"
+mk_remote extra-one; mk_remote extra-two
+SYNC_FN="$(sed -n '/^sync_extra_refs() {$/,/^}$/p' "$SPAWN")"
+check "sync_extra_refs extracted from the script" grep -q 'git clone --quiet --single-branch' <(printf '%s\n' "$SYNC_FN")
+sync() {          # sync <name> <refresh 0|1> <repo...>: the script's sync_extra_refs, sandboxed
+  local name="$1" refresh="$2" rc=0; shift 2
+  ( set -euo pipefail; eval "$SYNC_FN"
+    REFS_MIRROR="$MIRROR"; REFS_REMOTE="$REMOTE"; REFRESH_REFS="$refresh"; EXTRA_REFS=("$@")
+    sync_extra_refs ) > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
+  return "$rc"
+}
+rc=0; sync s1 1 extra-one extra-two || rc=$?
+check "sync: missing mirrors are cloned (exit 0)" [ "$rc" -eq 0 ]
+check "sync: clone reported" grep -q '>> extra refs: extra-one cloned (main at ' "$SB/out/s1.out"
+check "sync: clone is single-branch (no side branch fetched)" \
+  bash -c '[ "$(git -C "$1" for-each-ref --format="%(refname)" refs/remotes | grep -c side)" -eq 0 ]' _ "$MIRROR/extra-one"
+upstream_commit extra-one
+rc=0; sync s2 1 extra-one extra-two || rc=$?
+check "sync: upstream ahead -> fast-forward (exit 0)" [ "$rc" -eq 0 ]
+check "sync: fast-forward reported for extra-one only" \
+  bash -c 'grep -q "extra-one fast-forwarded to" "$1" && ! grep -q extra-two "$1"' _ "$SB/out/s2.out"
+check "sync: mirror HEAD == upstream main" \
+  [ "$(git -C "$MIRROR/extra-one" rev-parse HEAD)" = "$(git -C "$REMOTE/extra-one.git" rev-parse main)" ]
+rc=0; sync s3 1 extra-one extra-two || rc=$?
+check "sync: up to date -> exit 0, silent" bash -c '[ "$1" -eq 0 ] && [ ! -s "$2" ]' _ "$rc" "$SB/out/s3.out"
+touch "$MIRROR/extra-one/untracked.txt"
+rc=0; sync s4 1 extra-one || rc=$?
+check "sync: untracked file -> abort" bash -c '[ "$1" -ne 0 ] && grep -q "has LOCAL CHANGES" "$2"' _ "$rc" "$SB/out/s4.err"
+rm -f "$MIRROR/extra-one/untracked.txt"
+echo 'secret.env' >> "$MIRROR/extra-one/.git/info/exclude"; touch "$MIRROR/extra-one/secret.env"
+rc=0; sync s5 0 extra-one || rc=$?
+check "sync: IGNORED file -> abort (also under --no-refresh-refs)" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "has LOCAL CHANGES" "$2"' _ "$rc" "$SB/out/s5.err"
+rm -f "$MIRROR/extra-one/secret.env"
+echo changed >> "$MIRROR/extra-one/README.md"
+rc=0; sync s6 1 extra-one || rc=$?
+check "sync: modified tracked file -> abort" [ "$rc" -ne 0 ]
+git -C "$MIRROR/extra-one" checkout -q -- README.md
+rc=0; sync s7 1 no-such-repo || rc=$?
+check "sync: clone failure -> abort, reported" bash -c '[ "$1" -ne 0 ] && grep -q "clone FAILED for no-such-repo" "$2"' _ "$rc" "$SB/out/s7.err"
+check "sync: failed clone leaves no dir behind" [ ! -e "$MIRROR/no-such-repo" ]
+rc=0; sync s8 0 extra-three || rc=$?
+check "sync: missing mirror under --no-refresh-refs -> abort, nothing cloned" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "mirror MISSING" "$2" && [ ! -e "$3" ]' _ "$rc" "$SB/out/s8.err" "$MIRROR/extra-three"
+"${GITC[@]}" -C "$MIRROR/extra-two" commit -q --allow-empty -m local-only
+upstream_commit extra-two
+rc=0; sync s9 1 extra-two || rc=$?
+check "sync: diverged mirror (non-fast-forward) -> abort" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "fetch / fast-forward FAILED for extra-two" "$2"' _ "$rc" "$SB/out/s9.err"
+rm -rf "$MIRROR/extra-two"; sync s10 1 extra-two || true
+check "sync: a deleted mirror is simply re-cloned" [ -d "$MIRROR/extra-two/.git" ]
+
+printf '%s\n' '# extra refs for iota' 'extra-one' '  extra-two   # trailing comment' 'aqua-rs-sdk' '' 'extra-one' > "$TEST_DIR/iota-extra-refs.list"
+printf 'extra-two\r\n' >> "$TEST_DIR/iota-extra-refs.list"
+rc=0; run i1 --label iota --target "$TARGET" --persona Thalia --name Tester || rc=$?
+check "list: exit 0" [ "$rc" -eq 0 ]
+check "list: extra-one mounted :ro from the default mirror root" argv_has_line i1 "$MIRROR/extra-one:/refs/extra-one:ro"
+check "list: extra-two mounted :ro from the default mirror root" argv_has_line i1 "$MIRROR/extra-two:/refs/extra-two:ro"
+check "list: 6 fleet + 2 extra /refs mounts, each right after -v" \
+  bash -c '[ "$(awk "prev==\"-v\" && /:\/refs\/[^:]*:ro\$/ {n++} {prev=\$0} END{print n+0}" "$1")" -eq 8 ]' _ "$SB/out/i1.argv"
+check "list: fleet repo skipped with a note, mounted once from the fleet checkout" \
+  bash -c 'grep -q "aqua-rs-sdk is already fleet-mounted (REFS_REPOS), skipped" "$1" && [ "$(grep -c ":/refs/aqua-rs-sdk:ro$" "$2")" -eq 1 ] && grep -qx "$3/aqua-rs-sdk:/refs/aqua-rs-sdk:ro" "$2"' \
+  _ "$SB/out/i1.out" "$SB/out/i1.argv" "$REFS_BASE"
+check "list: one summary line (duplicates, comments, blanks, CR dropped)" \
+  grep -qxF ">> extra refs: 2 repo(s) from $MIRROR (as-is, freshness pass skipped), ro at /refs: extra-one extra-two" "$SB/out/i1.out"
+check "list: no rooms mounts without a rooms dir" bash -c '! grep -q "/agent/room" "$1"' _ "$SB/out/i1.argv"
+
+for bad in '../etc' 'a/b' '..' '.' 'a..b' 'has space' 'x;y' '$(id)'; do
+  printf '%s\n' extra-one "$bad" > "$TEST_DIR/kappa-extra-refs.list"
+  rc=0; run i2 --label kappa --target "$TARGET" --persona Thalia || rc=$?
+  check "bad name '$bad': exit 2, named, no argv, no config rendered" \
+    bash -c '[ "$1" -eq 2 ] && grep -qF "line 2: invalid repo name" "$2" && [ ! -s "$3" ] && [ ! -e "$4" ]' \
+    _ "$rc" "$SB/out/i2.err" "$SB/out/i2.argv" "$TEST_DIR/kappa-aqua-consultant-config.json"
+done
+rm -f "$TEST_DIR/kappa-extra-refs.list"
+
+printf 'extra-three\n' > "$TEST_DIR/lambda-extra-refs.list"
+rc=0; run i3 --label lambda --target "$TARGET" --persona Thalia || rc=$?
+check "missing mirror under --print-run: abort, nothing cloned, no argv" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "mirror MISSING" "$2" && [ ! -e "$3" ] && [ ! -s "$4" ]' \
+  _ "$rc" "$SB/out/i3.err" "$MIRROR/extra-three" "$SB/out/i3.argv"
+touch "$MIRROR/extra-two/notes.txt"
+rc=0; run i4 --label iota --target "$TARGET" --persona Thalia --name Tester || rc=$?
+check "dirty mirror under --print-run: abort, no argv" \
+  bash -c '[ "$1" -ne 0 ] && grep -q "has LOCAL CHANGES" "$2" && [ ! -s "$3" ]' _ "$rc" "$SB/out/i4.err" "$SB/out/i4.argv"
+rm -f "$MIRROR/extra-two/notes.txt"
+
+mkdir -p "$TEST_DIR/iota-rooms"
+rc=0; run i5 --label iota --target "$TARGET" --persona Thalia --name Tester || rc=$?
+check "rooms: exit 0" [ "$rc" -eq 0 ]
+check "rooms: <key>-rooms mounted read-only at /agent/rooms" argv_has_line i5 "$TEST_DIR/iota-rooms:/agent/rooms:ro"
+check "rooms: <key>-room-state created" [ -d "$TEST_DIR/iota-room-state" ]
+check "rooms: room-state mounted at /agent/room-state with the SAME option as /agent/memory" \
+  bash -c 'm="$(grep -E "^[^:]+:/agent/memory:" "$1" | sed "s/.*:\/agent\/memory//")"; [ -n "$m" ] && grep -qxF "$2:/agent/room-state$m" "$1"' \
+  _ "$SB/out/i5.argv" "$TEST_DIR/iota-room-state"
+echo keep > "$TEST_DIR/iota-room-state/note.md"
+rc=0; run i6 --replace --keep-config --label iota || rc=$?
+check "rooms: existing room-state kept across a re-spawn" bash -c '[ "$1" -eq 0 ] && [ "$(cat "$2")" = keep ]' _ "$rc" "$TEST_DIR/iota-room-state/note.md"
+check "rooms: --fresh never touches room-state (its rm -rf names only STORE/MEM)" \
+  bash -c '! grep -nE "rm -rf.*(ROOM|room)" "$1"' _ "$SPAWN"
+
+printf 'extra-two\n' > "$TEST_DIR/generic-extra-refs.list"; mkdir -p "$TEST_DIR/generic-rooms"
+rc=0; run i7 --generic --target "$TARGET" --persona Sabrina --name Operator || rc=$?
+check "generic: key 'generic' selects generic-extra-refs.list and generic-rooms" \
+  bash -c '[ "$1" -eq 0 ] && grep -qx "$2/extra-two:/refs/extra-two:ro" "$3" && grep -qx "$4/generic-rooms:/agent/rooms:ro" "$3"' \
+  _ "$rc" "$MIRROR" "$SB/out/i7.argv" "$TEST_DIR"
+rm -f "$TEST_DIR/generic-extra-refs.list"; rm -rf "$TEST_DIR/generic-rooms" "$TEST_DIR/generic-room-state"
+
+rc=0; run i8 --label mu --target "$TARGET" --persona Thalia || rc=$?
+check "default (no list, no rooms dir): exactly the six fleet /refs mounts, no rooms, no notes" \
+  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 6 ] && ! grep -q "/agent/room" "$2" && ! grep -q "extra refs\|rooms:" "$3" "$4" && [ ! -e "$5" ]' \
+  _ "$rc" "$SB/out/i8.argv" "$SB/out/i8.out" "$SB/out/i8.err" "$TEST_DIR/mu-room-state"
+check "mirror root default is on disk (~/.local/share), never /tmp" \
+  grep -qF 'REFS_MIRROR="${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs}"' "$SPAWN"
 
 echo "== side effects"
 check "podman/systemctl shims were never called" [ ! -e "$SIDE_EFFECTS" ]

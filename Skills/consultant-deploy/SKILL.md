@@ -244,6 +244,20 @@ the presence check, and the freshness pass are all driven by the single `REFS_RE
 list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 `consultant-config.template.json` (which the system prompt mirrors).
 
+**Per-consultant extra refs and rooms (opt-in).** `REFS_REPOS` reaches every consultant. A repo
+only ONE consultant may see (private ones included) goes in `<test-dir>/<key>-extra-refs.list`
+(key = label, or `generic`; one name per line, `#` comments): it is mounted `:ro` at
+`/refs/<repo>` into that consultant only, from a clean single-branch clone of the default branch
+under `${CONSULTANT_REFS_MIRROR:-~/.local/share/consultant-refs}` (never a working checkout,
+never /tmp). Unlike the fleet pass this is fail-closed: a bad name, a failed clone/fetch, a
+non-fast-forward or any local change in a mirror (ignored files included) aborts the spawn
+before the container is touched. A listed fleet repo is skipped. These mounts are NOT in
+`ref_mounts` and NOT in the system prompt; the agent reads them through its unscoped
+`Read`/`Glob`/`Grep`, so tell it about them in its own config if it should use them.
+A `<test-dir>/<key>-rooms/` dir is mounted `:ro` at `/agent/rooms`, together with a durable,
+writable `<test-dir>/<key>-room-state/` (created if missing, never wiped) at `/agent/room-state`
+with the same `:U` as `/agent/memory`. No list / no rooms dir = today's argv, byte for byte.
+
 ## Identity & lifecycle flags
 
 | Flag | Effect |
