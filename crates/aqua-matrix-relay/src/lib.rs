@@ -273,8 +273,10 @@ pub trait MessageHandler: Send + Sync + 'static {
 
     /// DID/MXID allow-deny SEAM. Default == today's exact behavior (single
     /// target, ASCII-case-insensitive — see [`mxid_authorized`] for why that is
-    /// both correct and safe against impersonation). [`dispatch`] and
-    /// `register_invite_autojoin` call THIS instead of the inline equality check.
+    /// both correct and safe against impersonation). `register_invite_autojoin`
+    /// and `dispatch_call` call THIS instead of the inline equality check;
+    /// inbound messages go through [`authorize_in_room`](Self::authorize_in_room),
+    /// whose default delegates here.
     /// SEAM(aqua-security): this is the white/blacklist hook keyed on DIDs — a
     /// future signature will take `sender_did: Option<&str>` plus a per-template
     /// allow/deny policy object (BOTH an allow-list AND a deny-list); the bool
@@ -283,11 +285,39 @@ pub trait MessageHandler: Send + Sync + 'static {
         mxid_authorized(sender_mxid, target)
     }
 
-    /// Handle one inbound text message from `target`. The relay has already
-    /// confirmed the sender and deduplicated by timestamp watermark, so this
-    /// fires at most once per message. Now takes a structured message and
-    /// returns `Result` so the relay owns uniform error logging (the relay
-    /// still never unwinds; it logs the `Err`).
+    /// Room-aware allow SEAM for inbound MESSAGES only. Default == exactly
+    /// [`authorize`](Self::authorize): `room_id` is ignored, so a handler that
+    /// does not override this behaves byte-for-byte as before. [`dispatch`] and
+    /// [`backfill_missed`] call THIS; invite auto-join and call signaling never
+    /// do, they stay on `authorize` (target only).
+    ///
+    /// Override to admit an extra sender inside ONE room only (an external
+    /// collaborator in a group room), without widening anything else: such a
+    /// sender can never make the agent join a room, become its `m.direct` peer,
+    /// or ring it. Keep `target` admitted everywhere (delegate to `authorize`
+    /// for it) and compare `room_id` exactly: it is the opaque `!id:server`
+    /// form, never an alias or a display name.
+    ///
+    /// What an override inherits: every admitted sender shares the ONE inbound
+    /// [`Watermark`], so a message no newer than one already dispatched from
+    /// ANOTHER room is dropped, and backfill does not bring it back. The
+    /// restart paths assume `target` too (`replay_inbox` presents a replayed
+    /// message as sent by `target`, `drain_deliveries` redelivers into the
+    /// `target` DM). Answer room-scoped messages in their room via
+    /// `msg.room_id`, and read `msg.sender_mxid`, never `target`, as the author.
+    // The default ignores `room_id` by design (see above).
+    #[allow(unused_variables)]
+    fn authorize_in_room(&self, sender_mxid: &str, room_id: &str, target: &str) -> bool {
+        self.authorize(sender_mxid, target)
+    }
+
+    /// Handle one inbound message from `target` (or from a sender an
+    /// [`authorize_in_room`](Self::authorize_in_room) override admits in
+    /// `msg.room_id`). The relay has already confirmed the sender and
+    /// deduplicated by timestamp watermark, so this fires at most once per
+    /// message. Now takes a structured message and returns `Result` so the
+    /// relay owns uniform error logging (the relay still never unwinds; it logs
+    /// the `Err`).
     async fn handle_message(
         &self,
         agent: &AgentClient,
@@ -913,6 +943,10 @@ fn register_invite_autojoin<H: MessageHandler>(
                 // (was: any inviter) — the default `authorize` keeps the
                 // case-insensitive single-peer check. Safe under the strict
                 // single-peer DM design; messaging/dispatch behavior unchanged.
+                // Deliberately `authorize`, never `authorize_in_room`: a
+                // room-scoped sender must never make the agent join a room, and
+                // a join here is followed by `mark_dm(.., target)`, which would
+                // also make that room the agent's `m.direct` DM with its peer.
                 if !handler.authorize(ev.sender.as_str(), &target) {
                     warn_on_case_only_drop(ev.sender.as_str(), &target, handler.role(), "invite");
                     return;
@@ -1052,6 +1086,10 @@ async fn dispatch_call<H: MessageHandler>(
     sender: &str,
     room_id: &str,
 ) {
+    // Deliberately `authorize`, never `authorize_in_room`, even though the room
+    // is known here: a sender admitted for messages in one room must never be
+    // able to ring the agent or reach `on_call`, whose contract is "from
+    // `target`" (a handler may well ring `target` back from it).
     if !handler.authorize(sender, target) {
         warn_on_case_only_drop(sender, target, handler.role(), "call");
         return;
@@ -1142,13 +1180,15 @@ async fn backfill_missed<H: MessageHandler>(
                         continue;
                     }
                     // `sender` is plaintext even on an undecryptable event, so
-                    // the peer check works for both kinds.
-                    let from_peer = event
-                        .raw()
-                        .get_field::<String>("sender")
-                        .ok()
-                        .flatten()
-                        .is_some_and(|sender| handler.authorize(&sender, target));
+                    // the peer check works for both kinds. Room-aware, exactly
+                    // as in `dispatch`: the room is known here.
+                    let sender = event.raw().get_field::<String>("sender").ok().flatten();
+                    let from_peer = backfill_sender_admitted(
+                        handler.as_ref(),
+                        sender.as_deref(),
+                        room.room_id().as_str(),
+                        target,
+                    );
                     match backfill_verdict(ts, since, from_peer, event.kind.is_utd()) {
                         BackfillVerdict::Skip => continue,
                         BackfillVerdict::Undecryptable => {
@@ -1264,6 +1304,22 @@ fn backfill_verdict(
     }
 }
 
+/// The `from_peer` input of [`backfill_verdict`]: is this backfilled event's
+/// `sender` admitted in `room_id`? Same [`MessageHandler::authorize_in_room`]
+/// check as [`dispatch`], so backfill and the live stream can never disagree
+/// about who is admitted where ("peer" then also covers a sender an override
+/// admits in that one room). An event with no readable `sender` is never
+/// admitted. Split out of [`backfill_missed`] so the room-aware decision is
+/// testable without a Matrix client.
+fn backfill_sender_admitted<H: MessageHandler>(
+    handler: &H,
+    sender: Option<&str>,
+    room_id: &str,
+    target: &str,
+) -> bool {
+    sender.is_some_and(|sender| handler.authorize_in_room(sender, room_id, target))
+}
+
 async fn dispatch<H: MessageHandler>(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -1278,8 +1334,10 @@ async fn dispatch<H: MessageHandler>(
     // case-insensitively: Synapse canonicalises MXIDs to lowercase, so
     // `ev.sender` is lowercased, while a `--target` derived from a mixed-case
     // `did:key` is not — an exact compare would silently drop every inbound
-    // message from such a peer.
-    if !handler.authorize(ev.sender.as_str(), target) {
+    // message from such a peer. Room-aware: the default `authorize_in_room` is
+    // exactly `authorize`; only an override admits another sender, and only in
+    // the rooms it names.
+    if !handler.authorize_in_room(ev.sender.as_str(), room.room_id().as_str(), target) {
         warn_on_case_only_drop(ev.sender.as_str(), target, handler.role(), "message");
         return;
     }
@@ -1595,7 +1653,10 @@ impl Watermark {
 
 #[cfg(test)]
 mod auth_tests {
-    use super::{is_case_only_mismatch, mxid_authorized, validate_target};
+    use super::{
+        async_trait, is_case_only_mismatch, mxid_authorized, validate_target, AgentClient,
+        InboundMessage, MessageHandler,
+    };
 
     // The real fleet's two contrasting peers: one all-lowercase localpart, one
     // mixed-case `did:key`. Synapse delivers `ev.sender` lowercased in both
@@ -1677,6 +1738,148 @@ mod auth_tests {
         assert!(!validate_target("missing-at:matrix.inblock.io", "test"));
         assert!(!validate_target("@:matrix.inblock.io", "test")); // empty localpart
         assert!(!validate_target("@user:", "test")); // empty server
+    }
+
+    // Room-scoped admission (`authorize_in_room`). Three rooms: the DM with the
+    // target, the one group room a policy lists, and an unrelated room. Shared
+    // with `backfill_verdict_tests`, which checks the backfill path against the
+    // same two handlers.
+    pub(super) const DM_ROOM: &str = "!dmroom:matrix.inblock.io";
+    pub(super) const GROUP_ROOM: &str = "!grouproom:matrix.inblock.io";
+    pub(super) const OTHER_ROOM: &str = "!otherroom:matrix.inblock.io";
+    pub(super) const COLLABORATOR: &str = "@collaborator:matrix.inblock.io";
+    const STRANGER: &str = "@stranger:matrix.inblock.io";
+    const ROOMS: [&str; 4] = [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""];
+
+    /// Overrides nothing it does not have to: every consultant in the fleet.
+    pub(super) struct DefaultHandler;
+
+    #[async_trait]
+    impl MessageHandler for DefaultHandler {
+        fn role(&self) -> &str {
+            "test-default"
+        }
+        async fn handle_message(
+            &self,
+            _agent: &AgentClient,
+            _target: &str,
+            _msg: &InboundMessage<'_>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A room policy: `target` everywhere, plus `COLLABORATOR` in `GROUP_ROOM`
+    /// and nowhere else. The shape a consultant with one external collaborator
+    /// in one group room would use.
+    pub(super) struct RoomPolicyHandler;
+
+    #[async_trait]
+    impl MessageHandler for RoomPolicyHandler {
+        fn role(&self) -> &str {
+            "test-room-policy"
+        }
+        fn authorize_in_room(&self, sender_mxid: &str, room_id: &str, target: &str) -> bool {
+            self.authorize(sender_mxid, target)
+                || (room_id == GROUP_ROOM && mxid_authorized(sender_mxid, COLLABORATOR))
+        }
+        async fn handle_message(
+            &self,
+            _agent: &AgentClient,
+            _target: &str,
+            _msg: &InboundMessage<'_>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The default must be `authorize` (so `mxid_authorized`) for every sender
+    /// in every room, the case fold included: the fleet's firewall may not move
+    /// by a byte because a room id is now passed along.
+    #[test]
+    fn default_authorize_in_room_is_exactly_authorize() {
+        let h = DefaultHandler;
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        let senders = [
+            TARGET_MIXED,
+            delivered.as_str(),
+            TARGET_LOWER,
+            COLLABORATOR,
+            STRANGER,
+            "",
+            "@\u{0130}:matrix.inblock.io",
+        ];
+        for target in [TARGET_MIXED, TARGET_LOWER, "@i:matrix.inblock.io"] {
+            for sender in senders {
+                for room in ROOMS {
+                    assert_eq!(
+                        h.authorize_in_room(sender, room, target),
+                        mxid_authorized(sender, target),
+                        "{sender:?} in {room:?} against {target:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_admits_target_in_any_room() {
+        let h = DefaultHandler;
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        for room in ROOMS {
+            assert!(h.authorize_in_room(&delivered, room, TARGET_MIXED), "{room:?}");
+            assert!(h.authorize_in_room(TARGET_LOWER, room, TARGET_LOWER), "{room:?}");
+        }
+    }
+
+    /// Including `GROUP_ROOM`: without an override, being in the room a policy
+    /// would list admits nobody.
+    #[test]
+    fn default_denies_every_non_target_in_every_room() {
+        let h = DefaultHandler;
+        for room in ROOMS {
+            for sender in [COLLABORATOR, STRANGER, TARGET_LOWER] {
+                assert!(
+                    !h.authorize_in_room(sender, room, TARGET_MIXED),
+                    "{sender:?} must not be admitted in {room:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn room_policy_admits_collaborator_only_in_its_room() {
+        let h = RoomPolicyHandler;
+        assert!(h.authorize_in_room(COLLABORATOR, GROUP_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(COLLABORATOR, DM_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(COLLABORATOR, OTHER_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(COLLABORATOR, "", TARGET_MIXED));
+    }
+
+    #[test]
+    fn room_policy_keeps_target_everywhere() {
+        let h = RoomPolicyHandler;
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        for room in ROOMS {
+            assert!(h.authorize_in_room(&delivered, room, TARGET_MIXED), "{room:?}");
+        }
+    }
+
+    #[test]
+    fn room_policy_denies_unrelated_sender_in_its_room() {
+        let h = RoomPolicyHandler;
+        assert!(!h.authorize_in_room(STRANGER, GROUP_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(TARGET_LOWER, GROUP_ROOM, TARGET_MIXED));
+    }
+
+    /// Invite auto-join and call signaling call `authorize`, which a room
+    /// policy leaves at `{target}`: the collaborator can never make the agent
+    /// join a room, become its `m.direct` peer, or ring it.
+    #[test]
+    fn room_policy_does_not_widen_authorize() {
+        let h = RoomPolicyHandler;
+        assert!(!h.authorize(COLLABORATOR, TARGET_MIXED));
+        assert!(h.authorize(&TARGET_MIXED.to_ascii_lowercase(), TARGET_MIXED));
     }
 }
 
@@ -1819,7 +2022,13 @@ mod watermark_tests {
 
 #[cfg(test)]
 mod backfill_verdict_tests {
-    use super::{backfill_verdict, mxid_authorized, BackfillVerdict};
+    use super::auth_tests::{
+        DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM,
+    };
+    use super::{
+        backfill_sender_admitted, backfill_verdict, mxid_authorized, BackfillVerdict,
+        MessageHandler,
+    };
 
     const PEER: &str = "@did-key-z6mkpeer:matrix.inblock.io";
     const AGENT: &str = "@did-key-z6mkagent:matrix.inblock.io";
@@ -1869,5 +2078,62 @@ mod backfill_verdict_tests {
         assert_eq!(verdict(WATERMARK + 1, PEER, true), BackfillVerdict::Undecryptable);
         assert_eq!(verdict(WATERMARK + 1, AGENT, true), BackfillVerdict::Skip);
         assert_eq!(verdict(WATERMARK - 1, PEER, true), BackfillVerdict::Skip);
+    }
+
+    /// Verdict for one event in `room`, through the same room-aware sender
+    /// check `backfill_missed` uses.
+    fn room_verdict<H: MessageHandler>(
+        h: &H,
+        ts: u64,
+        sender: &str,
+        room: &str,
+        utd: bool,
+    ) -> BackfillVerdict {
+        backfill_verdict(ts, WATERMARK, backfill_sender_admitted(h, Some(sender), room, PEER), utd)
+    }
+
+    /// Backfill must agree with `dispatch` about who is admitted where: a
+    /// sender a room policy admits is owed its missed messages in that room,
+    /// and only there, or a message it sent during the handler-less window
+    /// would be lost (or, the other way round, admitted in the wrong room).
+    #[test]
+    fn backfill_owes_room_scoped_sender_only_in_its_room() {
+        use BackfillVerdict::{Dispatch, Skip, Undecryptable};
+        let h = RoomPolicyHandler;
+        let fresh = WATERMARK + 1;
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, GROUP_ROOM, false), Dispatch);
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, DM_ROOM, false), Skip);
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, OTHER_ROOM, false), Skip);
+        // Its undecryptable events count as a key-sharing signal only where it
+        // is admitted.
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, GROUP_ROOM, true), Undecryptable);
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, DM_ROOM, true), Skip);
+        // The watermark still gates it like any other sender.
+        assert_eq!(room_verdict(&h, WATERMARK, COLLABORATOR, GROUP_ROOM, false), Skip);
+        // The target stays owed everywhere; the agent's own messages nowhere.
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            assert_eq!(room_verdict(&h, fresh, PEER, room, false), Dispatch);
+            assert_eq!(room_verdict(&h, fresh, AGENT, room, false), Skip);
+        }
+    }
+
+    /// Without an override the room-aware backfill check is the old peer
+    /// check: the target in any room, nobody else in any room.
+    #[test]
+    fn backfill_default_handler_owes_only_the_target() {
+        use BackfillVerdict::{Dispatch, Skip};
+        let h = DefaultHandler;
+        let fresh = WATERMARK + 1;
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            assert_eq!(room_verdict(&h, fresh, PEER, room, false), Dispatch);
+            assert_eq!(room_verdict(&h, fresh, COLLABORATOR, room, false), Skip);
+            assert_eq!(room_verdict(&h, fresh, AGENT, room, false), Skip);
+        }
+    }
+
+    #[test]
+    fn backfill_event_without_sender_is_never_admitted() {
+        assert!(!backfill_sender_admitted(&DefaultHandler, None, DM_ROOM, PEER));
+        assert!(!backfill_sender_admitted(&RoomPolicyHandler, None, GROUP_ROOM, PEER));
     }
 }
