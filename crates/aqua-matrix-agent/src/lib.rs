@@ -280,6 +280,9 @@ pub struct AgentConfig {
     pub device_id: Option<String>,
 }
 
+/// The `body` [`AgentClient::messages`] gives an event it could not decrypt.
+pub const UNDECRYPTABLE_BODY: &str = "[unable to decrypt]";
+
 pub struct Message {
     pub sender: String,
     pub body: String,
@@ -298,6 +301,12 @@ impl Message {
         self.mentioned_user_ids
             .iter()
             .any(|id| id.eq_ignore_ascii_case(mxid))
+    }
+
+    /// Whether this is the placeholder for an event [`AgentClient::messages`]
+    /// could not decrypt (no text, no mentions), not a real message.
+    pub fn is_undecryptable(&self) -> bool {
+        self.body == UNDECRYPTABLE_BODY && self.mentioned_user_ids.is_empty()
     }
 }
 
@@ -2251,7 +2260,7 @@ impl AgentClient {
             if event.kind.is_utd() {
                 messages.push(Message {
                     sender: sender.to_string(),
-                    body: "[unable to decrypt]".into(),
+                    body: UNDECRYPTABLE_BODY.into(),
                     timestamp_ms: u64::from(timestamp.0),
                     event_id: event_id.to_string(),
                     mentioned_user_ids: Vec::new(),
@@ -3002,6 +3011,24 @@ mod tests {
     use std::fs;
 
     const TIM: &str = "@did-pkh-eip155-1-0xabc:example.org";
+
+    /// `messages()` marks an undecryptable event by its placeholder body; a
+    /// real message is never taken for one, even one quoting the placeholder
+    /// with a mention (a placeholder carries none).
+    #[test]
+    fn undecryptable_placeholder_is_recognised() {
+        let msg = |body: &str, mentions: Vec<String>| Message {
+            sender: TIM.into(),
+            body: body.into(),
+            timestamp_ms: 1,
+            event_id: "$e".into(),
+            mentioned_user_ids: mentions,
+        };
+        assert!(msg(UNDECRYPTABLE_BODY, vec![]).is_undecryptable());
+        assert!(!msg("hello", vec![]).is_undecryptable());
+        assert!(!msg("[unable to decrypt] really?", vec![]).is_undecryptable());
+        assert!(!msg(UNDECRYPTABLE_BODY, vec![TIM.into()]).is_undecryptable());
+    }
 
     /// The wire JSON of a mention message: `m.mentions.user_ids` names exactly
     /// the user, `formatted_body` ends with the matrix.to pill, `body` carries
