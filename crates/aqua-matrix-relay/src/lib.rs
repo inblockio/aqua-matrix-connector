@@ -72,7 +72,7 @@ use matrix_sdk::{
 pub use aqua_matrix_agent::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
     is_unknown_token, load_dotenv, ConnectErrorClass, ConnectOutcome, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
-    TypingGuard, WorkItem, WorkJournal, WorkState,
+    RoomMention, TypingGuard, WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
 
