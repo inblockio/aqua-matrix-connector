@@ -13,6 +13,12 @@ name = "aqua_matrix_agent"
 name = "aqua-matrix-agent"
 path = "src/main.rs"
 
+# Canary test client for the consultant rooms feature (see the example's module
+# doc). `test = true` so a plain `cargo test` also runs its argument tests.
+[[example]]
+name = "room_probe"
+test = true
+
 [features]
 e2e = ["dep:uuid"]
 
