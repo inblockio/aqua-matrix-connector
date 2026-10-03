@@ -244,6 +244,55 @@ the presence check, and the freshness pass are all driven by the single `REFS_RE
 list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
 `consultant-config.template.json` (which the system prompt mirrors).
 
+**The `host` block (per consultant, opt-in).** Settings that only this spawn script uses live
+in ONE `host` object in the consultant JSON:
+
+```json
+"host": { "extra_refs": ["aqua-mail", "siwx-oidc"], "refs_follow": ["aqua-rs-sdk"] }
+```
+
+The agent binary accepts the object and ignores its contents (IMAGE BEFORE CONFIG: only an image
+that knows the `host` field may run a config that carries it, `deny_unknown_fields`). The script
+reads it from the config the spawn uses (the kept config, or the render's base: the existing
+config, else the template) and validates it strictly before any side effect (Owner step, config
+render, clone, container): `host` must be an object, its only keys are `extra_refs` and
+`refs_follow`, each a list of plain repo names (`[A-Za-z0-9._-]`, not `.`, no `..`, not the
+reserved `_developments`). Anything else exits 2 with nothing changed. Persona render,
+`--keep-config` (including its `avatar_path` patch and `--voice`) and `--refresh-prompt` carry
+`host`, `invite_policy` and `rooms` through byte for byte. No `host` = today's argv, byte for byte.
+
+**Extra refs (`host.extra_refs`).** `REFS_REPOS` reaches every consultant. A repo only ONE
+consultant may see (private ones included) goes in its `host.extra_refs`: it is mounted `:ro` at
+`/refs/<repo>` into that consultant only, from a clean single-branch clone of the default branch
+under `${CONSULTANT_REFS_MIRROR:-~/.local/share/consultant-refs}` (never a working checkout,
+never /tmp). Unlike the fleet pass this is fail-closed: a failed clone/fetch, a non-fast-forward
+or any local change in a mirror (ignored files included) aborts the spawn before the container is
+touched. A fleet repo or a followed repo in the list is skipped with a note. The former host file
+`<test-dir>/<key>-extra-refs.list` is NOT read any more (no fallback): move its names into
+`host.extra_refs` before the next spawn of that consultant, or they silently drop out of its
+`/refs`. These mounts are NOT in `ref_mounts` and NOT in the system prompt; the agent reads them
+through its unscoped `Read`/`Glob`/`Grep`, so tell it about them in its own config if it should
+use them.
+
+**Followed refs (`host.refs_follow`).** A followed repo is mounted `:ro` at `/refs/<repo>` from
+its FOLLOW mirror `<follow>/<repo>`, IN PLACE of the fleet mount for that repo (a repo outside
+`REFS_REPOS` is simply added), for that consultant only; everyone else keeps the fleet checkout.
+Its digest dir `<follow>/_developments/<repo>` (holding `DEVELOPMENTS.md`: latest tags, main of
+the last 30 days, open PRs) is mounted `:ro` at `/refs/_developments/<repo>`. Both are directory
+mounts, never a single-file bind mount (a file replaced by rename would go stale in the
+container). `<follow>` = `${CONSULTANT_REFS_FOLLOW_ROOT:-~/.local/share/consultant-refs-follow}`.
+The follow mirrors and digests come from the host timer `consultant-refs-follow.timer`
+(inblockio/aqua-ops, every 30 min, `Persistent=true`), which reads every live config's
+`host.refs_follow`, fast-forwards each mirror to the upstream default branch and refuses a dirty
+one. The spawn script NEVER clones, fetches or updates them; it only checks (read-only, with
+`GIT_OPTIONAL_LOCKS=0` so it never races the timer for the index lock) that each mirror is a
+clean git clone and its digest dir exists. Missing or dirty: exit 1 before anything changes, with
+`run: systemctl --user start consultant-refs-follow.service`.
+
+**Rooms.** A `<test-dir>/<key>-rooms/` dir is mounted `:ro` at `/agent/rooms`, together with a
+durable, writable `<test-dir>/<key>-room-state/` (created if missing, never wiped) at
+`/agent/room-state` with the same `:U` as `/agent/memory`. No rooms dir = no rooms mounts.
+
 ## Identity & lifecycle flags
 
 | Flag | Effect |
@@ -328,7 +377,14 @@ key file means exactly one bare `-e DEEPGRAM_API_KEY` and the value nowhere; `--
 flips only that key; `--replace --keep-config` preserves the block; `inblockio.github.io` is in
 `REFS_REPOS` and mounted `:ro`; the template pins `model`, a fresh render carries it, and a
 persona re-render or `--refresh-prompt` keeps an existing config's `model` (and never injects one);
-the shims were never called.
+the `host` block is validated strictly (unknown key, non-object `host`, non-list value, every bad or
+reserved name: exit 2, config byte-identical, no persist dir, no argv), `host.extra_refs` mounts
+from the mirrors and the old `<key>-extra-refs.list` is ignored, `host.refs_follow` puts the follow
+mirror IN PLACE of the fleet mount (exact `/refs` sequence) plus one `/refs/_developments/<repo>`
+directory mount, and a missing, non-clone or dirty follow mirror or a missing digest dir exits 1
+with the service hint and nothing changed; `host`, `invite_policy` and `rooms` keep their exact bytes
+through a persona render, the `avatar_path` patch, `--voice` and `--refresh-prompt`; the shims were
+never called.
 
 `tests/spawn-consultant-onboarding.sh` covers the welcome and `--onboard`: `hello_for` copy
 (persona + name exact, pseudonymous "Hi there" ending with the name question, voice line on/off,
@@ -355,7 +411,7 @@ bash Skills/consultant-deploy/tests/spawn-consultant-onboarding.sh
 
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
 avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
-`CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
+`CONSULTANT_REFS_MIRROR`, `CONSULTANT_REFS_REMOTE`, `CONSULTANT_REFS_FOLLOW_ROOT`, `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
 `CONSULTANT_NOTIFY`, `ONBOARD_WAIT` and `AQUA_SYSTEM_ALLOWLIST`.
 
 ## Model pin (`model`)
