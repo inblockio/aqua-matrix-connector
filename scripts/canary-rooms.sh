@@ -16,6 +16,13 @@
 #   canary-rooms.sh --strip-rooms   [--config F]    BEFORE spawning: drop `rooms` from the canary
 #                                                   config, in place (stage 1, see AC10 below)
 #   canary-rooms.sh --restore-rooms [--config F]    put `rooms` back from the binding file
+#   canary-rooms.sh --setup-boundinvite [--config F]
+#                                                   BEFORE spawning: the collaborator (not the
+#                                                   canary's target) creates a room (reused while it
+#                                                   is still joined), its id goes to ids.env as
+#                                                   BOUND_ROOM_ID, and the config gets a second
+#                                                   binding "boundinvite" for it, in place
+# --strip-rooms and --restore-rooms only move the test room's binding; other bindings stay.
 # With no arguments it prints this help and exits 2: nothing runs until told.
 # Real rooms are refused: the test room (ROOM_ID in ids.env) must not be bound by any other
 # consultant config in the test dir (*-config.json, .bak* skipped, the canary's own excepted).
@@ -28,8 +35,20 @@
 #                        name; canaryrooms-aqua-consultant-config.json for --strip/--restore)
 #   --binding FILE       the rooms block (default <config dir>/canaryrooms-rooms-binding.json)
 #   --only "STEPS"       run only these steps, space separated, in this fixed order:
-#                        k dm burst header noreply ignored redteam persona needstim security
-#                        dmheader pause log logs. The preflight always runs.
+#                        k dm burst header noreply ignored boundinvite redteam persona needstim
+#                        security dmheader follow digest pause log logs. The preflight always runs.
+#   --invite-policy P    owner_only (default) or legacy: what the canary's LIVE config sets
+#                        (`invite_policy`, absent = legacy); a mismatch ends the run. It flips the
+#                        `ignored` invite checks: owner_only = R17 (every non-owner invite declined,
+#                        never joined); legacy = pre-R17 (not declined, not joined by the live
+#                        handler, joined at the next cycle start, which the step forces with a
+#                        restart). `boundinvite` runs under owner_only only.
+#   --follow-bed DIR     test bed of `follow` and `digest` (never the live follow root):
+#                        DIR/remote/<repo>.git local bare upstream, DIR/root the canary's
+#                        CONSULTANT_REFS_FOLLOW_ROOT, DIR/configs the job's config dir (canary
+#                        configs only), DIR/work a scratch clone for the test pushes
+#   --follow-job PATH    consultant_refs_follow.py (aqua-ops tools/consultant-refs-follow)
+#   --follow-repo NAME   the followed repo (default aqua-rs-sdk)
 #   --keep-going         record every FAIL instead of stopping at the first
 #   --turn-timeout S     budget for one draft + reflection pair (default 600)
 #   --neg-wait S         how long "nothing is posted" is watched (default quiet + floor + 240)
@@ -46,9 +65,10 @@
 # In both modes the pre-spawn seed (PRE_SEED_MARK in ids.env, posted before the canary existed)
 # is UTD for the canary and must not appear in its history.
 #
-# Not checkable here (see ~/.aqua-matrix-test/canaryrooms-NOTES.md): AC5 (the canary has no extra
-# refs by design), AC6 (Aqua System is not in the test room), AC8 (build and fleet gates), the R8
-# daily limit at 48, R11 media, R15c to-room drafts (T3b, after T8).
+# Not checkable here (see ~/.aqua-matrix-test/canaryrooms-NOTES.md): AC5 (Marina's full extra refs;
+# the canary carries one, host.extra_refs, checked by podman inspect), AC6 (Aqua System is not
+# in the test room), AC8 (build and fleet gates), the R8 daily limit at 48, R11 media, R15c
+# to-room drafts (T3b, after T8).
 set -uo pipefail
 
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -56,12 +76,14 @@ REPO=$(cd "$SELF_DIR/.." && pwd)
 TEST_DIR=${CONSULTANT_TEST_DIR:-$HOME/.aqua-matrix-test}
 MARINA_CONTAINER='aqua-agent-aqua-consultant-1'
 KICKOFF_TEXT='Open the conversation with the collaborator: introduce yourself in two sentences and ask what they want to tackle first.'
-STEPS_ALL="k dm burst header noreply ignored redteam persona needstim security dmheader pause log logs"
+STEPS_ALL="k dm burst header noreply ignored boundinvite redteam persona needstim security dmheader follow digest pause log logs"
+LIVE_FOLLOW_ROOT=$HOME/.local/share/consultant-refs-follow
 
 usage() { sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
 [ $# -eq 0 ] && usage 2
 
 MODE=run CONTAINER= CANARY= CONFIG= BINDING= ONLY= KEEP_GOING=0 TURN=600 NEG= POLL=15 PROBE=
+INVITE_POLICY=owner_only FBED= FJOB= FREPO=aqua-rs-sdk
 CDIR=$HOME/.cache/marina-canary
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -76,13 +98,20 @@ while [ $# -gt 0 ]; do
     --poll) POLL=$2; shift 2 ;;
     --probe) PROBE=$2; shift 2 ;;
     --canary-dir) CDIR=$2; shift 2 ;;
+    --invite-policy) INVITE_POLICY=$2; shift 2 ;;
+    --follow-bed) FBED=$2; shift 2 ;;
+    --follow-job) FJOB=$2; shift 2 ;;
+    --follow-repo) FREPO=$2; shift 2 ;;
     --strip-rooms) MODE=strip; shift ;;
     --restore-rooms) MODE=restore; shift ;;
+    --setup-boundinvite) MODE=boundinvite; shift ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
 done
 PROBE=${PROBE:-$REPO/target/debug/examples/room_probe}
+case $INVITE_POLICY in owner_only|legacy) ;; *) echo "--invite-policy must be owner_only or legacy" >&2; exit 2 ;; esac
+[[ "$FREPO" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$FREPO" != *..* ]] || { echo "bad --follow-repo $FREPO" >&2; exit 2; }
 
 [ -r "$CDIR/ids.env" ] || { echo "missing $CDIR/ids.env (OWNER_MXID, COLLAB_MXID, STRANGER_MXID, ROOM_ID)" >&2; exit 2; }
 # shellcheck disable=SC1091
@@ -95,6 +124,8 @@ if [ -z "$CONFIG" ]; then
   else CONFIG=$TEST_DIR/canaryrooms-aqua-consultant-config.json; fi
 fi
 BINDING=${BINDING:-$(dirname "$CONFIG")/canaryrooms-rooms-binding.json}
+
+kv() { sed -n "s/^$1=//p"; }
 
 # Real rooms are refused: `bound_elsewhere <room_id>` prints every consultant config in the test
 # dir (<test-dir>/*-config.json, .bak* copies skipped) other than the canary's own ($CONFIG)
@@ -134,23 +165,74 @@ if cfg.get("target", "").lower() != owner.lower():
     sys.exit(f"refusing: {cfg_path} target {cfg.get('target')!r} is not the test owner {owner}")
 if [b.get("room_id") for b in binding] != [room]:
     sys.exit(f"refusing: {bind_path} must bind exactly the test room {room}")
+# Only the test room's binding moves; any other binding (e.g. boundinvite) stays as it is.
+current = cfg.get("rooms") or []
+mine = [b for b in current if b.get("room_id") == room]
+others = [b for b in current if b.get("room_id") != room]
 if mode == "strip":
-    if cfg.get("rooms") not in (None, binding):
-        sys.exit(f"refusing: the rooms in {cfg_path} differ from {bind_path}; reconcile them first")
-    cfg.pop("rooms", None)
+    if mine not in ([], binding):
+        sys.exit(f"refusing: the test room's binding in {cfg_path} differs from {bind_path}; reconcile them first")
+    rooms = others
 else:
-    cfg["rooms"] = binding
+    rooms = binding + others
+if rooms:
+    cfg["rooms"] = rooms
+else:
+    cfg.pop("rooms", None)
 text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
 with open(cfg_path, "r+", encoding="utf-8") as f:
     f.seek(0)
     f.write(text)
     f.truncate()
-print(f"{mode}: {cfg_path} now has {len(cfg.get('rooms', []))} room binding(s)")
+print(f"{mode}: {cfg_path} now has {len(rooms)} room binding(s)")
+PY
+}
+
+# --setup-boundinvite: a room created by the collaborator (a non-target identity), bound in the
+# canary config as "boundinvite" BEFORE the canary starts, so `boundinvite` can check that an
+# owner_only canary joins a non-target's invite into a room of its own `rooms`. The binding is a
+# copy of the test room's (governance files, respond_to, pacing) with room_id and name replaced.
+setup_boundinvite() {
+  local P="$PROBE" cid=(--key-file "$CDIR/collab/agent.pem" --store-dir "$CDIR/collab/store") br m elsewhere
+  br=${BOUND_ROOM_ID:-}
+  if [ -n "$br" ]; then
+    m=$("$P" membership "${cid[@]}" "$br" "$COLLAB" 2>/dev/null | kv membership)
+    [ "$m" = join ] || { echo "BOUND_ROOM_ID $br: the collaborator is $m there; creating a new room"; br=; }
+  fi
+  if [ -z "$br" ]; then
+    br=$("$P" create-room "${cid[@]}" --name canary-boundinvite 2>/dev/null | kv room_id)
+    [[ "$br" == '!'*:* ]] || { echo "the collaborator could not create the room" >&2; return 1; }
+    { grep -v '^BOUND_ROOM_ID=' "$CDIR/ids.env"; printf 'BOUND_ROOM_ID=%s\n' "$br"; } > "$CDIR/ids.env.new" \
+      && chmod --reference="$CDIR/ids.env" "$CDIR/ids.env.new" && mv "$CDIR/ids.env.new" "$CDIR/ids.env" || return 1
+    echo "created $br (collaborator), recorded as BOUND_ROOM_ID in $CDIR/ids.env"
+  fi
+  elsewhere=$(bound_elsewhere "$br") && [ -z "$elsewhere" ] \
+    || { echo "refusing: $br is bound by another consultant config: ${elsewhere:-config scan failed}" >&2; return 1; }
+  python3 - "$CONFIG" "$BINDING" "$OWNER" "$ROOM" "$br" <<'PY'
+import copy, json, sys
+cfg_path, bind_path, owner, room, bound = sys.argv[1:]
+cfg = json.load(open(cfg_path, encoding="utf-8"))
+if cfg.get("target", "").lower() != owner.lower():
+    sys.exit(f"refusing: {cfg_path} target {cfg.get('target')!r} is not the test owner {owner}")
+src = [b for b in json.load(open(bind_path, encoding="utf-8")) if b.get("room_id") == room]
+if len(src) != 1:
+    sys.exit(f"refusing: {bind_path} must bind exactly the test room {room}")
+b = copy.deepcopy(src[0])
+b["room_id"], b["name"] = bound, "boundinvite"
+rooms = [r for r in (cfg.get("rooms") or []) if r.get("name") != "boundinvite" and r.get("room_id") != bound]
+cfg["rooms"] = rooms + [b]
+text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+with open(cfg_path, "r+", encoding="utf-8") as f:
+    f.seek(0)
+    f.write(text)
+    f.truncate()
+print(f"boundinvite: {cfg_path} binds {bound} as 'boundinvite' ({len(cfg['rooms'])} binding(s)); start the canary after this")
 PY
 }
 case $MODE in
   strip) edit_rooms strip; exit $? ;;
   restore) edit_rooms restore; exit $? ;;
+  boundinvite) setup_boundinvite; exit $? ;;
 esac
 [ -n "$CONTAINER" ] || { echo "--container is required" >&2; usage 2; }
 
@@ -192,7 +274,6 @@ want() { [ -z "$ONLY" ] || [[ " $ONLY " == *" $1 "* ]]; }
 nowms() { local t=${EPOCHREALTIME//[.,]/}; echo $(( 10#$t / 1000 )); }
 hms() { date -u -d "@$(( $1 / 1000 ))" +%H:%M:%SZ; }
 lc() { printf '%s' "${1,,}"; }
-kv() { sed -n "s/^$1=//p"; }
 count() { grep -c . || true; }
 mark() { printf '%s-%s' "$1" "$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')"; }
 
@@ -247,7 +328,9 @@ restart_canary() {  # restart and wait for the relay's "connected" line
   podman restart "$CONTAINER" >/dev/null || return 1
   local deadline=$(( SECONDS + 240 ))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    podman logs --since "$since" "$CONTAINER" 2>&1 | grep -qE '(^|[^a-z])connected' && return 0
+    # Count, never grep -q (nor >/dev/null, which GNU grep treats alike): an early exit SIGPIPEs
+    # podman logs, and pipefail then turns the match into a miss.
+    [ "$(podman logs --since "$since" "$CONTAINER" 2>&1 | grep -cE '(^|[^a-z])connected')" -gt 0 ] && return 0
     sleep 5
   done
   return 1
@@ -259,6 +342,83 @@ transcripts() {  # every Claude transcript line of the room turns
   cexec sh -c 'find "/agent/room-state/$1" -name "*.jsonl" -exec cat {} + 2>/dev/null' _ "$RNAME" || true
 }
 
+# Follow test bed (steps follow, digest). Never the live follow root, never a remote URL: the
+# test pushes go to a local bare repo, and the job sees only the canary's configs.
+follow_bed_ok() {  # prints the reason and returns 1 when the bed is not a safe test bed
+  local root live src dsrc c
+  [ -n "$FBED" ] && [ -n "$FJOB" ] || { echo "--follow-bed and --follow-job are required"; return 1; }
+  [ -r "$FJOB" ] || { echo "no follow job at $FJOB"; return 1; }
+  root=$(realpath -m "$FBED/root"); live=$(realpath -m "$LIVE_FOLLOW_ROOT")
+  case "$root/" in "$live"/*) echo "refusing: $FBED/root is the live follow root"; return 1 ;; esac
+  case "$live/" in "$root"/*) echo "refusing: $FBED/root contains the live follow root"; return 1 ;; esac
+  [ "$(git -C "$FBED/remote/$FREPO.git" rev-parse --is-bare-repository 2>/dev/null)" = true ] \
+    || { echo "$FBED/remote/$FREPO.git is not a local bare repo"; return 1; }
+  for c in "$FBED"/configs/*-config.json; do
+    [ -e "$c" ] || { echo "no configs in $FBED/configs"; return 1; }
+    [ "$(jq -r '.target // "" | ascii_downcase' "$c")" = "$(lc "$OWNER")" ] \
+      || { echo "refusing: $c is not a canary config (target is not the test owner)"; return 1; }
+  done
+  src=$(podman inspect -f '{{range .Mounts}}{{.Destination}}={{.Source}}{{"\n"}}{{end}}' "$CONTAINER" | sed -n "s|^/refs/$FREPO=||p")
+  [ "$(realpath -m "$src")" = "$root/$FREPO" ] \
+    || { echo "the container's /refs/$FREPO comes from ${src:-nowhere}, not $root/$FREPO"; return 1; }
+}
+follow_job() {  # run the follow job against the bed; prints its exit code, log in the run dir
+  local rc
+  CONSULTANT_REFS_FOLLOW_CONFIG_DIR=$FBED/configs CONSULTANT_REFS_FOLLOW_ROOT=$FBED/root \
+    CONSULTANT_REFS_FOLLOW_REMOTE_BASE=$FBED/remote python3 "$FJOB" >>"$RUN/follow-job.log" 2>&1
+  rc=$?; echo "--- rc=$rc" >>"$RUN/follow-job.log"; echo "$rc"
+}
+push_marker() {  # push_marker <file>: one commit adding <file> to the bare upstream's default branch
+  local w=$FBED/work g=(git -c core.hooksPath=/dev/null -c commit.gpgsign=false)
+  [ -d "$w/.git" ] || "${g[@]}" clone -q "$FBED/remote/$FREPO.git" "$w" || return 1
+  "${g[@]}" -C "$w" pull -q --ff-only || return 1
+  printf 'canary follow marker %s\n' "$1" > "$w/$1"
+  "${g[@]}" -C "$w" add -- "$1" \
+    && "${g[@]}" -C "$w" -c user.name=canary -c user.email=canary@example.org commit -q -m "test: canary follow marker $1" \
+    && "${g[@]}" -C "$w" push -q origin HEAD
+}
+author_hits() {  # author_hits <file>...: per file, how many author names, emails or PR logins it holds
+  python3 - "$FBED/remote/$FREPO.git" "inblockio/$FREPO" "$@" <<'PY'
+import json, re, subprocess, sys
+remote, slug, *files = sys.argv[1:]
+MACHINE = {"github", "root", "ubuntu", "user", "admin", "runner", "unknown", "inblockio", "canary"}
+log = subprocess.run(["git", "-C", remote, "log", "--all", "--format=%an%x00%ae%x00%cn%x00%ce"],
+                     capture_output=True, text=True).stdout
+names, emails, logins = set(), set(), set()
+for line in log.splitlines():
+    an, ae, cn, ce = (line.split("\x00") + ["", "", "", ""])[:4]
+    for n in (an, cn):
+        if n.strip() and n.strip().lower() not in MACHINE: names.add(n.strip())
+    for e in (ae, ce):
+        if "@" in e and not e.endswith("@example.org"): emails.add(e.strip())
+        m = re.match(r"(?:\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com$", e.strip())
+        if m: logins.add(m.group(1))
+p = subprocess.run(["gh", "api", "--method", "GET", f"repos/{slug}/pulls?state=open&per_page=100"],
+                   capture_output=True, text=True)
+pr_ok = p.returncode == 0
+if pr_ok:
+    for pr in json.loads(p.stdout):
+        for who in (pr.get("user"), *(pr.get("assignees") or []), *(pr.get("requested_reviewers") or []),
+                    ((pr.get("head") or {}).get("repo") or {}).get("owner")):
+            if isinstance(who, dict) and who.get("login"): logins.add(who["login"])
+logins = {l for l in logins if len(l) >= 3 and l.lower() not in MACHINE}
+def pats():
+    for n in names:   # a one-word name shorter than 5 letters is too ambiguous to match
+        if " " in n or len(n) >= 5: yield "name", re.compile(r"(?<!\w)" + re.escape(n) + r"(?!\w)", re.I)
+    for e in emails: yield "email", re.compile(re.escape(e), re.I)
+    for l in logins: yield "login", re.compile(r"(?<![\w/-])" + re.escape(l) + r"(?![\w-])", re.I)
+P = list(pats())
+email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+for f in files:
+    text = open(f, encoding="utf-8", errors="replace").read()
+    hits = [(k, m.group(0)) for k, rx in P for m in [rx.search(text)] if m]
+    anymail = email_re.findall(text)
+    masked = " ".join(f"{k}:{v[:2]}***" for k, v in hits)
+    print(f"{f.rsplit('/', 1)[-1]} hits={len(hits)} emails={len(anymail)} checked names={len(names)} "
+          f"emails={len(emails)} logins={len(logins)} prs={'ok' if pr_ok else 'unavailable'} {masked}".rstrip())
+PY
+}
+
 # ------------------------------------------------------------------ preflight
 step preflight "safety, identities, live config, membership"
 for t in jq podman python3; do command -v "$t" >/dev/null || fatal preflight.tools "$t is missing"; done
@@ -268,12 +428,19 @@ for who in owner collab stranger; do
 done
 elsewhere=$(bound_elsewhere "$ROOM") && [ -z "$elsewhere" ] \
   || fatal preflight.room "refusing to test in $ROOM: another consultant config binds it (a real room)" "${elsewhere:-config scan failed}"
+if [ -n "${BOUND_ROOM_ID:-}" ]; then
+  elsewhere=$(bound_elsewhere "$BOUND_ROOM_ID") && [ -z "$elsewhere" ] \
+    || fatal preflight.room "refusing to test in $BOUND_ROOM_ID: another consultant config binds it (a real room)" "${elsewhere:-config scan failed}"
+fi
 [ "$CONTAINER" != "$MARINA_CONTAINER" ] || fatal preflight.container "refusing to drive Marina's container"
 [ "$(podman inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = true ] \
   || fatal preflight.running "container $CONTAINER is not running"
 LIVE=$(cexec cat /agent/config.json 2>/dev/null) || LIVE='{}'
 [ "$(jq -r '.target // "" | ascii_downcase' <<<"$LIVE")" = "$(lc "$OWNER")" ] \
   || fatal preflight.target "live config target is not the test owner $OWNER; refusing (this would restart a real consultant)"
+LIVE_POLICY=$(jq -r '.invite_policy // "legacy"' <<<"$LIVE")
+[ "$LIVE_POLICY" = "$INVITE_POLICY" ] \
+  || fatal preflight.invite-policy "the live config's invite_policy is $LIVE_POLICY, this run expects $INVITE_POLICY (--invite-policy)"
 HELLO=$(jq -r '.hello // ""' <<<"$LIVE")
 FIRST=$(jq -r '.display_name // ""' <<<"$LIVE" | awk '{print $1}')
 LIVE_BIND=$(jq -c --arg r "$ROOM" '[.rooms[]? | select(.room_id==$r)]' <<<"$LIVE")
@@ -301,7 +468,7 @@ cexec sh -c 'test -d /agent/room-state && test -w /agent/room-state' \
   || fatal preflight.room-state "/agent/room-state is not a writable mount in the container"
 info "container=$CONTAINER image=$(podman inspect -f '{{.ImageName}} {{.Image}}' "$CONTAINER" | cut -c1-80)"
 info "canary=$CANARY owner=$OWNER collab=$COLLAB stranger=$STRANGER room=$ROOM name=$RNAME"
-info "stage=$STAGE quiet=${QUIET}s floor=${FLOOR}s reply_wait=${REPLY_WAIT}s neg_wait=${NEG}s"
+info "stage=$STAGE quiet=${QUIET}s floor=${FLOOR}s reply_wait=${REPLY_WAIT}s neg_wait=${NEG}s invite_policy=$INVITE_POLICY"
 # {{.ImageID}} errors out on pod infra containers (no image), so inspect each agent instead.
 info "fleet images: $(for c in $(podman ps --format '{{.Names}}' | grep '^aqua-agent-'); do podman inspect -f '{{.Image}}' "$c" | cut -c1-12; done | sort | uniq -c | tr '\n' ' ')"
 for who in collab stranger; do
@@ -332,12 +499,28 @@ if want k; then
     check "$(verdict "$([ -n "$e" ] && echo 1)")" AC10.seed "history seed posted after the canary joined, before its room channel" "event $e at $(hms "$t")"
     sleep 20
     assert_canary
+    # Stage 1 stands for the room's FIRST enable (the Task 8 order), when the relay has no inbound
+    # watermark for the room yet. One left by an earlier run on this identity would make the
+    # restart's backfill answer the seed as a missed message, on top of the kickoff opening.
+    wm=$(cexec ls /agent/store 2>/dev/null | python3 -c '
+import sys, urllib.parse as u
+pre = "inbound-watermark.room."
+for l in sys.stdin:
+    l = l.strip()
+    if l.startswith(pre) and u.unquote(l[len(pre):]) == sys.argv[1]:
+        print(l)' "$ROOM")
+    if [ -n "$wm" ]; then
+      cexec rm -f -- "/agent/store/$wm"
+      info "stage 1: removed the room's inbound watermark left by an earlier run ($wm)"
+    fi
     out=$(edit_rooms restore 2>&1); rc=$?
     check "$(verdict "$([ $rc = 0 ] && echo 1)")" AC10.rooms-on "rooms restored into the host config in place" "$out"
   else
     info "rooms already live: no decryptable pre-channel seed; history is a REVIEW item"
   fi
   assert_canary
+  # Room state is durable (never wiped): count only the done files this run adds.
+  done0=$(cexec ls "/agent/room-state/$RNAME" 2>/dev/null | grep -cE '^kickoff\..+\.done\.md$')
   cexec mkdir -p "/agent/room-state/$RNAME" \
     && printf '%s\n' "$KICKOFF_TEXT" | podman exec -i "$CONTAINER" sh -c 'cat > "/agent/room-state/$1/kickoff.md"' _ "$RNAME"
   check "$(verdict "$(cexec test -s "/agent/room-state/$RNAME/kickoff.md" && echo 1)")" AC10.file "kickoff.md written into the room state" "/agent/room-state/$RNAME/kickoff.md"
@@ -356,8 +539,8 @@ if want k; then
   ls_out=$(cexec ls "/agent/room-state/$RNAME" 2>&1)
   done_n=$(printf '%s\n' "$ls_out" | grep -cE '^kickoff\..+\.done\.md$')
   ko=$(printf '%s\n' "$ls_out" | grep -cx 'kickoff.md')
-  check "$(verdict "$([ "$done_n" = 1 ] && [ "$ko" = 0 ] && echo 1)")" AC10.renamed "kickoff.md renamed to kickoff.<UTC>.done.md" \
-    "$(printf '%s\n' "$ls_out" | grep -E '^kickoff' | tr '\n' ' ')"
+  check "$(verdict "$([ "$done_n" = $((done0 + 1)) ] && [ "$ko" = 0 ] && echo 1)")" AC10.renamed "kickoff.md renamed to kickoff.<UTC>.done.md" \
+    "done files before=$done0 after=$done_n" "$(printf '%s\n' "$ls_out" | grep -E '^kickoff' | tail -3 | tr '\n' ' ')"
   if [ -n "$SEED_MARK" ]; then
     # History, not a live batch: the seed must sit in a file that also holds the R16 header.
     hits=$(room_state_grep "$SEED_MARK"); hist=
@@ -379,8 +562,8 @@ if want k; then
   sleep "$NEG"
   again=$(canary_replies "$TR" | count)
   done2=$(cexec ls "/agent/room-state/$RNAME" 2>&1 | grep -cE '^kickoff\..+\.done\.md$')
-  check "$(verdict "$([ "$again" = 0 ] && [ "$done2" = 1 ] && echo 1)")" AC10.once "no second opening after a restart" \
-    "posts since restart=$again done files=$done2 (watched ${NEG}s)"
+  check "$(verdict "$([ "$again" = 0 ] && [ "$done2" = $((done0 + 1)) ] && echo 1)")" AC10.once "no second opening after a restart" \
+    "posts since restart=$again done files=$done2 (before the run $done0, watched ${NEG}s)"
 fi
 
 # ------------------------------------------------------------------ dm: DM baseline + private code word (AC7, H3)
@@ -454,6 +637,7 @@ if want ignored; then
   info "R17 invites: collab dm $CDM, stranger dm $SDM, stranger group $SGR"
   [ -n "$CDM" ] && [ -n "$SDM" ] && [ -n "$SGR" ] \
     || check FAIL R17.setup "room_probe could not create every invite" "collab dm=$CDM stranger dm=$SDM group=$SGR"
+  if [ "$INVITE_POLICY" = owner_only ]; then
   sleep "$NEG"   # > one relay cycle (~4 min): covers the live handler and the cycle-start join
   m=$(probe collab membership "$CDM" "$CANARY" | kv membership)
   check "$(verdict "$([ "$m" != join ] && echo 1)")" AC2.dm-not-joined "the canary did not join the collaborator's DM invite" "room $CDM membership=$m"
@@ -466,12 +650,67 @@ if want ignored; then
     check "$(verdict "$([ -n "$l" ] && [ "$m" != join ] && echo 1)")" "R17.$id" "the $id invite was declined and not joined" \
       "room $r membership=$m" "${l:-no declined-invite line}"
   done
+  else
+  # Legacy = pre-R17 main (H1): the live handler ignores a non-owner invite (no decline, no
+  # join) and the next cycle start joins every pending invite. A natural cycle start inside the
+  # wait may join already; the log line tells the two paths apart (live: "auto-joined invited
+  # room <id>", cycle start: "joined invited room: <id>").
+  sleep 60
+  for spec in "collab-dm|collab|$CDM|$COLLAB" "stranger-dm|stranger|$SDM|$STRANGER" "stranger-group|stranger|$SGR|$STRANGER"; do
+    IFS="|" read -r id who r inv <<<"$spec"
+    l=$(declined "$tiso" "$r" "$inv")
+    lj=$(clogs "$tiso" | grep -F "auto-joined invited room $r" | tail -1)
+    check "$(verdict "$([ -z "$l" ] && [ -z "$lj" ] && echo 1)")" "H1.$id-live" "legacy live handler: the $id invite was neither declined nor joined" \
+      "room $r" "${l:-no declined-invite line}" "${lj:-no live auto-join line}"
+  done
+  restart_canary; rc=$?
+  check "$(verdict "$([ $rc = 0 ] && echo 1)")" H1.restart "restart to force a cycle start (relay connected)"
+  mem_join() { probe "$1" membership "$2" "$CANARY" | grep -x membership=join; }
+  for spec in "collab-dm|collab|$CDM|$COLLAB" "stranger-dm|stranger|$SDM|$STRANGER" "stranger-group|stranger|$SGR|$STRANGER"; do
+    IFS="|" read -r id who r inv <<<"$spec"
+    wait_lines 180 1 mem_join "$who" "$r" >/dev/null
+    m=$(probe "$who" membership "$r" "$CANARY" | kv membership)
+    cj=$(clogs "$tiso" | grep -F "joined invited room: $r" | tail -1)
+    check "$(verdict "$([ "$m" = join ] && [ -n "$cj" ] && echo 1)")" "H1.$id-cycle-join" "legacy cycle start joined the $id invite (pre-R17)" \
+      "room $r membership=$m" "$(printf '%s' "${cj:-no cycle-start join line}" | cut -c1-200)"
+  done
+  sleep 150   # joined now: give a (wrong) reply in those DMs time to show up
+  fi
   n=$(probe stranger read-dm "$CANARY" --since-ms "$t" --json | jq -c --arg c "$(lc "$CANARY")" 'select((.sender|ascii_downcase)==$c)' | count)
   check "$(verdict "$([ "$n" = 0 ] && echo 1)")" R17.stranger-dm-silent "no canary message in the stranger's DM" "messages=$n"
   n=$(probe collab read-dm "$CANARY" --since-ms "$t" --json | jq -c --arg c "$(lc "$CANARY")" 'select((.sender|ascii_downcase)==$c)' | count)
   check "$(verdict "$([ "$n" = 0 ] && echo 1)")" AC2.dm-ignored "no canary message in the collaborator's DM" "messages=$n"
   posts=$(canary_replies "$t"); n=$(printf '%s' "$posts" | count)
   check "$(verdict "$([ "$n" = 0 ] && echo 1)")" AC2.stranger "the stranger's room post triggered nothing" "posts=$n (watched ${NEG}s)" "$(printf '%s\n' "$posts" | brief)"
+fi
+
+# ------------------------------------------------------------------ boundinvite: H2 bound room
+if want boundinvite; then
+  step boundinvite "H2: owner_only joins a non-target's invite into a room bound in the canary's own config"
+  BR=${BOUND_ROOM_ID:-}
+  nb=$(jq --arg r "$BR" '[.rooms[]? | select(.room_id==$r)] | length' <<<"$LIVE")
+  if [ "$INVITE_POLICY" != owner_only ]; then
+    info "boundinvite skipped: it checks owner_only, this run is $INVITE_POLICY"
+  elif [ -z "$BR" ] || [ "$nb" != 1 ]; then
+    check FAIL BI.setup "no bound room: run --setup-boundinvite, then start the canary" "BOUND_ROOM_ID=${BR:-unset} live bindings=$nb"
+  else
+    m=$(probe collab membership "$BR" "$CANARY" | kv membership)
+    if [ "$m" = join ] || [ "$m" = invite ]; then   # left over from an earlier run: start clean
+      probe collab kick "$BR" "$CANARY" --reason "canary boundinvite reset" >/dev/null
+      sleep 10
+      info "reset: the canary was $m in $BR, now $(probe collab membership "$BR" "$CANARY" | kv membership)"
+    fi
+    tiso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    probe collab invite "$BR" "$CANARY" >/dev/null
+    bi_joined() { probe collab membership "$BR" "$CANARY" | grep -x membership=join; }
+    wait_lines 180 1 bi_joined >/dev/null
+    m=$(probe collab membership "$BR" "$CANARY" | kv membership)
+    jl=$(clogs "$tiso" | grep -F -e "auto-joined invited room $BR" -e "joined invited room $BR from" | tail -1)
+    check "$(verdict "$([ "$m" = join ] && echo 1)")" BI.joined "the canary joined the collaborator's invite into its bound room" \
+      "room $BR membership=$m" "$(printf '%s' "${jl:-no join line}" | cut -c1-200)"
+    l=$(declined "$tiso" "$BR" "$COLLAB")
+    check "$(verdict "$([ -z "$l" ] && echo 1)")" BI.no-decline "no declined-invite line for the bound room" "${l:-none}"
+  fi
 fi
 
 # ------------------------------------------------------------------ redteam: AC7 / H7 / R7
@@ -651,6 +890,79 @@ if want dmheader; then
   fi
 fi
 
+# ------------------------------------------------------------------ follow: H5 / H7
+if want follow; then
+  step follow "H5/H7: a followed repo moves in the running container; a dirty mirror is refused"
+  why=$(follow_bed_ok) || fatal follow.bed "the follow test bed is not usable" "$why"
+  MIR=$FBED/root/$FREPO DIG=$FBED/root/_developments/$FREPO/DEVELOPMENTS.md
+  mnt=$(podman inspect -f '{{range .Mounts}}{{.Destination}} {{.Source}} rw={{.RW}} type={{.Type}}{{"\n"}}{{end}}' "$CONTAINER" \
+    | grep -E "^/refs/(_developments/)?$FREPO ")
+  ok=1
+  grep -qxF "/refs/$FREPO $(realpath "$MIR") rw=false type=bind" <<<"$mnt" || ok=0
+  grep -qxF "/refs/_developments/$FREPO $(realpath "$FBED/root/_developments/$FREPO") rw=false type=bind" <<<"$mnt" || ok=0
+  cexec test -d "/refs/_developments/$FREPO" || ok=0
+  check "$(verdict "$ok")" H5.mount "/refs/$FREPO and /refs/_developments/$FREPO are read-only dir mounts from the bed's follow root" "$mnt"
+  st0=$(podman inspect -f '{{.State.StartedAt}}' "$CONTAINER")
+  ts=$(date -u +%Y%m%dT%H%M%SZ); F1=CANARY-FOLLOW-$ts.md; F2=CANARY-FOLLOW-$ts-2.md
+  push_marker "$F1"; prc=$?
+  rc=$(follow_job)
+  seen=$(cexec cat "/refs/$FREPO/$F1" 2>/dev/null)
+  st1=$(podman inspect -f '{{.State.StartedAt}}' "$CONTAINER")
+  check "$(verdict "$([ "$prc" = 0 ] && [ "$rc" = 0 ] && [ -n "$seen" ] && [ "$st0" = "$st1" ] && echo 1)")" H5.update \
+    "a new upstream commit shows in the running container after one job run, no restart" \
+    "push $F1 rc=$prc, job rc=$rc" "container: ${seen:-file not visible}" "started $st0 -> $st1"
+  head0=$(git -C "$MIR" rev-parse HEAD)
+  DIRTY=$MIR/CANARY-DIRTY-$ts.txt
+  printf 'untracked file: the mirror is dirty\n' > "$DIRTY"
+  push_marker "$F2"; prc=$?
+  rc=$(follow_job)
+  head1=$(git -C "$MIR" rev-parse HEAD)
+  stale=$(grep -c '^STALE since ' "$DIG"); top=$(head -1 "$DIG" | cut -c1-160)
+  cstale=$(cexec cat "/refs/_developments/$FREPO/DEVELOPMENTS.md" 2>/dev/null | grep -c '^STALE since ')
+  vis=$(cexec test -e "/refs/$FREPO/$F2" && echo visible || echo absent)
+  check "$(verdict "$([ "$prc" = 0 ] && [ "$rc" != 0 ] && [ "$stale" = 1 ] && [ "$cstale" = 1 ] && [ "$head0" = "$head1" ] \
+      && [ "$vis" = absent ] && [ -e "$DIRTY" ] && echo 1)")" H7.dirty-refused \
+    "a dirty mirror is refused: job fails, mirror untouched, one STALE line, container unchanged" \
+    "push $F2 rc=$prc, job rc=$rc, mirror head ${head0:0:12} -> ${head1:0:12}, untracked file $([ -e "$DIRTY" ] && echo kept || echo GONE)" \
+    "STALE lines host=$stale container=$cstale, top: $top" "container $F2: $vis"
+  rm -f -- "$DIRTY"
+  rc=$(follow_job)
+  stale=$(grep -c '^STALE since ' "$DIG")
+  vis=$(cexec test -e "/refs/$FREPO/$F2" && echo visible || echo absent)
+  check "$(verdict "$([ "$rc" = 0 ] && [ "$stale" = 0 ] && [ "$vis" = visible ] && echo 1)")" H7.recovers \
+    "cleaned, the next run fast-forwards and clears STALE" "job rc=$rc STALE lines=$stale container $F2: $vis" \
+    "mirror head $(git -C "$MIR" rev-parse --short=12 HEAD)"
+fi
+
+# ------------------------------------------------------------------ digest: H6
+if want digest; then
+  step digest "H6: the developments digest is in the container, names no author, and the room cites the newest open PR as open"
+  why=$(follow_bed_ok) || fatal digest.bed "the follow test bed is not usable" "$why"
+  cexec cat "/refs/_developments/$FREPO/DEVELOPMENTS.md" > "$RUN/digest.md" 2>/dev/null
+  same=$(cmp -s "$RUN/digest.md" "$FBED/root/_developments/$FREPO/DEVELOPMENTS.md" && echo yes || echo no)
+  hdr=$(grep -c 'data generated from GitHub' "$RUN/digest.md")
+  stale=$(grep -c '^STALE since ' "$RUN/digest.md")
+  prs=$(grep -cE '^- #[0-9]+ ' "$RUN/digest.md")
+  check "$(verdict "$([ -s "$RUN/digest.md" ] && [ "$same" = yes ] && [ "$hdr" -ge 1 ] && [ "$stale" = 0 ] && echo 1)")" H6.digest-present \
+    "/refs/_developments/$FREPO/DEVELOPMENTS.md is in the container, current, marked as data" \
+    "bytes=$(wc -c < "$RUN/digest.md") same-as-host=$same header=$hdr STALE=$stale open PRs listed=$prs"
+  ah=$(author_hits "$RUN/digest.md")
+  check "$(verdict "$(grep -q ' hits=0 emails=0 ' <<<"$ah" && echo 1)")" H6.no-authors "the digest holds no author name, email or PR login" "$ah"
+  newest=$(grep -oE '^- #[0-9]+ ' "$RUN/digest.md" | tr -dc '0-9\n' | sort -n | tail -1)
+  updated=$(grep -oE '^- #[0-9]+ ' "$RUN/digest.md" | head -1 | tr -dc '0-9')
+  t=$(nowms)
+  say collab "What is the newest open pull request in aqua-rs-sdk, and is it released? ($(mark G))" >/dev/null
+  r=$(wait_lines "$REPLY_WAIT" 1 canary_replies "$t" | head -1)
+  printf '%s\n' "$r" | texts > "$RUN/digest-reply.txt"
+  check "$(verdict "$([ -n "$r" ] && echo 1)")" H6.reply "the room answered the pull request question" "$(printf '%s\n' "$r" | brief)"
+  ah=$(author_hits "$RUN/digest-reply.txt")
+  check "$(verdict "$(grep -q ' hits=0 ' <<<"$ah" && echo 1)")" H6.reply-no-author "the reply names no commit or PR author" "$ah"
+  cited=$(grep -oE '#[0-9]+' "$RUN/digest-reply.txt" | sort -u | tr '\n' ' ')
+  words=$(grep -oiE 'not (yet )?(been )?released|unreleased|in progress|still open|is open|open pull request|may change' "$RUN/digest-reply.txt" | sort -u | tr '\n' ',')
+  check REVIEW H6.newest-pr "read the reply: it should cite #$newest (newest by number; #$updated is the most recently updated), call it open / not released, and name no author" \
+    "cited: ${cited:-none}  wording: ${words:-none}" "reply: $(tr '\n' ' ' < "$RUN/digest-reply.txt" | cut -c1-600)"
+fi
+
 # ------------------------------------------------------------------ pause: AC3
 if want pause; then
   step pause "AC3: stop during a hold, paused across a restart, continue answers once"
@@ -736,7 +1048,7 @@ if want logs; then
     "preamble lines=$np reflection prompts=$nr replies=$replies"; fi
   hits=
   for s in "$SECRET" "${SEED_MARK:-}" "${pref:-}" "${qref:-}" "${SREF:-}" "${IREF:-}" "$KICKOFF_TEXT"; do
-    [ -n "$s" ] && podman logs --since "$RUN_START_ISO" "$CONTAINER" 2>&1 | grep -qF -- "$s" && hits="$hits ${s:0:24}"
+    [ -n "$s" ] && [ "$(podman logs --since "$RUN_START_ISO" "$CONTAINER" 2>&1 | grep -cF -- "$s")" -gt 0 ] && hits="$hits ${s:0:24}"
   done
   check "$(verdict "$([ -z "$hits" ] && echo 1)")" R9.no-bodies "no message body appears in the container log" "${hits:-none found}"
 fi
