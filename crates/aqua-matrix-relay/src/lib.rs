@@ -39,6 +39,7 @@
 //! swap an access token in place; rotating the whole client ~30 s before expiry
 //! is what avoids the `M_UNKNOWN_TOKEN` sync wedge.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -298,10 +299,12 @@ pub trait MessageHandler: Send + Sync + 'static {
     /// for it) and compare `room_id` exactly: it is the opaque `!id:server`
     /// form, never an alias or a display name.
     ///
-    /// What an override inherits: every admitted sender shares the ONE inbound
-    /// [`Watermark`], so a message no newer than one already dispatched from
-    /// ANOTHER room is dropped, and backfill does not bring it back. The
-    /// restart paths assume `target` too (`replay_inbox` presents a replayed
+    /// List every room an override admits an extra sender in under
+    /// [`bound_rooms`](Self::bound_rooms) too. A room missing there inherits
+    /// the single-target assumptions: every admitted sender shares the ONE
+    /// inbound [`Watermark`], so a message no newer than one already dispatched
+    /// from ANOTHER room is dropped, and backfill does not bring it back; and
+    /// the restart paths assume `target` (`replay_inbox` presents a replayed
     /// message as sent by `target`, `drain_deliveries` redelivers into the
     /// `target` DM). Answer room-scoped messages in their room via
     /// `msg.room_id`, and read `msg.sender_mxid`, never `target`, as the author.
@@ -309,6 +312,28 @@ pub trait MessageHandler: Send + Sync + 'static {
     #[allow(unused_variables)]
     fn authorize_in_room(&self, sender_mxid: &str, room_id: &str, target: &str) -> bool {
         self.authorize(sender_mxid, target)
+    }
+
+    /// Rooms in which this handler admits senders other than `target` via
+    /// [`authorize_in_room`](Self::authorize_in_room). Default: none, and then
+    /// nothing below changes.
+    ///
+    /// For a room listed here (exact string compare, the opaque `!id:server`
+    /// form), and only for those, the relay drops its single-sender,
+    /// single-DM assumptions:
+    ///  1. the room gets its own inbound [`Watermark`], seeded and persisted
+    ///     exactly like the global one (`<store>/inbound-watermark.room.<escaped id>`),
+    ///     so a newer message in another room no longer buries an older one
+    ///     here, nor the other way round;
+    ///  2. a message from a sender other than `target` is journalled with that
+    ///     sender, and `replay_inbox` presents it as theirs (or drops it when
+    ///     `authorize_in_room` no longer admits them there);
+    ///  3. `drain_deliveries` redelivers a journalled reply into the room, never
+    ///     into the `target` DM.
+    ///
+    /// Read once at daemon start; a change takes a restart.
+    fn bound_rooms(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Handle one inbound message from `target` (or from a sender an
@@ -501,7 +526,12 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // host reboot): the next process resumes from the last processed message
     // instead of re-seeding to "now" and silently skipping everything that
     // was delivered while the daemon was down.
-    let watermark = Arc::new(Watermark::load_or_seed(&config.store_dir));
+    //
+    // Each of the handler's `bound_rooms` gets a watermark of its own, loaded
+    // and seeded the same way from its own file; with none (the default) this
+    // is exactly the one global watermark above, and no other file is touched.
+    let bound_rooms = handler.bound_rooms();
+    let watermark = Arc::new(InboundWatermarks::load_or_seed(&config.store_dir, &bound_rooms));
 
     // Durable work-journal: the inbox+outbox that makes every accepted message a
     // promise (answered-or-errored, delivery confirmed) across restarts AND token
@@ -606,7 +636,7 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // cycle's fresh token. Each confirmed send clears its journal entry; a
         // still-failing one stays for the next cycle. This is the outbound half of
         // the promise: a reply can never be silently dropped.
-        drain_deliveries(&agent, &target, &journal, handler.role()).await;
+        drain_deliveries(&agent, &target, &journal, handler.role(), &bound_rooms).await;
 
         // Once per process: replay inbound messages that were accepted but never
         // answered (crash/restart mid-turn). The watermark prevents sync from
@@ -763,7 +793,8 @@ fn spawn_shutdown_listener(shutdown: Arc<Notify>) {
 /// Run one client cycle: register handlers, sync until the rotation deadline
 /// (or sync end, or shutdown), then abort the sync task and report why it ended.
 ///
-/// `watermark` is the cross-cycle inbound-message dedupe key, owned by
+/// `watermark` is the cross-cycle inbound-message dedupe key (one per bound
+/// room plus the global one, see [`InboundWatermarks`]), owned by
 /// [`run_daemon`] and passed in (not created here). It is loaded once at
 /// daemon start from its file in the store dir (falling back to "now" when no
 /// usable file exists, so only the very first run ignores pre-startup
@@ -784,7 +815,7 @@ async fn run_cycle<H: MessageHandler>(
     target: &Arc<String>,
     handler: &Arc<H>,
     refresh_deadline: tokio::time::Instant,
-    watermark: Arc<Watermark>,
+    watermark: Arc<InboundWatermarks>,
     journal: Arc<WorkJournal>,
     recycle: &Notify,
     shutdown: &Notify,
@@ -970,7 +1001,7 @@ fn register_handler<H: MessageHandler>(
     agent: AgentClient,
     target: Arc<String>,
     handler: Arc<H>,
-    watermark: Arc<Watermark>,
+    watermark: Arc<InboundWatermarks>,
     journal: Arc<WorkJournal>,
 ) -> matrix_sdk::event_handler::EventHandlerHandle {
     agent.client().add_event_handler({
@@ -1143,14 +1174,17 @@ async fn backfill_missed<H: MessageHandler>(
     agent: &AgentClient,
     target: &str,
     handler: &Arc<H>,
-    watermark: &Watermark,
+    watermark: &InboundWatermarks,
     journal: &WorkJournal,
 ) {
-    let since = watermark.get();
+    let since = watermark.global().get();
     let scan = async {
         let mut pending: Vec<(u64, Room, OriginalSyncRoomMessageEvent)> = Vec::new();
         let mut utd = 0usize;
         for room in agent.client().joined_rooms() {
+            // The watermark `dispatch` will gate this room's messages on: a
+            // bound room's own, else the global one (`since`).
+            let since = watermark.for_room(room.room_id().as_str()).get();
             let mut from: Option<String> = None;
             let mut pages = 0usize;
             for _ in 0..BACKFILL_MAX_PAGES {
@@ -1326,7 +1360,7 @@ async fn dispatch<H: MessageHandler>(
     agent: &AgentClient,
     target: &str,
     handler: &Arc<H>,
-    watermark: &Watermark,
+    watermarks: &InboundWatermarks,
     journal: &WorkJournal,
 ) {
     // Only messages from the configured peer, and only ones newer than anything
@@ -1341,6 +1375,9 @@ async fn dispatch<H: MessageHandler>(
         warn_on_case_only_drop(ev.sender.as_str(), target, handler.role(), "message");
         return;
     }
+    // A bound room's messages are gated on (and advance) that room's own
+    // watermark, every other message the global one.
+    let watermark = watermarks.for_room(room.room_id().as_str());
     let ts_ms = u64::from(ev.origin_server_ts.0);
     if ts_ms <= watermark.get() {
         return;
@@ -1410,6 +1447,11 @@ async fn dispatch<H: MessageHandler>(
         msgtype: ev.content.msgtype.msgtype().to_string(),
         body: body.clone(),
         state: WorkState::Pending,
+        sender: journal_sender(
+            ev.sender.as_str(),
+            watermarks.is_bound(room.room_id().as_str()),
+            target,
+        ),
     });
     if !newly_enqueued {
         tracing::debug!(
@@ -1474,17 +1516,27 @@ async fn dispatch<H: MessageHandler>(
 /// send uses this cycle's freshly-minted token: that IS the self-heal for the
 /// token-rotation drop. A confirmed send clears the entry; a still-failing one
 /// stays for the next cycle. Never re-runs the handler (the text is cached).
+///
+/// A reply to a message from one of the handler's `bound_rooms` goes back into
+/// that room, everything else into the `target` DM (see [`redelivery_target`]).
+/// Both sends chunk and retry the same way and neither refreshes the token: a
+/// still-failing send (an `M_UNKNOWN_TOKEN` included) stays for the next cycle.
 async fn drain_deliveries(
     agent: &AgentClient,
     target: &str,
     journal: &WorkJournal,
     role: &str,
+    bound_rooms: &[String],
 ) {
     for item in journal.pending_deliveries() {
         let WorkState::ToDeliver { text } = &item.state else {
             continue;
         };
-        match agent.send_dm_chunked(target, text).await {
+        let sent = match redelivery_target(&item.room_id, bound_rooms) {
+            Redelivery::TargetDm => agent.send_dm_chunked(target, text).await,
+            Redelivery::Room(room_id) => agent.send_to_room_chunked(room_id, text).await,
+        };
+        match sent {
             Ok(_) => {
                 journal.mark_done(&item.event_id);
                 tracing::info!("{role}: redelivered journalled reply for {}", item.event_id);
@@ -1503,6 +1555,8 @@ async fn drain_deliveries(
 /// is the inbox promise surviving a restart. Runs ONCE per process (the live sync
 /// path handles everything after). Text-only: a media handle can't be re-resolved
 /// across a restart, so a replayed media message carries just its caption (logged).
+/// The author is the journalled sender when there is one (see [`journal_sender`]),
+/// `target` otherwise.
 async fn replay_inbox<H: MessageHandler>(
     agent: &AgentClient,
     target: &str,
@@ -1519,6 +1573,20 @@ async fn replay_inbox<H: MessageHandler>(
         pending.len()
     );
     for item in pending {
+        // Only a journalled sender is re-checked (a target-only journal replays
+        // exactly as before): the restart that applies a narrowed room policy
+        // must not hand the handler a message from someone it no longer admits.
+        if !replay_admitted(handler.as_ref(), &item, target) {
+            tracing::warn!(
+                "{}: dropping unfinished inbox message {} from {:?}: no longer admitted in {}",
+                handler.role(),
+                item.event_id,
+                item.sender.as_deref().unwrap_or_default(),
+                item.room_id
+            );
+            journal.mark_done(&item.event_id);
+            continue;
+        }
         if item.msgtype != "m.text" {
             tracing::warn!(
                 "{}: replaying non-text message {} ({}) with caption only — media not re-fetchable after restart",
@@ -1528,7 +1596,7 @@ async fn replay_inbox<H: MessageHandler>(
             );
         }
         let msg = InboundMessage {
-            sender_mxid: target,
+            sender_mxid: replay_sender(&item, target),
             sender_did: None,
             event_id: &item.event_id,
             room_id: &item.room_id,
@@ -1545,6 +1613,51 @@ async fn replay_inbox<H: MessageHandler>(
         if !handler.owns_completion() {
             journal.mark_done(&item.event_id);
         }
+    }
+}
+
+/// The sender [`dispatch`] journals with a message: `Some` only for a message
+/// in a bound room from someone other than `target` (ASCII case folded, as in
+/// [`mxid_authorized`], so the peer's own lowercased MXID never counts as
+/// "someone else"). `None` everywhere else, which is what keeps the journal of a
+/// handler without bound rooms byte-identical, whatever its `authorize` admits.
+fn journal_sender(sender: &str, room_bound: bool, target: &str) -> Option<String> {
+    (room_bound && !mxid_authorized(sender, target)).then(|| sender.to_string())
+}
+
+/// Who [`replay_inbox`] presents as a replayed message's author: the journalled
+/// sender when there is one, `target` otherwise (every item [`journal_sender`]
+/// left at `None`, and every item journalled before the field existed).
+fn replay_sender<'a>(item: &'a WorkItem, target: &'a str) -> &'a str {
+    item.sender.as_deref().unwrap_or(target)
+}
+
+/// Does [`replay_inbox`] still owe this item a handler run? An item with a
+/// journalled sender only if [`MessageHandler::authorize_in_room`] still admits
+/// that sender in the item's room; an item without one always (no check, as
+/// before: it is `target`'s).
+fn replay_admitted<H: MessageHandler>(handler: &H, item: &WorkItem, target: &str) -> bool {
+    item.sender
+        .as_deref()
+        .is_none_or(|sender| handler.authorize_in_room(sender, &item.room_id, target))
+}
+
+/// Where [`drain_deliveries`] resends a journalled reply.
+#[derive(Debug, PartialEq, Eq)]
+enum Redelivery<'a> {
+    /// The DM with `target`: every item outside the bound rooms.
+    TargetDm,
+    /// The bound room the message arrived in.
+    Room(&'a str),
+}
+
+/// Pick the [`Redelivery`] for an item that arrived in `room_id`: that room iff
+/// it is one of `bound_rooms` (exact string compare), else the `target` DM.
+fn redelivery_target<'a>(room_id: &'a str, bound_rooms: &[String]) -> Redelivery<'a> {
+    if bound_rooms.iter().any(|bound| bound == room_id) {
+        Redelivery::Room(room_id)
+    } else {
+        Redelivery::TargetDm
     }
 }
 
@@ -1586,7 +1699,12 @@ impl Watermark {
     /// preserves the original ignore-pre-startup-backlog behavior exactly
     /// once: the first start with persistence enabled.
     fn load_or_seed(store_dir: &Path) -> Self {
-        let path = store_dir.join(Self::FILE_NAME);
+        Self::load_or_seed_file(store_dir.join(Self::FILE_NAME))
+    }
+
+    /// [`load_or_seed`](Self::load_or_seed) for an explicit file: the global
+    /// watermark's, or a bound room's (see [`InboundWatermarks`]).
+    fn load_or_seed_file(path: PathBuf) -> Self {
         let value = match Self::load(&path) {
             Some(ts) => {
                 tracing::info!("inbound watermark restored: {ts} (from {})", path.display());
@@ -1616,7 +1734,7 @@ impl Watermark {
     /// a crash mid-write can never leave a torn file (worst case the old value
     /// survives). Failure is a WARN, never fatal.
     fn persist(path: &Path, value: u64) {
-        let tmp = path.with_extension("tmp");
+        let tmp = Self::tmp_path(path);
         let res = std::fs::write(&tmp, format!("{value}\n"))
             .and_then(|()| std::fs::rename(&tmp, path));
         if let Err(e) = res {
@@ -1625,6 +1743,17 @@ impl Watermark {
                 path.display()
             );
         }
+    }
+
+    /// `<file>.tmp`: appended, not `with_extension("tmp")`, which would map
+    /// every room file (`inbound-watermark.room.<id>`) onto the ONE temp file
+    /// `inbound-watermark.room.tmp`, so two concurrent advances could rename
+    /// one room's value into the other's file. For the global
+    /// `inbound-watermark` (no extension) both give `inbound-watermark.tmp`.
+    fn tmp_path(path: &Path) -> PathBuf {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
     }
 
     /// Current watermark (epoch ms).
@@ -1649,6 +1778,77 @@ impl Watermark {
             Self::persist(&self.path, self.get());
         }
     }
+}
+
+/// The inbound dedupe watermarks [`dispatch`] and [`backfill_missed`] gate on:
+/// the global [`Watermark`], plus one per [`MessageHandler::bound_rooms`] entry.
+///
+/// One watermark for every room is only safe while every admitted message
+/// comes from one sender in one DM. matrix-sdk 0.17 hands a sync's rooms to the
+/// handlers in room-id order, not timestamp order, so with a second room in
+/// play a newer message in one room advances the shared watermark past an older
+/// one still waiting in the other, which is then dropped as already seen, and
+/// backfill (which skips `ts <= watermark`) never brings it back. A bound room
+/// therefore keeps its own: its messages read and advance only that one, and
+/// no other message ever touches it. With no bound rooms this is the global
+/// watermark alone, loaded, seeded and persisted exactly as before.
+///
+/// A room's watermark lives in `<store>/inbound-watermark.room.<escaped id>`
+/// (see [`room_watermark_file`]) and is seeded and persisted by the same code
+/// as the global one: restored from its file, else seeded to "now" (the local
+/// clock, like the global seed) and written at once, then advanced and
+/// rewritten atomically on every dispatch.
+struct InboundWatermarks {
+    global: Watermark,
+    rooms: HashMap<String, Watermark>,
+}
+
+impl InboundWatermarks {
+    fn load_or_seed(store_dir: &Path, bound_rooms: &[String]) -> Self {
+        let global = Watermark::load_or_seed(store_dir);
+        let mut rooms = HashMap::new();
+        for room_id in bound_rooms {
+            // A duplicate entry must not open a second watermark on one file.
+            if !rooms.contains_key(room_id) {
+                let path = store_dir.join(room_watermark_file(room_id));
+                rooms.insert(room_id.clone(), Watermark::load_or_seed_file(path));
+            }
+        }
+        Self { global, rooms }
+    }
+
+    /// The watermark that gates a message in `room_id`: the room's own when it
+    /// is a bound room (exact string compare), the global one otherwise.
+    fn for_room(&self, room_id: &str) -> &Watermark {
+        self.rooms.get(room_id).unwrap_or(&self.global)
+    }
+
+    /// Is `room_id` one of the bound rooms?
+    fn is_bound(&self, room_id: &str) -> bool {
+        self.rooms.contains_key(room_id)
+    }
+
+    /// The global watermark, which every message outside the bound rooms uses.
+    fn global(&self) -> &Watermark {
+        &self.global
+    }
+}
+
+/// File name of a bound room's watermark: `inbound-watermark.room.` plus the
+/// room id with every byte outside `[A-Za-z0-9_-]` written as `%XX`. Injective
+/// (a `%` is escaped too), never a path separator, and no `.` after the prefix,
+/// so no room file can collide with another, with the global
+/// `inbound-watermark`, or with any of their `.tmp` files.
+fn room_watermark_file(room_id: &str) -> String {
+    let mut name = String::from("inbound-watermark.room.");
+    for byte in room_id.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    name
 }
 
 #[cfg(test)]
@@ -1885,7 +2085,8 @@ mod auth_tests {
 
 #[cfg(test)]
 mod watermark_tests {
-    use super::{now_epoch_ms, Watermark};
+    use super::auth_tests::{DM_ROOM, GROUP_ROOM, OTHER_ROOM};
+    use super::{now_epoch_ms, room_watermark_file, InboundWatermarks, Watermark};
     use std::path::PathBuf;
 
     /// Fresh per-test store dir under the OS temp dir (no tempfile dep: the
@@ -2017,6 +2218,240 @@ mod watermark_tests {
         std::fs::write(&path, "1749740000000\n").unwrap();
         assert_eq!(Watermark::load(&path), Some(1_749_740_000_000));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `dispatch`'s gate, against the watermark it picks for `room`: drop
+    /// `ts <= watermark`, else advance and deliver.
+    fn offer(wms: &InboundWatermarks, room: &str, ts: u64) -> bool {
+        let wm = wms.for_room(room);
+        let fresh = ts > wm.get();
+        if fresh {
+            wm.advance(ts);
+        }
+        fresh
+    }
+
+    fn file_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The bug a bound room exists for: matrix-sdk hands a sync's rooms over in
+    /// room-id order, so a newer message in one room can be dispatched before
+    /// an older one in another. With a watermark of its own, neither buries the
+    /// other, in either order, and each one advances only its own on disk.
+    #[test]
+    fn bound_room_and_dm_do_not_bury_each_other() {
+        let dir = temp_store("bound-order");
+        std::fs::write(dir.join(Watermark::FILE_NAME), "50\n").unwrap();
+        let room_file = dir.join(room_watermark_file(GROUP_ROOM));
+        std::fs::write(&room_file, "50\n").unwrap();
+        let wms = InboundWatermarks::load_or_seed(&dir, &[GROUP_ROOM.to_string()]);
+
+        // A newer DM message first, then an older one in the bound room.
+        assert!(offer(&wms, DM_ROOM, 300));
+        assert!(offer(&wms, GROUP_ROOM, 200), "the DM must not bury the bound room");
+        // A newer bound-room message first, then an older DM message.
+        assert!(offer(&wms, GROUP_ROOM, 500));
+        assert!(offer(&wms, DM_ROOM, 400), "the bound room must not bury the DM");
+
+        // Each still dedupes on its own.
+        assert!(!offer(&wms, DM_ROOM, 400));
+        assert!(!offer(&wms, GROUP_ROOM, 500));
+        // Any room that is not bound shares the global watermark, as before.
+        assert!(!offer(&wms, OTHER_ROOM, 350));
+        assert!(offer(&wms, OTHER_ROOM, 450));
+
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(450));
+        assert_eq!(Watermark::load(&room_file), Some(500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No bound rooms: one global watermark for every room, nothing else on
+    /// disk, and the cross-room burying it has always had (documented on
+    /// `authorize_in_room`) is unchanged.
+    #[test]
+    fn without_bound_rooms_one_global_watermark_as_before() {
+        let dir = temp_store("unbound");
+        std::fs::write(dir.join(Watermark::FILE_NAME), "50\n").unwrap();
+        let wms = InboundWatermarks::load_or_seed(&dir, &[]);
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""] {
+            assert!(std::ptr::eq(wms.for_room(room), wms.global()), "{room:?}");
+            assert!(!wms.is_bound(room), "{room:?}");
+        }
+        assert!(offer(&wms, DM_ROOM, 300));
+        assert!(!offer(&wms, GROUP_ROOM, 200), "one shared watermark, as today");
+        assert_eq!(file_names(&dir), vec![Watermark::FILE_NAME.to_string()]);
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(300));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bound room's watermark is seeded and persisted exactly like the global
+    /// one: absent file -> "now", written at once; advances survive a restart;
+    /// the global file is a separate value it never writes.
+    #[test]
+    fn bound_room_watermark_seeds_persists_and_reloads() {
+        let dir = temp_store("bound-persist");
+        let bound = [GROUP_ROOM.to_string()];
+        let room_file = dir.join(room_watermark_file(GROUP_ROOM));
+        let before = now_epoch_ms();
+        let wms = InboundWatermarks::load_or_seed(&dir, &bound);
+        let after = now_epoch_ms();
+        let seeded = wms.for_room(GROUP_ROOM).get();
+        assert!(seeded >= before && seeded <= after);
+        assert_eq!(Watermark::load(&room_file), Some(seeded));
+        let global = wms.global().get();
+
+        wms.for_room(GROUP_ROOM).advance(seeded + 60_000);
+        let reloaded = InboundWatermarks::load_or_seed(&dir, &bound);
+        assert_eq!(reloaded.for_room(GROUP_ROOM).get(), seeded + 60_000);
+        assert_eq!(reloaded.global().get(), global);
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(global));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_bound_room_opens_one_watermark() {
+        let dir = temp_store("bound-dup");
+        let wms = InboundWatermarks::load_or_seed(
+            &dir,
+            &[GROUP_ROOM.to_string(), GROUP_ROOM.to_string()],
+        );
+        assert_eq!(wms.rooms.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Room ids differing anywhere map to different files; none leaves the
+    /// store dir; none collides with the global file or any `.tmp` file.
+    #[test]
+    fn room_watermark_file_is_injective_and_flat() {
+        let ids = [
+            GROUP_ROOM,
+            "!grouproom:matrix.inblock.org",
+            "!grouproom:matrix.inblock.io.tmp",
+            "!group.room:x",
+            "!group%2Eroom:x",
+            "!GroupRoom:x",
+            "!grouproom:x",
+            "!../../etc:x",
+            "!r\u{00e4}um:x",
+        ];
+        let names: Vec<String> = ids.iter().map(|id| room_watermark_file(id)).collect();
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        let prefix = "inbound-watermark.room.";
+        for name in &names {
+            let escaped = name.strip_prefix(prefix).unwrap();
+            assert!(!escaped.contains(['/', '.']), "{name}");
+            assert_ne!(name, Watermark::FILE_NAME);
+        }
+        assert_eq!(
+            room_watermark_file(GROUP_ROOM),
+            "inbound-watermark.room.%21grouproom%3Amatrix%2Einblock%2Eio"
+        );
+        // The global temp file name is what it always was.
+        let global = std::path::Path::new("/s").join(Watermark::FILE_NAME);
+        assert_eq!(Watermark::tmp_path(&global), std::path::Path::new("/s/inbound-watermark.tmp"));
+        assert_eq!(global.with_extension("tmp"), Watermark::tmp_path(&global));
+        // Each room has its own temp file, not one shared `.room.tmp`.
+        let tmps: Vec<PathBuf> =
+            names.iter().map(|n| Watermark::tmp_path(&std::path::Path::new("/s").join(n))).collect();
+        let mut unique_tmps = tmps.clone();
+        unique_tmps.sort();
+        unique_tmps.dedup();
+        assert_eq!(unique_tmps.len(), tmps.len());
+    }
+}
+
+#[cfg(test)]
+mod restart_path_tests {
+    use super::auth_tests::{
+        DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM,
+    };
+    use super::{
+        journal_sender, redelivery_target, replay_admitted, replay_sender, MessageHandler,
+        Redelivery, WorkItem, WorkState,
+    };
+
+    const TARGET: &str = "@did-key-zDnaePeer:matrix.inblock.io";
+
+    fn item(room: &str, sender: Option<&str>) -> WorkItem {
+        WorkItem {
+            event_id: "$e".to_string(),
+            room_id: room.to_string(),
+            ts_ms: 1,
+            msgtype: "m.text".to_string(),
+            body: "b".to_string(),
+            state: WorkState::Pending,
+            sender: sender.map(str::to_string),
+        }
+    }
+
+    /// Only someone other than the target, only in a bound room. The target's
+    /// own (lowercased, as Synapse delivers it) MXID never counts as someone
+    /// else, and outside a bound room nothing is journalled whoever sent it,
+    /// so a handler without bound rooms writes exactly the old journal.
+    #[test]
+    fn journal_sender_only_for_others_in_bound_rooms() {
+        let delivered = TARGET.to_ascii_lowercase();
+        assert_eq!(journal_sender(COLLABORATOR, true, TARGET).as_deref(), Some(COLLABORATOR));
+        assert_eq!(journal_sender(&delivered, true, TARGET), None);
+        assert_eq!(journal_sender(TARGET, true, TARGET), None);
+        assert_eq!(journal_sender(COLLABORATOR, false, TARGET), None);
+        assert_eq!(journal_sender(&delivered, false, TARGET), None);
+    }
+
+    #[test]
+    fn replay_presents_the_journalled_sender() {
+        assert_eq!(replay_sender(&item(GROUP_ROOM, Some(COLLABORATOR)), TARGET), COLLABORATOR);
+        // No journalled sender (the target's, or an item from before the
+        // field): the target, exactly as before.
+        assert_eq!(replay_sender(&item(GROUP_ROOM, None), TARGET), TARGET);
+        assert_eq!(replay_sender(&item(DM_ROOM, None), TARGET), TARGET);
+    }
+
+    /// A journalled sender is replayed only while the policy still admits them
+    /// in that room; a narrowed policy (here: the override gone) drops it. An
+    /// item without one is replayed unchecked, as before.
+    #[test]
+    fn replay_rechecks_only_a_journalled_sender() {
+        let collab_in_group = item(GROUP_ROOM, Some(COLLABORATOR));
+        assert!(replay_admitted(&RoomPolicyHandler, &collab_in_group, TARGET));
+        assert!(!replay_admitted(&DefaultHandler, &collab_in_group, TARGET));
+        assert!(!replay_admitted(&RoomPolicyHandler, &item(DM_ROOM, Some(COLLABORATOR)), TARGET));
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            assert!(replay_admitted(&DefaultHandler, &item(room, None), TARGET));
+            assert!(replay_admitted(&RoomPolicyHandler, &item(room, None), TARGET));
+        }
+    }
+
+    #[test]
+    fn redelivery_goes_back_into_a_bound_room_only() {
+        let bound = [GROUP_ROOM.to_string()];
+        assert_eq!(redelivery_target(GROUP_ROOM, &bound), Redelivery::Room(GROUP_ROOM));
+        assert_eq!(redelivery_target(DM_ROOM, &bound), Redelivery::TargetDm);
+        assert_eq!(redelivery_target(OTHER_ROOM, &bound), Redelivery::TargetDm);
+        // Exact compare: no case fold, no prefix match.
+        assert_eq!(
+            redelivery_target(&GROUP_ROOM.to_ascii_uppercase(), &bound),
+            Redelivery::TargetDm
+        );
+        assert_eq!(redelivery_target("!grouproom", &bound), Redelivery::TargetDm);
+        // No bound rooms: every reply goes to the target DM, as before.
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""] {
+            assert_eq!(redelivery_target(room, &[]), Redelivery::TargetDm);
+        }
+    }
+
+    #[test]
+    fn default_handler_binds_no_room() {
+        assert!(DefaultHandler.bound_rooms().is_empty());
     }
 }
 
