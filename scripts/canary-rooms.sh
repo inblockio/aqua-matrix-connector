@@ -696,6 +696,17 @@ if want ignored; then
   check "$(verdict "$([ "$n" = 0 ] && echo 1)")" AC2.dm-ignored "no canary message in the collaborator's DM" "messages=$n"
   posts=$(canary_replies "$t"); n=$(printf '%s' "$posts" | count)
   check "$(verdict "$([ "$n" = 0 ] && echo 1)")" AC2.stranger "the stranger's room post triggered nothing" "posts=$n (watched ${NEG}s)" "$(printf '%s\n' "$posts" | brief)"
+  if [ "$INVITE_POLICY" = legacy ]; then
+    # Legacy left the canary joined in these rooms. A DM's members share power level 100, so the
+    # inviter cannot kick it; the test owner joins instead, so no room stays a true 1:1 that a
+    # later run's DM lookup (owner_only R17 checks) would reuse.
+    for spec in "collab|$CDM" "stranger|$SDM" "stranger|$SGR"; do
+      IFS="|" read -r who r <<<"$spec"
+      [ "$(probe "$who" membership "$r" "$OWNER" | kv membership)" = invite ] || probe "$who" invite "$r" "$OWNER" >/dev/null
+      probe owner join "$r" >/dev/null
+      info "legacy cleanup: $r now has the test owner as $(probe "$who" membership "$r" "$OWNER" | kv membership) (never a 1:1)"
+    done
+  fi
 fi
 
 # ------------------------------------------------------------------ boundinvite: H2 bound room
