@@ -45,6 +45,17 @@ pub struct WorkItem {
     /// original sync event).
     pub body: String,
     pub state: WorkState,
+    /// Who sent the message, recorded ONLY when the relay admitted someone other
+    /// than its `target` in one of the handler's bound rooms
+    /// (`MessageHandler::bound_rooms` in aqua-matrix-relay), so a replay can
+    /// present the real author. `None` means `target` and is not written at all:
+    /// a journal holding no such message is byte-identical to the format before
+    /// this field existed, and `serde(default)` reads that format. There is no
+    /// `deny_unknown_fields`, so an older binary still loads a journal that
+    /// carries the field; it drops it on its next rewrite and replays the item
+    /// as sent by `target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 /// Durable, process-shared journal of [`WorkItem`]s for one target. Cloneable via
@@ -199,6 +210,7 @@ mod tests {
             msgtype: "m.text".to_string(),
             body: format!("body of {id}"),
             state: WorkState::Pending,
+            sender: None,
         }
     }
 
@@ -269,6 +281,130 @@ mod tests {
                 text: "cached reply".into()
             }
         );
+    }
+
+    /// The on-disk bytes of an item without a recorded sender, exactly as every
+    /// binary before the `sender` field wrote them. Every live agent without
+    /// bound rooms journals only such items, so this must never move.
+    #[test]
+    fn item_without_sender_keeps_the_pre_sender_format() {
+        assert_eq!(
+            serde_json::to_string(&item("$a")).unwrap(),
+            r#"{"event_id":"$a","room_id":"!room:server","ts_ms":1,"msgtype":"m.text","body":"body of $a","state":"Pending"}"#
+        );
+        let dir = tmp_dir("format");
+        let j = WorkJournal::load_or_empty(&dir);
+        j.enqueue(item("$a"));
+        j.enqueue(item("$b"));
+        j.set_to_deliver("$b", "the answer");
+        let on_disk = std::fs::read_to_string(dir.join(WorkJournal::FILE_NAME)).unwrap();
+        assert_eq!(
+            on_disk,
+            r#"[
+  {
+    "event_id": "$a",
+    "room_id": "!room:server",
+    "ts_ms": 1,
+    "msgtype": "m.text",
+    "body": "body of $a",
+    "state": "Pending"
+  },
+  {
+    "event_id": "$b",
+    "room_id": "!room:server",
+    "ts_ms": 1,
+    "msgtype": "m.text",
+    "body": "body of $b",
+    "state": {
+      "ToDeliver": {
+        "text": "the answer"
+      }
+    }
+  }
+]"#
+        );
+    }
+
+    /// A recorded sender is written, survives a restart and comes back as-is.
+    #[test]
+    fn recorded_sender_round_trips_through_a_restart() {
+        let dir = tmp_dir("sender");
+        {
+            let j = WorkJournal::load_or_empty(&dir);
+            j.enqueue(WorkItem {
+                sender: Some("@collaborator:server".to_string()),
+                ..item("$from-collaborator")
+            });
+            j.enqueue(item("$from-target"));
+        }
+        let on_disk = std::fs::read_to_string(dir.join(WorkJournal::FILE_NAME)).unwrap();
+        assert_eq!(on_disk.matches("\"sender\"").count(), 1, "{on_disk}");
+        let pending = WorkJournal::load_or_empty(&dir).pending_work();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].sender.as_deref(), Some("@collaborator:server"));
+        assert_eq!(pending[1].sender, None);
+    }
+
+    /// A journal written before the field existed (the file every live agent
+    /// holds today) loads, every item without a sender.
+    #[test]
+    fn pre_sender_journal_loads_without_a_sender() {
+        let dir = tmp_dir("old-format");
+        std::fs::write(
+            dir.join(WorkJournal::FILE_NAME),
+            r#"[
+  {
+    "event_id": "$old",
+    "room_id": "!room:server",
+    "ts_ms": 1,
+    "msgtype": "m.text",
+    "body": "asked before the upgrade",
+    "state": "Pending"
+  },
+  {
+    "event_id": "$answered",
+    "room_id": "!room:server",
+    "ts_ms": 2,
+    "msgtype": "m.text",
+    "body": "q",
+    "state": {
+      "ToDeliver": {
+        "text": "a"
+      }
+    }
+  }
+]"#,
+        )
+        .unwrap();
+        let j = WorkJournal::load_or_empty(&dir);
+        assert_eq!(j.len(), 2, "an old-format journal must not load empty");
+        assert_eq!(j.pending_work()[0].sender, None);
+        assert_eq!(j.pending_work()[0].body, "asked before the upgrade");
+        assert_eq!(j.pending_deliveries()[0].sender, None);
+    }
+
+    /// Rollback: the item shape of a binary from before the field (same derive,
+    /// no `deny_unknown_fields`) still reads a journal that carries a sender.
+    #[test]
+    fn pre_sender_binary_reads_a_journal_with_a_sender() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreSenderWorkItem {
+            event_id: String,
+            room_id: String,
+            ts_ms: u64,
+            msgtype: String,
+            body: String,
+            state: WorkState,
+        }
+        let json = serde_json::to_string(&vec![WorkItem {
+            sender: Some("@collaborator:server".to_string()),
+            ..item("$a")
+        }])
+        .unwrap();
+        let old: Vec<PreSenderWorkItem> = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].event_id, "$a");
     }
 
     #[test]

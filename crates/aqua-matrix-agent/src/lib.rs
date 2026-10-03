@@ -280,6 +280,9 @@ pub struct AgentConfig {
     pub device_id: Option<String>,
 }
 
+/// The `body` [`AgentClient::messages`] gives an event it could not decrypt.
+pub const UNDECRYPTABLE_BODY: &str = "[unable to decrypt]";
+
 pub struct Message {
     pub sender: String,
     pub body: String,
@@ -299,6 +302,20 @@ impl Message {
             .iter()
             .any(|id| id.eq_ignore_ascii_case(mxid))
     }
+
+    /// Whether this is the placeholder for an event [`AgentClient::messages`]
+    /// could not decrypt (no text, no mentions), not a real message.
+    pub fn is_undecryptable(&self) -> bool {
+        self.body == UNDECRYPTABLE_BODY && self.mentioned_user_ids.is_empty()
+    }
+}
+
+/// One invite waiting for this account ([`AgentClient::pending_invites`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInvite {
+    pub room_id: String,
+    /// Who sent the invite; `None` when the invite event is not known locally.
+    pub inviter: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1490,6 +1507,13 @@ impl AgentClient {
         self.client.device_id().map(|d| d.to_string())
     }
 
+    /// Join EVERY pending invite, whoever sent it. For one-shot tools, drivers
+    /// and tests that invite themselves, and the relay's cycle start under its
+    /// default (Legacy) invite policy, unchanged since before 2026-10-03. A
+    /// daemon that must not join a stranger's invite (2026-10-03, one made a
+    /// consultant join a test room at cycle start) gates each invite via
+    /// [`AgentClient::pending_invites`] instead, as the relay's OwnerOnly
+    /// invite policy does.
     pub async fn join_invited_rooms(&self) -> Result<Vec<String>> {
         let mut joined = Vec::new();
         for room in self.client.invited_rooms() {
@@ -1505,6 +1529,52 @@ impl AgentClient {
             }
         }
         Ok(joined)
+    }
+
+    /// Every pending invite with the MXID that sent it, acting on none. The
+    /// inviter is the sender of our own `m.room.member` invite event in the
+    /// invite's stripped state; `None` when that event is not known locally
+    /// (the caller must then neither join nor decline on a guess).
+    pub async fn pending_invites(&self) -> Vec<PendingInvite> {
+        let mut out = Vec::new();
+        for room in self.client.invited_rooms() {
+            let room_id = room.room_id().to_string();
+            let inviter = match room.invite_details().await {
+                Ok(d) => Some(d.inviter_id.to_string()),
+                Err(e) => {
+                    tracing::debug!("invite to {room_id}: inviter unknown ({e})");
+                    None
+                }
+            };
+            out.push(PendingInvite { room_id, inviter });
+        }
+        out
+    }
+
+    /// Join one room this account is invited to.
+    pub async fn join_invited_room(&self, room_id: &str) -> Result<()> {
+        self.known_room(room_id)?
+            .join()
+            .await
+            .with_context(|| format!("joining {room_id}"))
+    }
+
+    /// Decline one invite (leave the invited room). A room already left is a
+    /// no-op.
+    pub async fn decline_invite(&self, room_id: &str) -> Result<()> {
+        self.known_room(room_id)?
+            .leave()
+            .await
+            .with_context(|| format!("declining the invite to {room_id}"))
+    }
+
+    fn known_room(&self, room_id: &str) -> Result<matrix_sdk::Room> {
+        let id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id {room_id:?}: {e}"))?;
+        self.client
+            .get_room(id)
+            .ok_or_else(|| anyhow!("room {room_id} is not known to this client"))
     }
 
     pub async fn dm_room_id(&self, target: &str) -> Result<Option<String>> {
@@ -1889,6 +1959,107 @@ impl AgentClient {
         Ok(last)
     }
 
+    /// [`send_to_room_chunked`](Self::send_to_room_chunked) that survives a dead
+    /// access token and can carry a real user mention.
+    ///
+    /// Token: a long-lived handler task may hold a clone of a client whose
+    /// connection cycle (and token) has ended, exactly as with
+    /// [`send_dm_reliable_with_refresh`](Self::send_dm_reliable_with_refresh).
+    /// Each chunk is sent with the retry-until-acknowledged loop; on
+    /// `M_UNKNOWN_TOKEN` the client reauths once and that CHUNK is retried, so
+    /// chunks already delivered are never sent twice.
+    ///
+    /// Mention: with `Some(mention)`, the LAST chunk carries it (see
+    /// [`mention_content`]): `m.mentions.user_ids = [user_id]` (MSC3952, the
+    /// field Synapse's `.m.rule.is_user_mention` push rule matches, so the user
+    /// is notified), a `matrix.to` pill in `formatted_body`, and the MXID in
+    /// `body`. Appended at the end, so the text's own first line stays first.
+    /// `None` sends plain Markdown chunks, byte-identical to
+    /// `send_to_room_chunked`. Returns the last delivered event id.
+    pub async fn send_to_room_chunked_with_refresh(
+        &mut self,
+        room_id: &str,
+        message: &str,
+        mention: Option<&RoomMention<'_>>,
+    ) -> Result<String> {
+        let chunks = split_for_matrix(message, STREAM_ROLLOVER_BYTES);
+        let n = chunks.len();
+        let mut last = String::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let content = match mention {
+                Some(m) if i + 1 == n => mention_content(chunk, m)?,
+                _ => RoomMessageEventContent::text_markdown(chunk),
+            };
+            let first = retry_finalize("send-room", || {
+                self.send_content_once(room_id, content.clone())
+            })
+            .await;
+            last = match first {
+                Ok(id) => id,
+                Err(e) if is_unknown_token(&e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "room send rejected with M_UNKNOWN_TOKEN; refreshing token and retrying the chunk once"
+                    );
+                    self.reauth_token_only()
+                        .await
+                        .context("token refresh after M_UNKNOWN_TOKEN failed")?;
+                    retry_finalize("send-room", || {
+                        self.send_content_once(room_id, content.clone())
+                    })
+                    .await
+                    .context("room send still failed after token refresh")?
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        Ok(last)
+    }
+}
+
+/// A user to @-mention in a room message: the MXID that goes into
+/// `m.mentions.user_ids` and the `body`, and the text shown on the pill.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomMention<'a> {
+    /// The mentioned user's MXID, e.g. `@tim:example.org`.
+    pub user_id: &'a str,
+    /// The pill's visible text, e.g. `Tim`.
+    pub display: &'a str,
+}
+
+/// Build an `m.room.message` that renders `markdown` and ends with a real
+/// mention of `mention.user_id`: `body` = the Markdown, a blank line, the MXID;
+/// `formatted_body` = the rendered Markdown (escaped plain text when it has no
+/// Markdown) followed by `<a href="https://matrix.to/#/<mxid>">display</a>`;
+/// `m.mentions.user_ids` = `[mxid]`. Errors on an invalid MXID.
+pub fn mention_content(markdown: &str, mention: &RoomMention<'_>) -> Result<RoomMessageEventContent> {
+    use matrix_sdk::ruma::events::room::message::FormattedBody;
+    use matrix_sdk::ruma::events::Mentions;
+    let user: OwnedUserId = mention
+        .user_id
+        .try_into()
+        .map_err(|e| anyhow!("invalid mention user id {:?}: {e}", mention.user_id))?;
+    let html_main = FormattedBody::markdown(markdown)
+        .map(|f| f.body)
+        .unwrap_or_else(|| html_escape(markdown).replace('\n', "<br>"));
+    let body = format!("{markdown}\n\n{user}");
+    let html = format!(
+        "{html_main}<p><a href=\"https://matrix.to/#/{user}\">{}</a></p>",
+        html_escape(mention.display)
+    );
+    Ok(RoomMessageEventContent::text_html(body, html).add_mentions(Mentions::with_user_ids([user])))
+}
+
+/// Minimal HTML text escaping for [`mention_content`].
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+impl AgentClient {
+
     /// [`send_dm`] bounded by [`SEND_ATTEMPT_TIMEOUT`] so a server-5xx that
     /// matrix-sdk would otherwise retry internally for minutes can't silently
     /// consume the access token's whole lifetime. A timeout is surfaced as a
@@ -2091,7 +2262,7 @@ impl AgentClient {
             if event.kind.is_utd() {
                 messages.push(Message {
                     sender: sender.to_string(),
-                    body: "[unable to decrypt]".into(),
+                    body: UNDECRYPTABLE_BODY.into(),
                     timestamp_ms: u64::from(timestamp.0),
                     event_id: event_id.to_string(),
                     mentioned_user_ids: Vec::new(),
@@ -2840,6 +3011,67 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    const TIM: &str = "@did-pkh-eip155-1-0xabc:example.org";
+
+    /// `messages()` marks an undecryptable event by its placeholder body; a
+    /// real message is never taken for one, even one quoting the placeholder
+    /// with a mention (a placeholder carries none).
+    #[test]
+    fn undecryptable_placeholder_is_recognised() {
+        let msg = |body: &str, mentions: Vec<String>| Message {
+            sender: TIM.into(),
+            body: body.into(),
+            timestamp_ms: 1,
+            event_id: "$e".into(),
+            mentioned_user_ids: mentions,
+        };
+        assert!(msg(UNDECRYPTABLE_BODY, vec![]).is_undecryptable());
+        assert!(!msg("hello", vec![]).is_undecryptable());
+        assert!(!msg("[unable to decrypt] really?", vec![]).is_undecryptable());
+        assert!(!msg(UNDECRYPTABLE_BODY, vec![TIM.into()]).is_undecryptable());
+    }
+
+    /// The wire JSON of a mention message: `m.mentions.user_ids` names exactly
+    /// the user, `formatted_body` ends with the matrix.to pill, `body` carries
+    /// the MXID, and the text's first line stays the first line.
+    #[test]
+    fn mention_content_carries_intentional_mention_pill_and_mxid() {
+        let text = "#pr-proposal aqua-rs-sdk: x\n\n#needs-tim\nTim decides **this**.";
+        let m = RoomMention { user_id: TIM, display: "Tim" };
+        let content = mention_content(text, &m).unwrap();
+        let v = serde_json::to_value(&content).unwrap();
+        assert_eq!(v["msgtype"], "m.text");
+        assert_eq!(v["m.mentions"]["user_ids"], serde_json::json!([TIM]));
+        let body = v["body"].as_str().unwrap();
+        assert!(body.starts_with("#pr-proposal aqua-rs-sdk: x\n"), "{body}");
+        assert!(body.ends_with(&format!("\n\n{TIM}")), "{body}");
+        assert_eq!(v["format"], "org.matrix.custom.html");
+        let html = v["formatted_body"].as_str().unwrap();
+        assert!(html.contains("<strong>this</strong>"), "markdown rendered: {html}");
+        assert!(
+            html.ends_with(&format!("<p><a href=\"https://matrix.to/#/{TIM}\">Tim</a></p>")),
+            "{html}"
+        );
+    }
+
+    /// Plain text without Markdown still gets an HTML body (escaped, line
+    /// breaks kept) so the pill renders; the pill text is escaped too.
+    #[test]
+    fn mention_content_plain_text_is_escaped() {
+        let m = RoomMention { user_id: TIM, display: "T<i>m" };
+        let content = mention_content("a < b\nc", &m).unwrap();
+        let v = serde_json::to_value(&content).unwrap();
+        let html = v["formatted_body"].as_str().unwrap();
+        assert!(html.starts_with("a &lt; b<br>c"), "{html}");
+        assert!(html.contains(">T&lt;i&gt;m</a>"), "{html}");
+    }
+
+    #[test]
+    fn mention_content_rejects_an_invalid_mxid() {
+        let m = RoomMention { user_id: "not-an-mxid", display: "Tim" };
+        assert!(mention_content("hi", &m).is_err());
+    }
 
     /// Strip whitespace and fence markers so we can assert no content was lost
     /// across a split regardless of where boundaries fell.

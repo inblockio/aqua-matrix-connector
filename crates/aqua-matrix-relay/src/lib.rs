@@ -29,7 +29,9 @@
 //!
 //! The outer loop in [`run_daemon`] builds a fresh [`AgentClient`] (which hits
 //! the refresh-grant path, preserving `device_id` and the crypto store), then:
-//!   1. joins any pending invites,
+//!   1. joins pending invites per its handler's [`InvitePolicy`]: all of
+//!      them by default (Legacy), or only those [`invite_decision`] admits,
+//!      declining the others (OwnerOnly),
 //!   2. sends the handler's one-time `hello()` on the first cycle only,
 //!   3. upserts the fleet-registry entry,
 //!   4. runs a sync stream + optional periodic tick until the token nears
@@ -39,6 +41,7 @@
 //! swap an access token in place; rotating the whole client ~30 s before expiry
 //! is what avoids the `M_UNKNOWN_TOKEN` sync wedge.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -71,9 +74,11 @@ use matrix_sdk::{
 pub use aqua_matrix_agent::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
     is_unknown_token, load_dotenv, ConnectErrorClass, ConnectOutcome, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
-    TypingGuard, WorkItem, WorkJournal, WorkState,
+    RoomMention, TypingGuard, WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
+
+use aqua_matrix_agent::PendingInvite;
 
 mod media;
 
@@ -273,8 +278,10 @@ pub trait MessageHandler: Send + Sync + 'static {
 
     /// DID/MXID allow-deny SEAM. Default == today's exact behavior (single
     /// target, ASCII-case-insensitive — see [`mxid_authorized`] for why that is
-    /// both correct and safe against impersonation). [`dispatch`] and
-    /// `register_invite_autojoin` call THIS instead of the inline equality check.
+    /// both correct and safe against impersonation). `register_invite_autojoin`
+    /// and `dispatch_call` call THIS instead of the inline equality check;
+    /// inbound messages go through [`authorize_in_room`](Self::authorize_in_room),
+    /// whose default delegates here.
     /// SEAM(aqua-security): this is the white/blacklist hook keyed on DIDs — a
     /// future signature will take `sender_did: Option<&str>` plus a per-template
     /// allow/deny policy object (BOTH an allow-list AND a deny-list); the bool
@@ -283,11 +290,76 @@ pub trait MessageHandler: Send + Sync + 'static {
         mxid_authorized(sender_mxid, target)
     }
 
-    /// Handle one inbound text message from `target`. The relay has already
-    /// confirmed the sender and deduplicated by timestamp watermark, so this
-    /// fires at most once per message. Now takes a structured message and
-    /// returns `Result` so the relay owns uniform error logging (the relay
-    /// still never unwinds; it logs the `Err`).
+    /// Room-aware allow SEAM for inbound MESSAGES only. Default == exactly
+    /// [`authorize`](Self::authorize): `room_id` is ignored, so a handler that
+    /// does not override this behaves byte-for-byte as before. [`dispatch`] and
+    /// [`backfill_missed`] call THIS; invite auto-join and call signaling never
+    /// do, they stay on `authorize` (target only).
+    ///
+    /// Override to admit an extra sender inside ONE room only (an external
+    /// collaborator in a group room), without widening anything else: such a
+    /// sender can never make the agent join a room, become its `m.direct` peer,
+    /// or ring it. Keep `target` admitted everywhere (delegate to `authorize`
+    /// for it) and compare `room_id` exactly: it is the opaque `!id:server`
+    /// form, never an alias or a display name.
+    ///
+    /// List every room an override admits an extra sender in under
+    /// [`bound_rooms`](Self::bound_rooms) too. A room missing there inherits
+    /// the single-target assumptions: every admitted sender shares the ONE
+    /// inbound [`Watermark`], so a message no newer than one already dispatched
+    /// from ANOTHER room is dropped, and backfill does not bring it back; and
+    /// the restart paths assume `target` (`replay_inbox` presents a replayed
+    /// message as sent by `target`, `drain_deliveries` redelivers into the
+    /// `target` DM). Answer room-scoped messages in their room via
+    /// `msg.room_id`, and read `msg.sender_mxid`, never `target`, as the author.
+    // The default ignores `room_id` by design (see above).
+    #[allow(unused_variables)]
+    fn authorize_in_room(&self, sender_mxid: &str, room_id: &str, target: &str) -> bool {
+        self.authorize(sender_mxid, target)
+    }
+
+    /// Rooms in which this handler admits senders other than `target` via
+    /// [`authorize_in_room`](Self::authorize_in_room). Default: none, and then
+    /// nothing below changes.
+    ///
+    /// For a room listed here (exact string compare, the opaque `!id:server`
+    /// form), and only for those, the relay drops its single-sender,
+    /// single-DM assumptions:
+    ///  1. the room gets its own inbound [`Watermark`], seeded and persisted
+    ///     exactly like the global one (`<store>/inbound-watermark.room.<escaped id>`),
+    ///     so a newer message in another room no longer buries an older one
+    ///     here, nor the other way round;
+    ///  2. a message from a sender other than `target` is journalled with that
+    ///     sender, and `replay_inbox` presents it as theirs (or drops it when
+    ///     `authorize_in_room` no longer admits them there);
+    ///  3. `drain_deliveries` redelivers a journalled reply into the room, never
+    ///     into the `target` DM.
+    ///
+    /// Read once at daemon start for the watermarks (a change takes a
+    /// restart), and per invite under [`InvitePolicy::OwnerOnly`], so return
+    /// the same list every time.
+    fn bound_rooms(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// How the relay treats room invites, see [`InvitePolicy`]. Default
+    /// [`InvitePolicy::Legacy`] keeps today's behaviour byte for byte (every
+    /// pending invite joined at cycle start, a live invite joined only from an
+    /// inviter [`authorize`](Self::authorize) admits and otherwise ignored,
+    /// never declined). Override per consultant from its config, never by a
+    /// code default. Consulted at every cycle start and on every live invite,
+    /// so return a constant.
+    fn invite_policy(&self) -> InvitePolicy {
+        InvitePolicy::Legacy
+    }
+
+    /// Handle one inbound message from `target` (or from a sender an
+    /// [`authorize_in_room`](Self::authorize_in_room) override admits in
+    /// `msg.room_id`). The relay has already confirmed the sender and
+    /// deduplicated by timestamp watermark, so this fires at most once per
+    /// message. Now takes a structured message and returns `Result` so the
+    /// relay owns uniform error logging (the relay still never unwinds; it logs
+    /// the `Err`).
     async fn handle_message(
         &self,
         agent: &AgentClient,
@@ -456,6 +528,15 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // that silently replies to no one. Non-fatal: we log and continue.
     validate_target(&target, handler.role());
 
+    // Logged only when not the default, so a Legacy daemon's output is
+    // unchanged.
+    if handler.invite_policy() == InvitePolicy::OwnerOnly {
+        tracing::info!(
+            "{}: invite policy owner_only (join invites from the target or into a bound room, decline the rest)",
+            handler.role()
+        );
+    }
+
     // The inbound-message dedupe watermark lives ACROSS cycles AND restarts:
     // loaded from `<store>/inbound-watermark` here (seeded to "now" only when
     // the file is absent or unparsable) and persisted by [`dispatch`] on every
@@ -471,7 +552,12 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // host reboot): the next process resumes from the last processed message
     // instead of re-seeding to "now" and silently skipping everything that
     // was delivered while the daemon was down.
-    let watermark = Arc::new(Watermark::load_or_seed(&config.store_dir));
+    //
+    // Each of the handler's `bound_rooms` gets a watermark of its own, loaded
+    // and seeded the same way from its own file; with none (the default) this
+    // is exactly the one global watermark above, and no other file is touched.
+    let bound_rooms = handler.bound_rooms();
+    let watermark = Arc::new(InboundWatermarks::load_or_seed(&config.store_dir, &bound_rooms));
 
     // Durable work-journal: the inbox+outbox that makes every accepted message a
     // promise (answered-or-errored, delivery confirmed) across restarts AND token
@@ -546,19 +632,12 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // spawns a DUPLICATE — which, against a programmatic peer, splits the two
         // sides into separate rooms and breaks Megolm key exchange (in
         // production it leaves stray empty rooms). The peer is the only party
-        // that DMs us, so any room it invited us to IS the DM room.
-        match agent.join_invited_rooms().await {
-            Ok(joined) => {
-                for room_id in &joined {
-                    if let Err(e) = agent.mark_dm(room_id, &target).await {
-                        tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
-                    } else {
-                        tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("{}: join_invited_rooms failed: {e:#}", handler.role()),
-        }
+        // that DMs us, so any room it invited us to IS the DM room. Which
+        // invites are joined is the handler's `invite_policy`: Legacy (the
+        // default) joins every one, as before R17; OwnerOnly joins only those
+        // `invite_decision` admits and declines the rest (R17, 2026-10-03: a
+        // stranger's invite made a consultant join a test room here).
+        accept_pending_invites(&agent, handler.as_ref(), &target).await;
 
         // One sync so the peer's device keys are known before we encrypt the
         // hello (otherwise the hello is undecryptable on their side until the
@@ -576,7 +655,7 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // cycle's fresh token. Each confirmed send clears its journal entry; a
         // still-failing one stays for the next cycle. This is the outbound half of
         // the promise: a reply can never be silently dropped.
-        drain_deliveries(&agent, &target, &journal, handler.role()).await;
+        drain_deliveries(&agent, &target, &journal, handler.role(), &bound_rooms).await;
 
         // Once per process: replay inbound messages that were accepted but never
         // answered (crash/restart mid-turn). The watermark prevents sync from
@@ -733,7 +812,8 @@ fn spawn_shutdown_listener(shutdown: Arc<Notify>) {
 /// Run one client cycle: register handlers, sync until the rotation deadline
 /// (or sync end, or shutdown), then abort the sync task and report why it ended.
 ///
-/// `watermark` is the cross-cycle inbound-message dedupe key, owned by
+/// `watermark` is the cross-cycle inbound-message dedupe key (one per bound
+/// room plus the global one, see [`InboundWatermarks`]), owned by
 /// [`run_daemon`] and passed in (not created here). It is loaded once at
 /// daemon start from its file in the store dir (falling back to "now" when no
 /// usable file exists, so only the very first run ignores pre-startup
@@ -754,7 +834,7 @@ async fn run_cycle<H: MessageHandler>(
     target: &Arc<String>,
     handler: &Arc<H>,
     refresh_deadline: tokio::time::Instant,
-    watermark: Arc<Watermark>,
+    watermark: Arc<InboundWatermarks>,
     journal: Arc<WorkJournal>,
     recycle: &Notify,
     shutdown: &Notify,
@@ -883,6 +963,194 @@ fn log_sync_end(res: Result<matrix_sdk::Result<()>, tokio::task::JoinError>) {
     }
 }
 
+/// How the relay treats room invites ([`MessageHandler::invite_policy`]).
+/// A per-consultant config switch: the default is the pre-R17 behaviour, and a
+/// fleet-wide change is made by flipping configs, never this default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InvitePolicy {
+    /// The behaviour before R17, unchanged: at cycle start every pending
+    /// invite is joined, whoever sent it ([`AgentClient::join_invited_rooms`]),
+    /// and recorded as the DM with `target`; the live auto-join joins an
+    /// invite whose inviter passes `authorize` and ignores every other one
+    /// (left pending, never declined).
+    #[default]
+    Legacy,
+    /// R17: join an invite from an inviter `authorize` admits or into one of
+    /// the handler's own [`bound_rooms`](MessageHandler::bound_rooms), decline
+    /// every other one (one fixed INFO line each), and leave one with an
+    /// unknown inviter pending. Same rule at cycle start and live
+    /// ([`invite_decision`]).
+    OwnerOnly,
+}
+
+/// What the relay does with one invite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteDecision {
+    /// Join (then `mark_dm`, which refuses anything but a true 1:1 with
+    /// `target`).
+    Join,
+    /// [`InvitePolicy::OwnerOnly`] only: decline (leave the invited room).
+    Decline,
+    /// The inviter is not known locally: neither join nor decline on a guess.
+    Undecided,
+    /// [`InvitePolicy::Legacy`] live auto-join only: an inviter `authorize`
+    /// rejects is ignored, the invite stays pending, never declined (the next
+    /// cycle start joins it, as before R17).
+    Ignore,
+}
+
+/// The [`InvitePolicy::OwnerOnly`] invite rule, shared by its cycle-start join
+/// and its live auto-join: join an invite whose inviter passes
+/// `handler.authorize(inviter, target)` or whose `room_id` is one of the
+/// handler's own [`bound_rooms`](MessageHandler::bound_rooms) (exact compare,
+/// the opaque `!id:server` form), decline every other invite, and leave one
+/// with an unknown inviter alone (bound room or not). Deliberately
+/// `authorize`, never `authorize_in_room`: a room-scoped sender must never
+/// make the agent join a room its config does not bind, and a join is
+/// followed by `mark_dm(.., target)`.
+pub fn invite_decision<H: MessageHandler + ?Sized>(
+    handler: &H,
+    room_id: &str,
+    inviter: Option<&str>,
+    target: &str,
+) -> InviteDecision {
+    match inviter {
+        None => InviteDecision::Undecided,
+        Some(inviter) if handler.authorize(inviter, target) => InviteDecision::Join,
+        Some(_) if handler.bound_rooms().iter().any(|r| r == room_id) => InviteDecision::Join,
+        Some(_) => InviteDecision::Decline,
+    }
+}
+
+/// The live auto-join's decision for one invite event, per the handler's
+/// [`InvitePolicy`]. Legacy is the pre-R17 check unchanged (`authorize`
+/// admits: join; anyone else: ignore, never decline); OwnerOnly is
+/// [`invite_decision`].
+fn live_invite_decision<H: MessageHandler + ?Sized>(
+    handler: &H,
+    room_id: &str,
+    inviter: &str,
+    target: &str,
+) -> InviteDecision {
+    match handler.invite_policy() {
+        InvitePolicy::Legacy if handler.authorize(inviter, target) => InviteDecision::Join,
+        InvitePolicy::Legacy => InviteDecision::Ignore,
+        InvitePolicy::OwnerOnly => invite_decision(handler, room_id, Some(inviter), target),
+    }
+}
+
+/// The INFO line for a declined invite (one per invite, both paths). Kept in
+/// one place: the canary greps for it.
+fn declined_invite_line(role: &str, room_id: &str, inviter: &str) -> String {
+    format!("{role}: declined invite to {room_id} from {inviter} (inviter not authorized)")
+}
+
+/// The [`AgentClient`] calls the cycle-start invite handling makes. A seam so
+/// a test can prove which calls each [`InvitePolicy`] makes without a
+/// homeserver; production is [`AgentClient`], by plain delegation.
+#[async_trait]
+trait InviteOps: Send + Sync {
+    async fn join_invited_rooms(&self) -> anyhow::Result<Vec<String>>;
+    async fn pending_invites(&self) -> Vec<PendingInvite>;
+    async fn join_invited_room(&self, room_id: &str) -> anyhow::Result<()>;
+    async fn decline_invite(&self, room_id: &str) -> anyhow::Result<()>;
+    async fn mark_dm(&self, room_id: &str, target: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl InviteOps for AgentClient {
+    async fn join_invited_rooms(&self) -> anyhow::Result<Vec<String>> {
+        AgentClient::join_invited_rooms(self).await
+    }
+    async fn pending_invites(&self) -> Vec<PendingInvite> {
+        AgentClient::pending_invites(self).await
+    }
+    async fn join_invited_room(&self, room_id: &str) -> anyhow::Result<()> {
+        AgentClient::join_invited_room(self, room_id).await
+    }
+    async fn decline_invite(&self, room_id: &str) -> anyhow::Result<()> {
+        AgentClient::decline_invite(self, room_id).await
+    }
+    async fn mark_dm(&self, room_id: &str, target: &str) -> anyhow::Result<()> {
+        AgentClient::mark_dm(self, room_id, target).await
+    }
+}
+
+/// Cycle start: act on the pending invites per the handler's
+/// [`InvitePolicy`], then record each joined room as the DM with our peer.
+async fn accept_pending_invites<O, H>(agent: &O, handler: &H, target: &str)
+where
+    O: InviteOps + ?Sized,
+    H: MessageHandler + ?Sized,
+{
+    match handler.invite_policy() {
+        // Pre-R17 main, unchanged: join EVERY pending invite, whoever sent it.
+        InvitePolicy::Legacy => match agent.join_invited_rooms().await {
+            Ok(joined) => {
+                for room_id in &joined {
+                    if let Err(e) = agent.mark_dm(room_id, target).await {
+                        tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
+                    } else {
+                        tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("{}: join_invited_rooms failed: {e:#}", handler.role()),
+        },
+        // R17: only the invites `invite_decision` admits are joined, the same
+        // rule as the live `register_invite_autojoin`; the others are declined.
+        InvitePolicy::OwnerOnly => {
+            for room_id in &join_authorized_invites(agent, handler, target).await {
+                if let Err(e) = agent.mark_dm(room_id, target).await {
+                    tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
+                } else {
+                    tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
+                }
+            }
+        }
+    }
+}
+
+/// [`InvitePolicy::OwnerOnly`] cycle-start half of the invite rule: act on
+/// every pending invite per [`invite_decision`] and return the rooms joined.
+async fn join_authorized_invites<O, H>(agent: &O, handler: &H, target: &str) -> Vec<String>
+where
+    O: InviteOps + ?Sized,
+    H: MessageHandler + ?Sized,
+{
+    let role = handler.role();
+    let mut joined = Vec::new();
+    for inv in agent.pending_invites().await {
+        let room_id = inv.room_id.as_str();
+        match (invite_decision(handler, room_id, inv.inviter.as_deref(), target), inv.inviter.as_deref()) {
+            (InviteDecision::Join, inviter) => match agent.join_invited_room(room_id).await {
+                Ok(()) => {
+                    tracing::info!("{role}: joined invited room {room_id} from {}", inviter.unwrap_or("?"));
+                    joined.push(inv.room_id.clone());
+                }
+                Err(e) => tracing::warn!("{role}: joining invited room {room_id} failed: {e:#}"),
+            },
+            (InviteDecision::Decline, Some(inviter)) => {
+                warn_on_case_only_drop(inviter, target, role, "invite");
+                match agent.decline_invite(room_id).await {
+                    Ok(()) => tracing::info!("{}", declined_invite_line(role, room_id, inviter)),
+                    Err(e) => tracing::warn!(
+                        "{role}: declining the invite to {room_id} from {inviter} failed: {e:#}"
+                    ),
+                }
+            }
+            (InviteDecision::Decline, None) | (InviteDecision::Undecided, _) => tracing::info!(
+                "{role}: invite to {room_id} left pending: inviter unknown (not joined, not declined)"
+            ),
+            // `invite_decision` never ignores (that is the Legacy live path).
+            (InviteDecision::Ignore, _) => tracing::info!(
+                "{role}: invite to {room_id} left pending (not joined, not declined)"
+            ),
+        }
+    }
+    joined
+}
+
 /// Continuously auto-join rooms we are invited to (and record them as the DM
 /// with our peer), so the daemon converges on the SAME room the peer created
 /// rather than `create_dm` later spawning a duplicate. Registered on the sync
@@ -913,9 +1181,37 @@ fn register_invite_autojoin<H: MessageHandler>(
                 // (was: any inviter) — the default `authorize` keeps the
                 // case-insensitive single-peer check. Safe under the strict
                 // single-peer DM design; messaging/dispatch behavior unchanged.
-                if !handler.authorize(ev.sender.as_str(), &target) {
-                    warn_on_case_only_drop(ev.sender.as_str(), &target, handler.role(), "invite");
-                    return;
+                // Deliberately `authorize`, never `authorize_in_room`: a
+                // room-scoped sender must never make the agent join a room, and
+                // a join here is followed by `mark_dm(.., target)`, which would
+                // also make that room the agent's `m.direct` DM with its peer.
+                // Which invites are joined is the handler's `invite_policy`
+                // (`live_invite_decision`): Legacy (the default) ignores any
+                // other inviter's invite, as before R17; OwnerOnly also joins
+                // one into a bound room and declines the rest (R17), instead of
+                // leaving them pending for the next cycle start to reconsider.
+                let inviter = ev.sender.as_str();
+                let invited_room = room.room_id().to_string();
+                match live_invite_decision(handler.as_ref(), &invited_room, inviter, &target) {
+                    InviteDecision::Join => {}
+                    // Legacy: pre-R17 main, unchanged.
+                    InviteDecision::Ignore => {
+                        warn_on_case_only_drop(inviter, &target, handler.role(), "invite");
+                        return;
+                    }
+                    InviteDecision::Decline => {
+                        warn_on_case_only_drop(inviter, &target, handler.role(), "invite");
+                        let room_id = invited_room.as_str();
+                        match room.leave().await {
+                            Ok(()) => tracing::info!("{}", declined_invite_line(&role, room_id, inviter)),
+                            Err(e) => tracing::warn!(
+                                "{role}: declining the invite to {room_id} from {inviter} failed: {e:#}"
+                            ),
+                        }
+                        return;
+                    }
+                    // The sender of a live invite event is always known.
+                    InviteDecision::Undecided => return,
                 }
                 match room.join().await {
                     Ok(()) => {
@@ -936,7 +1232,7 @@ fn register_handler<H: MessageHandler>(
     agent: AgentClient,
     target: Arc<String>,
     handler: Arc<H>,
-    watermark: Arc<Watermark>,
+    watermark: Arc<InboundWatermarks>,
     journal: Arc<WorkJournal>,
 ) -> matrix_sdk::event_handler::EventHandlerHandle {
     agent.client().add_event_handler({
@@ -1052,6 +1348,10 @@ async fn dispatch_call<H: MessageHandler>(
     sender: &str,
     room_id: &str,
 ) {
+    // Deliberately `authorize`, never `authorize_in_room`, even though the room
+    // is known here: a sender admitted for messages in one room must never be
+    // able to ring the agent or reach `on_call`, whose contract is "from
+    // `target`" (a handler may well ring `target` back from it).
     if !handler.authorize(sender, target) {
         warn_on_case_only_drop(sender, target, handler.role(), "call");
         return;
@@ -1105,14 +1405,17 @@ async fn backfill_missed<H: MessageHandler>(
     agent: &AgentClient,
     target: &str,
     handler: &Arc<H>,
-    watermark: &Watermark,
+    watermark: &InboundWatermarks,
     journal: &WorkJournal,
 ) {
-    let since = watermark.get();
+    let since = watermark.global().get();
     let scan = async {
         let mut pending: Vec<(u64, Room, OriginalSyncRoomMessageEvent)> = Vec::new();
         let mut utd = 0usize;
         for room in agent.client().joined_rooms() {
+            // The watermark `dispatch` will gate this room's messages on: a
+            // bound room's own, else the global one (`since`).
+            let since = watermark.for_room(room.room_id().as_str()).get();
             let mut from: Option<String> = None;
             let mut pages = 0usize;
             for _ in 0..BACKFILL_MAX_PAGES {
@@ -1142,13 +1445,15 @@ async fn backfill_missed<H: MessageHandler>(
                         continue;
                     }
                     // `sender` is plaintext even on an undecryptable event, so
-                    // the peer check works for both kinds.
-                    let from_peer = event
-                        .raw()
-                        .get_field::<String>("sender")
-                        .ok()
-                        .flatten()
-                        .is_some_and(|sender| handler.authorize(&sender, target));
+                    // the peer check works for both kinds. Room-aware, exactly
+                    // as in `dispatch`: the room is known here.
+                    let sender = event.raw().get_field::<String>("sender").ok().flatten();
+                    let from_peer = backfill_sender_admitted(
+                        handler.as_ref(),
+                        sender.as_deref(),
+                        room.room_id().as_str(),
+                        target,
+                    );
                     match backfill_verdict(ts, since, from_peer, event.kind.is_utd()) {
                         BackfillVerdict::Skip => continue,
                         BackfillVerdict::Undecryptable => {
@@ -1264,13 +1569,29 @@ fn backfill_verdict(
     }
 }
 
+/// The `from_peer` input of [`backfill_verdict`]: is this backfilled event's
+/// `sender` admitted in `room_id`? Same [`MessageHandler::authorize_in_room`]
+/// check as [`dispatch`], so backfill and the live stream can never disagree
+/// about who is admitted where ("peer" then also covers a sender an override
+/// admits in that one room). An event with no readable `sender` is never
+/// admitted. Split out of [`backfill_missed`] so the room-aware decision is
+/// testable without a Matrix client.
+fn backfill_sender_admitted<H: MessageHandler>(
+    handler: &H,
+    sender: Option<&str>,
+    room_id: &str,
+    target: &str,
+) -> bool {
+    sender.is_some_and(|sender| handler.authorize_in_room(sender, room_id, target))
+}
+
 async fn dispatch<H: MessageHandler>(
     ev: OriginalSyncRoomMessageEvent,
     room: Room,
     agent: &AgentClient,
     target: &str,
     handler: &Arc<H>,
-    watermark: &Watermark,
+    watermarks: &InboundWatermarks,
     journal: &WorkJournal,
 ) {
     // Only messages from the configured peer, and only ones newer than anything
@@ -1278,11 +1599,16 @@ async fn dispatch<H: MessageHandler>(
     // case-insensitively: Synapse canonicalises MXIDs to lowercase, so
     // `ev.sender` is lowercased, while a `--target` derived from a mixed-case
     // `did:key` is not — an exact compare would silently drop every inbound
-    // message from such a peer.
-    if !handler.authorize(ev.sender.as_str(), target) {
+    // message from such a peer. Room-aware: the default `authorize_in_room` is
+    // exactly `authorize`; only an override admits another sender, and only in
+    // the rooms it names.
+    if !handler.authorize_in_room(ev.sender.as_str(), room.room_id().as_str(), target) {
         warn_on_case_only_drop(ev.sender.as_str(), target, handler.role(), "message");
         return;
     }
+    // A bound room's messages are gated on (and advance) that room's own
+    // watermark, every other message the global one.
+    let watermark = watermarks.for_room(room.room_id().as_str());
     let ts_ms = u64::from(ev.origin_server_ts.0);
     if ts_ms <= watermark.get() {
         return;
@@ -1352,6 +1678,11 @@ async fn dispatch<H: MessageHandler>(
         msgtype: ev.content.msgtype.msgtype().to_string(),
         body: body.clone(),
         state: WorkState::Pending,
+        sender: journal_sender(
+            ev.sender.as_str(),
+            watermarks.is_bound(room.room_id().as_str()),
+            target,
+        ),
     });
     if !newly_enqueued {
         tracing::debug!(
@@ -1416,17 +1747,27 @@ async fn dispatch<H: MessageHandler>(
 /// send uses this cycle's freshly-minted token: that IS the self-heal for the
 /// token-rotation drop. A confirmed send clears the entry; a still-failing one
 /// stays for the next cycle. Never re-runs the handler (the text is cached).
+///
+/// A reply to a message from one of the handler's `bound_rooms` goes back into
+/// that room, everything else into the `target` DM (see [`redelivery_target`]).
+/// Both sends chunk and retry the same way and neither refreshes the token: a
+/// still-failing send (an `M_UNKNOWN_TOKEN` included) stays for the next cycle.
 async fn drain_deliveries(
     agent: &AgentClient,
     target: &str,
     journal: &WorkJournal,
     role: &str,
+    bound_rooms: &[String],
 ) {
     for item in journal.pending_deliveries() {
         let WorkState::ToDeliver { text } = &item.state else {
             continue;
         };
-        match agent.send_dm_chunked(target, text).await {
+        let sent = match redelivery_target(&item.room_id, bound_rooms) {
+            Redelivery::TargetDm => agent.send_dm_chunked(target, text).await,
+            Redelivery::Room(room_id) => agent.send_to_room_chunked(room_id, text).await,
+        };
+        match sent {
             Ok(_) => {
                 journal.mark_done(&item.event_id);
                 tracing::info!("{role}: redelivered journalled reply for {}", item.event_id);
@@ -1445,6 +1786,8 @@ async fn drain_deliveries(
 /// is the inbox promise surviving a restart. Runs ONCE per process (the live sync
 /// path handles everything after). Text-only: a media handle can't be re-resolved
 /// across a restart, so a replayed media message carries just its caption (logged).
+/// The author is the journalled sender when there is one (see [`journal_sender`]),
+/// `target` otherwise.
 async fn replay_inbox<H: MessageHandler>(
     agent: &AgentClient,
     target: &str,
@@ -1461,6 +1804,20 @@ async fn replay_inbox<H: MessageHandler>(
         pending.len()
     );
     for item in pending {
+        // Only a journalled sender is re-checked (a target-only journal replays
+        // exactly as before): the restart that applies a narrowed room policy
+        // must not hand the handler a message from someone it no longer admits.
+        if !replay_admitted(handler.as_ref(), &item, target) {
+            tracing::warn!(
+                "{}: dropping unfinished inbox message {} from {:?}: no longer admitted in {}",
+                handler.role(),
+                item.event_id,
+                item.sender.as_deref().unwrap_or_default(),
+                item.room_id
+            );
+            journal.mark_done(&item.event_id);
+            continue;
+        }
         if item.msgtype != "m.text" {
             tracing::warn!(
                 "{}: replaying non-text message {} ({}) with caption only — media not re-fetchable after restart",
@@ -1470,7 +1827,7 @@ async fn replay_inbox<H: MessageHandler>(
             );
         }
         let msg = InboundMessage {
-            sender_mxid: target,
+            sender_mxid: replay_sender(&item, target),
             sender_did: None,
             event_id: &item.event_id,
             room_id: &item.room_id,
@@ -1487,6 +1844,51 @@ async fn replay_inbox<H: MessageHandler>(
         if !handler.owns_completion() {
             journal.mark_done(&item.event_id);
         }
+    }
+}
+
+/// The sender [`dispatch`] journals with a message: `Some` only for a message
+/// in a bound room from someone other than `target` (ASCII case folded, as in
+/// [`mxid_authorized`], so the peer's own lowercased MXID never counts as
+/// "someone else"). `None` everywhere else, which is what keeps the journal of a
+/// handler without bound rooms byte-identical, whatever its `authorize` admits.
+fn journal_sender(sender: &str, room_bound: bool, target: &str) -> Option<String> {
+    (room_bound && !mxid_authorized(sender, target)).then(|| sender.to_string())
+}
+
+/// Who [`replay_inbox`] presents as a replayed message's author: the journalled
+/// sender when there is one, `target` otherwise (every item [`journal_sender`]
+/// left at `None`, and every item journalled before the field existed).
+fn replay_sender<'a>(item: &'a WorkItem, target: &'a str) -> &'a str {
+    item.sender.as_deref().unwrap_or(target)
+}
+
+/// Does [`replay_inbox`] still owe this item a handler run? An item with a
+/// journalled sender only if [`MessageHandler::authorize_in_room`] still admits
+/// that sender in the item's room; an item without one always (no check, as
+/// before: it is `target`'s).
+fn replay_admitted<H: MessageHandler>(handler: &H, item: &WorkItem, target: &str) -> bool {
+    item.sender
+        .as_deref()
+        .is_none_or(|sender| handler.authorize_in_room(sender, &item.room_id, target))
+}
+
+/// Where [`drain_deliveries`] resends a journalled reply.
+#[derive(Debug, PartialEq, Eq)]
+enum Redelivery<'a> {
+    /// The DM with `target`: every item outside the bound rooms.
+    TargetDm,
+    /// The bound room the message arrived in.
+    Room(&'a str),
+}
+
+/// Pick the [`Redelivery`] for an item that arrived in `room_id`: that room iff
+/// it is one of `bound_rooms` (exact string compare), else the `target` DM.
+fn redelivery_target<'a>(room_id: &'a str, bound_rooms: &[String]) -> Redelivery<'a> {
+    if bound_rooms.iter().any(|bound| bound == room_id) {
+        Redelivery::Room(room_id)
+    } else {
+        Redelivery::TargetDm
     }
 }
 
@@ -1528,7 +1930,12 @@ impl Watermark {
     /// preserves the original ignore-pre-startup-backlog behavior exactly
     /// once: the first start with persistence enabled.
     fn load_or_seed(store_dir: &Path) -> Self {
-        let path = store_dir.join(Self::FILE_NAME);
+        Self::load_or_seed_file(store_dir.join(Self::FILE_NAME))
+    }
+
+    /// [`load_or_seed`](Self::load_or_seed) for an explicit file: the global
+    /// watermark's, or a bound room's (see [`InboundWatermarks`]).
+    fn load_or_seed_file(path: PathBuf) -> Self {
         let value = match Self::load(&path) {
             Some(ts) => {
                 tracing::info!("inbound watermark restored: {ts} (from {})", path.display());
@@ -1558,7 +1965,7 @@ impl Watermark {
     /// a crash mid-write can never leave a torn file (worst case the old value
     /// survives). Failure is a WARN, never fatal.
     fn persist(path: &Path, value: u64) {
-        let tmp = path.with_extension("tmp");
+        let tmp = Self::tmp_path(path);
         let res = std::fs::write(&tmp, format!("{value}\n"))
             .and_then(|()| std::fs::rename(&tmp, path));
         if let Err(e) = res {
@@ -1567,6 +1974,17 @@ impl Watermark {
                 path.display()
             );
         }
+    }
+
+    /// `<file>.tmp`: appended, not `with_extension("tmp")`, which would map
+    /// every room file (`inbound-watermark.room.<id>`) onto the ONE temp file
+    /// `inbound-watermark.room.tmp`, so two concurrent advances could rename
+    /// one room's value into the other's file. For the global
+    /// `inbound-watermark` (no extension) both give `inbound-watermark.tmp`.
+    fn tmp_path(path: &Path) -> PathBuf {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        PathBuf::from(tmp)
     }
 
     /// Current watermark (epoch ms).
@@ -1593,9 +2011,84 @@ impl Watermark {
     }
 }
 
+/// The inbound dedupe watermarks [`dispatch`] and [`backfill_missed`] gate on:
+/// the global [`Watermark`], plus one per [`MessageHandler::bound_rooms`] entry.
+///
+/// One watermark for every room is only safe while every admitted message
+/// comes from one sender in one DM. matrix-sdk 0.17 hands a sync's rooms to the
+/// handlers in room-id order, not timestamp order, so with a second room in
+/// play a newer message in one room advances the shared watermark past an older
+/// one still waiting in the other, which is then dropped as already seen, and
+/// backfill (which skips `ts <= watermark`) never brings it back. A bound room
+/// therefore keeps its own: its messages read and advance only that one, and
+/// no other message ever touches it. With no bound rooms this is the global
+/// watermark alone, loaded, seeded and persisted exactly as before.
+///
+/// A room's watermark lives in `<store>/inbound-watermark.room.<escaped id>`
+/// (see [`room_watermark_file`]) and is seeded and persisted by the same code
+/// as the global one: restored from its file, else seeded to "now" (the local
+/// clock, like the global seed) and written at once, then advanced and
+/// rewritten atomically on every dispatch.
+struct InboundWatermarks {
+    global: Watermark,
+    rooms: HashMap<String, Watermark>,
+}
+
+impl InboundWatermarks {
+    fn load_or_seed(store_dir: &Path, bound_rooms: &[String]) -> Self {
+        let global = Watermark::load_or_seed(store_dir);
+        let mut rooms = HashMap::new();
+        for room_id in bound_rooms {
+            // A duplicate entry must not open a second watermark on one file.
+            if !rooms.contains_key(room_id) {
+                let path = store_dir.join(room_watermark_file(room_id));
+                rooms.insert(room_id.clone(), Watermark::load_or_seed_file(path));
+            }
+        }
+        Self { global, rooms }
+    }
+
+    /// The watermark that gates a message in `room_id`: the room's own when it
+    /// is a bound room (exact string compare), the global one otherwise.
+    fn for_room(&self, room_id: &str) -> &Watermark {
+        self.rooms.get(room_id).unwrap_or(&self.global)
+    }
+
+    /// Is `room_id` one of the bound rooms?
+    fn is_bound(&self, room_id: &str) -> bool {
+        self.rooms.contains_key(room_id)
+    }
+
+    /// The global watermark, which every message outside the bound rooms uses.
+    fn global(&self) -> &Watermark {
+        &self.global
+    }
+}
+
+/// File name of a bound room's watermark: `inbound-watermark.room.` plus the
+/// room id with every byte outside `[A-Za-z0-9_-]` written as `%XX`. Injective
+/// (a `%` is escaped too), never a path separator, and no `.` after the prefix,
+/// so no room file can collide with another, with the global
+/// `inbound-watermark`, or with any of their `.tmp` files.
+fn room_watermark_file(room_id: &str) -> String {
+    let mut name = String::from("inbound-watermark.room.");
+    for byte in room_id.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    name
+}
+
 #[cfg(test)]
 mod auth_tests {
-    use super::{is_case_only_mismatch, mxid_authorized, validate_target};
+    use super::{
+        async_trait, declined_invite_line, invite_decision, is_case_only_mismatch,
+        mxid_authorized, validate_target, AgentClient, InboundMessage, InviteDecision,
+        MessageHandler,
+    };
 
     // The real fleet's two contrasting peers: one all-lowercase localpart, one
     // mixed-case `did:key`. Synapse delivers `ev.sender` lowercased in both
@@ -1603,7 +2096,7 @@ mod auth_tests {
     // accept the lowercased sender against EITHER configured form.
     const TARGET_LOWER: &str =
         "@did-key-zdnaezp2zvct2tp3zvjkqxynzyzbxnuuz3zw5mhf6cysgyfio:matrix.inblock.io";
-    const TARGET_MIXED: &str =
+    pub(super) const TARGET_MIXED: &str =
         "@did-key-zDnaef1WiYi9AXZgz55kptPRnTUkt3iZ7U6bqkjmoDMkpvdSL:matrix.inblock.io";
 
     #[test]
@@ -1678,11 +2171,433 @@ mod auth_tests {
         assert!(!validate_target("@:matrix.inblock.io", "test")); // empty localpart
         assert!(!validate_target("@user:", "test")); // empty server
     }
+
+    // Room-scoped admission (`authorize_in_room`). Three rooms: the DM with the
+    // target, the one group room a policy lists, and an unrelated room. Shared
+    // with `backfill_verdict_tests`, which checks the backfill path against the
+    // same two handlers.
+    pub(super) const DM_ROOM: &str = "!dmroom:matrix.inblock.io";
+    pub(super) const GROUP_ROOM: &str = "!grouproom:matrix.inblock.io";
+    pub(super) const OTHER_ROOM: &str = "!otherroom:matrix.inblock.io";
+    pub(super) const COLLABORATOR: &str = "@collaborator:matrix.inblock.io";
+    pub(super) const STRANGER: &str = "@stranger:matrix.inblock.io";
+    const ROOMS: [&str; 4] = [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""];
+
+    /// Overrides nothing it does not have to: every consultant in the fleet.
+    pub(super) struct DefaultHandler;
+
+    #[async_trait]
+    impl MessageHandler for DefaultHandler {
+        fn role(&self) -> &str {
+            "test-default"
+        }
+        async fn handle_message(
+            &self,
+            _agent: &AgentClient,
+            _target: &str,
+            _msg: &InboundMessage<'_>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A room policy: `target` everywhere, plus `COLLABORATOR` in `GROUP_ROOM`
+    /// and nowhere else. The shape a consultant with one external collaborator
+    /// in one group room would use.
+    pub(super) struct RoomPolicyHandler;
+
+    #[async_trait]
+    impl MessageHandler for RoomPolicyHandler {
+        fn role(&self) -> &str {
+            "test-room-policy"
+        }
+        fn authorize_in_room(&self, sender_mxid: &str, room_id: &str, target: &str) -> bool {
+            self.authorize(sender_mxid, target)
+                || (room_id == GROUP_ROOM && mxid_authorized(sender_mxid, COLLABORATOR))
+        }
+        async fn handle_message(
+            &self,
+            _agent: &AgentClient,
+            _target: &str,
+            _msg: &InboundMessage<'_>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The default must be `authorize` (so `mxid_authorized`) for every sender
+    /// in every room, the case fold included: the fleet's firewall may not move
+    /// by a byte because a room id is now passed along.
+    #[test]
+    fn default_authorize_in_room_is_exactly_authorize() {
+        let h = DefaultHandler;
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        let senders = [
+            TARGET_MIXED,
+            delivered.as_str(),
+            TARGET_LOWER,
+            COLLABORATOR,
+            STRANGER,
+            "",
+            "@\u{0130}:matrix.inblock.io",
+        ];
+        for target in [TARGET_MIXED, TARGET_LOWER, "@i:matrix.inblock.io"] {
+            for sender in senders {
+                for room in ROOMS {
+                    assert_eq!(
+                        h.authorize_in_room(sender, room, target),
+                        mxid_authorized(sender, target),
+                        "{sender:?} in {room:?} against {target:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_admits_target_in_any_room() {
+        let h = DefaultHandler;
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        for room in ROOMS {
+            assert!(h.authorize_in_room(&delivered, room, TARGET_MIXED), "{room:?}");
+            assert!(h.authorize_in_room(TARGET_LOWER, room, TARGET_LOWER), "{room:?}");
+        }
+    }
+
+    /// Including `GROUP_ROOM`: without an override, being in the room a policy
+    /// would list admits nobody.
+    #[test]
+    fn default_denies_every_non_target_in_every_room() {
+        let h = DefaultHandler;
+        for room in ROOMS {
+            for sender in [COLLABORATOR, STRANGER, TARGET_LOWER] {
+                assert!(
+                    !h.authorize_in_room(sender, room, TARGET_MIXED),
+                    "{sender:?} must not be admitted in {room:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn room_policy_admits_collaborator_only_in_its_room() {
+        let h = RoomPolicyHandler;
+        assert!(h.authorize_in_room(COLLABORATOR, GROUP_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(COLLABORATOR, DM_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(COLLABORATOR, OTHER_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(COLLABORATOR, "", TARGET_MIXED));
+    }
+
+    #[test]
+    fn room_policy_keeps_target_everywhere() {
+        let h = RoomPolicyHandler;
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        for room in ROOMS {
+            assert!(h.authorize_in_room(&delivered, room, TARGET_MIXED), "{room:?}");
+        }
+    }
+
+    #[test]
+    fn room_policy_denies_unrelated_sender_in_its_room() {
+        let h = RoomPolicyHandler;
+        assert!(!h.authorize_in_room(STRANGER, GROUP_ROOM, TARGET_MIXED));
+        assert!(!h.authorize_in_room(TARGET_LOWER, GROUP_ROOM, TARGET_MIXED));
+    }
+
+    /// Invite auto-join and call signaling call `authorize`, which a room
+    /// policy leaves at `{target}`: the collaborator can never make the agent
+    /// join a room, become its `m.direct` peer, or ring it.
+    #[test]
+    fn room_policy_does_not_widen_authorize() {
+        let h = RoomPolicyHandler;
+        assert!(!h.authorize(COLLABORATOR, TARGET_MIXED));
+        assert!(h.authorize(&TARGET_MIXED.to_ascii_lowercase(), TARGET_MIXED));
+    }
+
+    /// R17 invite gate (the OwnerOnly rule), inviter x handler x room: only
+    /// the target's invites are joined (case folded like every other
+    /// authorize), everyone else's are declined, an unknown inviter is
+    /// neither. A room-scoped collaborator is declined too: admitted to talk
+    /// in one room, never to pull the agent into one. Neither handler binds a
+    /// room, so the room never matters here (bound rooms: `invite_policy_tests`).
+    /// Same table for the cycle-start join and the live auto-join.
+    #[test]
+    fn invite_gate_joins_only_authorized_inviters() {
+        use InviteDecision::{Decline, Join, Undecided};
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        let cases: &[(Option<&str>, InviteDecision)] = &[
+            (Some(&delivered), Join),
+            (Some(TARGET_MIXED), Join),
+            (Some(STRANGER), Decline),
+            (Some(COLLABORATOR), Decline),
+            (Some(TARGET_LOWER), Decline),
+            (Some(""), Decline),
+            (None, Undecided),
+        ];
+        let handlers: [&dyn MessageHandler; 2] = [&DefaultHandler, &RoomPolicyHandler];
+        for h in handlers {
+            for room in ROOMS {
+                for (inviter, want) in cases {
+                    assert_eq!(
+                        invite_decision(h, room, *inviter, TARGET_MIXED),
+                        *want,
+                        "{} room {room:?} inviter {inviter:?}",
+                        h.role()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The declined-invite INFO line names role, room and inviter in a fixed
+    /// shape (the canary greps it).
+    #[test]
+    fn declined_invite_line_names_room_and_inviter() {
+        assert_eq!(
+            declined_invite_line("aqua-consultant", GROUP_ROOM, STRANGER),
+            "aqua-consultant: declined invite to !grouproom:matrix.inblock.io from @stranger:matrix.inblock.io (inviter not authorized)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod invite_policy_tests {
+    use super::auth_tests::{
+        DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM, STRANGER,
+        TARGET_MIXED,
+    };
+    use super::{
+        accept_pending_invites, async_trait, invite_decision, live_invite_decision, AgentClient,
+        InboundMessage, InviteDecision, InviteOps, InvitePolicy, MessageHandler, PendingInvite,
+    };
+    use std::sync::Mutex;
+
+    const UNKNOWN_ROOM: &str = "!unknowninviter:matrix.inblock.io";
+
+    /// A consultant that binds `GROUP_ROOM` (its `rooms` config) under either
+    /// invite policy. Everything else is the trait default.
+    struct PolicyHandler(InvitePolicy);
+
+    #[async_trait]
+    impl MessageHandler for PolicyHandler {
+        fn role(&self) -> &str {
+            "test-invite-policy"
+        }
+        fn bound_rooms(&self) -> Vec<String> {
+            vec![GROUP_ROOM.to_string()]
+        }
+        fn invite_policy(&self) -> InvitePolicy {
+            self.0
+        }
+        async fn handle_message(
+            &self,
+            _agent: &AgentClient,
+            _target: &str,
+            _msg: &InboundMessage<'_>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One pending invite per decision-table row, as `pending_invites` would
+    /// report them.
+    fn pending() -> Vec<PendingInvite> {
+        let inv = |room: &str, inviter: Option<&str>| PendingInvite {
+            room_id: room.to_string(),
+            inviter: inviter.map(str::to_string),
+        };
+        vec![
+            inv(DM_ROOM, Some(TARGET_MIXED)),
+            inv(OTHER_ROOM, Some(STRANGER)),
+            inv(GROUP_ROOM, Some(STRANGER)),
+            inv(UNKNOWN_ROOM, None),
+        ]
+    }
+
+    /// Records every `InviteOps` call in order. `join_invited_rooms` joins
+    /// every pending invite, like the real one.
+    struct FakeInvites {
+        pending: Vec<PendingInvite>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeInvites {
+        fn new() -> Self {
+            Self {
+                pending: pending(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl InviteOps for FakeInvites {
+        async fn join_invited_rooms(&self) -> anyhow::Result<Vec<String>> {
+            self.log("join_invited_rooms".into());
+            Ok(self.pending.iter().map(|i| i.room_id.clone()).collect())
+        }
+        async fn pending_invites(&self) -> Vec<PendingInvite> {
+            self.log("pending_invites".into());
+            self.pending.clone()
+        }
+        async fn join_invited_room(&self, room_id: &str) -> anyhow::Result<()> {
+            self.log(format!("join {room_id}"));
+            Ok(())
+        }
+        async fn decline_invite(&self, room_id: &str) -> anyhow::Result<()> {
+            self.log(format!("decline {room_id}"));
+            Ok(())
+        }
+        async fn mark_dm(&self, room_id: &str, target: &str) -> anyhow::Result<()> {
+            self.log(format!("mark_dm {room_id} {target}"));
+            Ok(())
+        }
+    }
+
+    /// The code default is Legacy, for the enum and for a handler that does
+    /// not override `invite_policy` (every consultant today).
+    #[test]
+    fn default_invite_policy_is_legacy() {
+        assert_eq!(InvitePolicy::default(), InvitePolicy::Legacy);
+        assert_eq!(DefaultHandler.invite_policy(), InvitePolicy::Legacy);
+        assert_eq!(RoomPolicyHandler.invite_policy(), InvitePolicy::Legacy);
+    }
+
+    /// The decision table, both policies, for a handler that binds
+    /// `GROUP_ROOM`. Columns: Legacy live auto-join, OwnerOnly (cycle start
+    /// and live share `invite_decision`). Legacy cycle start joins every row
+    /// (`legacy_cycle_start_is_the_join_all_path`). `None` in the Legacy live
+    /// column: a live invite event always names its sender.
+    #[test]
+    fn invite_decision_table_both_policies() {
+        use InviteDecision::{Decline, Ignore, Join, Undecided};
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        #[rustfmt::skip]
+        let rows: &[(&str, Option<&str>, Option<InviteDecision>, InviteDecision)] = &[
+            // room,       inviter,                Legacy live,   OwnerOnly
+            (DM_ROOM,      Some(TARGET_MIXED),     Some(Join),    Join),
+            (DM_ROOM,      Some(&delivered),       Some(Join),    Join),
+            (GROUP_ROOM,   Some(TARGET_MIXED),     Some(Join),    Join),
+            (OTHER_ROOM,   Some(STRANGER),         Some(Ignore),  Decline),
+            (DM_ROOM,      Some(STRANGER),         Some(Ignore),  Decline),
+            (GROUP_ROOM,   Some(STRANGER),         Some(Ignore),  Join),
+            (GROUP_ROOM,   Some(COLLABORATOR),     Some(Ignore),  Join),
+            (OTHER_ROOM,   Some(COLLABORATOR),     Some(Ignore),  Decline),
+            (OTHER_ROOM,   None,                   None,          Undecided),
+            (GROUP_ROOM,   None,                   None,          Undecided),
+        ];
+        let legacy = PolicyHandler(InvitePolicy::Legacy);
+        let owner_only = PolicyHandler(InvitePolicy::OwnerOnly);
+        for (room, inviter, legacy_live, owner) in rows {
+            assert_eq!(
+                invite_decision(&owner_only, room, *inviter, TARGET_MIXED),
+                *owner,
+                "owner_only room {room} inviter {inviter:?}"
+            );
+            if let Some(inviter) = inviter {
+                assert_eq!(
+                    live_invite_decision(&owner_only, room, inviter, TARGET_MIXED),
+                    *owner,
+                    "owner_only live room {room} inviter {inviter}"
+                );
+                assert_eq!(
+                    live_invite_decision(&legacy, room, inviter, TARGET_MIXED),
+                    legacy_live.expect("a known inviter has a Legacy live verdict"),
+                    "legacy live room {room} inviter {inviter}"
+                );
+            }
+        }
+    }
+
+    /// Legacy live auto-join is the pre-R17 check, nothing else: Join exactly
+    /// when `authorize` admits the inviter, otherwise Ignore. It never
+    /// declines, whatever the room (bound or not) and whatever the handler.
+    #[test]
+    fn legacy_live_path_never_declines() {
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        let inviters = [TARGET_MIXED, delivered.as_str(), STRANGER, COLLABORATOR, ""];
+        let rooms = [DM_ROOM, GROUP_ROOM, OTHER_ROOM, UNKNOWN_ROOM, ""];
+        let handlers: [&dyn MessageHandler; 3] = [
+            &DefaultHandler,
+            &RoomPolicyHandler,
+            &PolicyHandler(InvitePolicy::Legacy),
+        ];
+        for h in handlers {
+            assert_eq!(h.invite_policy(), InvitePolicy::Legacy);
+            for room in rooms {
+                for inviter in inviters {
+                    let want = if h.authorize(inviter, TARGET_MIXED) {
+                        InviteDecision::Join
+                    } else {
+                        InviteDecision::Ignore
+                    };
+                    assert_eq!(
+                        live_invite_decision(h, room, inviter, TARGET_MIXED),
+                        want,
+                        "{} room {room:?} inviter {inviter:?}",
+                        h.role()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Legacy cycle start is the pre-R17 join-all path: one
+    /// `join_invited_rooms` (every pending invite, inviter never consulted),
+    /// then `mark_dm` for each room it joined. No `pending_invites`, no
+    /// per-invite decision, no decline.
+    #[tokio::test]
+    async fn legacy_cycle_start_is_the_join_all_path() {
+        let handlers: [&dyn MessageHandler; 3] = [
+            &DefaultHandler,
+            &RoomPolicyHandler,
+            &PolicyHandler(InvitePolicy::Legacy),
+        ];
+        for h in handlers {
+            let fake = FakeInvites::new();
+            accept_pending_invites(&fake, h, TARGET_MIXED).await;
+            let mut want = vec!["join_invited_rooms".to_string()];
+            want.extend(
+                pending()
+                    .iter()
+                    .map(|i| format!("mark_dm {} {TARGET_MIXED}", i.room_id)),
+            );
+            assert_eq!(fake.calls(), want, "{}", h.role());
+        }
+    }
+
+    /// OwnerOnly cycle start: each pending invite decided by
+    /// `invite_decision`. The target's and the bound room's are joined (and
+    /// handed to `mark_dm`, which refuses any non 1:1), the stranger's is
+    /// declined, the unknown inviter's is left pending.
+    #[tokio::test]
+    async fn owner_only_cycle_start_gates_each_invite() {
+        let fake = FakeInvites::new();
+        accept_pending_invites(&fake, &PolicyHandler(InvitePolicy::OwnerOnly), TARGET_MIXED).await;
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "pending_invites".to_string(),
+                format!("join {DM_ROOM}"),
+                format!("decline {OTHER_ROOM}"),
+                format!("join {GROUP_ROOM}"),
+                format!("mark_dm {DM_ROOM} {TARGET_MIXED}"),
+                format!("mark_dm {GROUP_ROOM} {TARGET_MIXED}"),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
 mod watermark_tests {
-    use super::{now_epoch_ms, Watermark};
+    use super::auth_tests::{DM_ROOM, GROUP_ROOM, OTHER_ROOM};
+    use super::{now_epoch_ms, room_watermark_file, InboundWatermarks, Watermark};
     use std::path::PathBuf;
 
     /// Fresh per-test store dir under the OS temp dir (no tempfile dep: the
@@ -1815,11 +2730,251 @@ mod watermark_tests {
         assert_eq!(Watermark::load(&path), Some(1_749_740_000_000));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `dispatch`'s gate, against the watermark it picks for `room`: drop
+    /// `ts <= watermark`, else advance and deliver.
+    fn offer(wms: &InboundWatermarks, room: &str, ts: u64) -> bool {
+        let wm = wms.for_room(room);
+        let fresh = ts > wm.get();
+        if fresh {
+            wm.advance(ts);
+        }
+        fresh
+    }
+
+    fn file_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The bug a bound room exists for: matrix-sdk hands a sync's rooms over in
+    /// room-id order, so a newer message in one room can be dispatched before
+    /// an older one in another. With a watermark of its own, neither buries the
+    /// other, in either order, and each one advances only its own on disk.
+    #[test]
+    fn bound_room_and_dm_do_not_bury_each_other() {
+        let dir = temp_store("bound-order");
+        std::fs::write(dir.join(Watermark::FILE_NAME), "50\n").unwrap();
+        let room_file = dir.join(room_watermark_file(GROUP_ROOM));
+        std::fs::write(&room_file, "50\n").unwrap();
+        let wms = InboundWatermarks::load_or_seed(&dir, &[GROUP_ROOM.to_string()]);
+
+        // A newer DM message first, then an older one in the bound room.
+        assert!(offer(&wms, DM_ROOM, 300));
+        assert!(offer(&wms, GROUP_ROOM, 200), "the DM must not bury the bound room");
+        // A newer bound-room message first, then an older DM message.
+        assert!(offer(&wms, GROUP_ROOM, 500));
+        assert!(offer(&wms, DM_ROOM, 400), "the bound room must not bury the DM");
+
+        // Each still dedupes on its own.
+        assert!(!offer(&wms, DM_ROOM, 400));
+        assert!(!offer(&wms, GROUP_ROOM, 500));
+        // Any room that is not bound shares the global watermark, as before.
+        assert!(!offer(&wms, OTHER_ROOM, 350));
+        assert!(offer(&wms, OTHER_ROOM, 450));
+
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(450));
+        assert_eq!(Watermark::load(&room_file), Some(500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No bound rooms: one global watermark for every room, nothing else on
+    /// disk, and the cross-room burying it has always had (documented on
+    /// `authorize_in_room`) is unchanged.
+    #[test]
+    fn without_bound_rooms_one_global_watermark_as_before() {
+        let dir = temp_store("unbound");
+        std::fs::write(dir.join(Watermark::FILE_NAME), "50\n").unwrap();
+        let wms = InboundWatermarks::load_or_seed(&dir, &[]);
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""] {
+            assert!(std::ptr::eq(wms.for_room(room), wms.global()), "{room:?}");
+            assert!(!wms.is_bound(room), "{room:?}");
+        }
+        assert!(offer(&wms, DM_ROOM, 300));
+        assert!(!offer(&wms, GROUP_ROOM, 200), "one shared watermark, as today");
+        assert_eq!(file_names(&dir), vec![Watermark::FILE_NAME.to_string()]);
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(300));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bound room's watermark is seeded and persisted exactly like the global
+    /// one: absent file -> "now", written at once; advances survive a restart;
+    /// the global file is a separate value it never writes.
+    #[test]
+    fn bound_room_watermark_seeds_persists_and_reloads() {
+        let dir = temp_store("bound-persist");
+        let bound = [GROUP_ROOM.to_string()];
+        let room_file = dir.join(room_watermark_file(GROUP_ROOM));
+        let before = now_epoch_ms();
+        let wms = InboundWatermarks::load_or_seed(&dir, &bound);
+        let after = now_epoch_ms();
+        let seeded = wms.for_room(GROUP_ROOM).get();
+        assert!(seeded >= before && seeded <= after);
+        assert_eq!(Watermark::load(&room_file), Some(seeded));
+        let global = wms.global().get();
+
+        wms.for_room(GROUP_ROOM).advance(seeded + 60_000);
+        let reloaded = InboundWatermarks::load_or_seed(&dir, &bound);
+        assert_eq!(reloaded.for_room(GROUP_ROOM).get(), seeded + 60_000);
+        assert_eq!(reloaded.global().get(), global);
+        assert_eq!(Watermark::load(&dir.join(Watermark::FILE_NAME)), Some(global));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_bound_room_opens_one_watermark() {
+        let dir = temp_store("bound-dup");
+        let wms = InboundWatermarks::load_or_seed(
+            &dir,
+            &[GROUP_ROOM.to_string(), GROUP_ROOM.to_string()],
+        );
+        assert_eq!(wms.rooms.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Room ids differing anywhere map to different files; none leaves the
+    /// store dir; none collides with the global file or any `.tmp` file.
+    #[test]
+    fn room_watermark_file_is_injective_and_flat() {
+        let ids = [
+            GROUP_ROOM,
+            "!grouproom:matrix.inblock.org",
+            "!grouproom:matrix.inblock.io.tmp",
+            "!group.room:x",
+            "!group%2Eroom:x",
+            "!GroupRoom:x",
+            "!grouproom:x",
+            "!../../etc:x",
+            "!r\u{00e4}um:x",
+        ];
+        let names: Vec<String> = ids.iter().map(|id| room_watermark_file(id)).collect();
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        let prefix = "inbound-watermark.room.";
+        for name in &names {
+            let escaped = name.strip_prefix(prefix).unwrap();
+            assert!(!escaped.contains(['/', '.']), "{name}");
+            assert_ne!(name, Watermark::FILE_NAME);
+        }
+        assert_eq!(
+            room_watermark_file(GROUP_ROOM),
+            "inbound-watermark.room.%21grouproom%3Amatrix%2Einblock%2Eio"
+        );
+        // The global temp file name is what it always was.
+        let global = std::path::Path::new("/s").join(Watermark::FILE_NAME);
+        assert_eq!(Watermark::tmp_path(&global), std::path::Path::new("/s/inbound-watermark.tmp"));
+        assert_eq!(global.with_extension("tmp"), Watermark::tmp_path(&global));
+        // Each room has its own temp file, not one shared `.room.tmp`.
+        let tmps: Vec<PathBuf> =
+            names.iter().map(|n| Watermark::tmp_path(&std::path::Path::new("/s").join(n))).collect();
+        let mut unique_tmps = tmps.clone();
+        unique_tmps.sort();
+        unique_tmps.dedup();
+        assert_eq!(unique_tmps.len(), tmps.len());
+    }
+}
+
+#[cfg(test)]
+mod restart_path_tests {
+    use super::auth_tests::{
+        DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM,
+    };
+    use super::{
+        journal_sender, redelivery_target, replay_admitted, replay_sender, MessageHandler,
+        Redelivery, WorkItem, WorkState,
+    };
+
+    const TARGET: &str = "@did-key-zDnaePeer:matrix.inblock.io";
+
+    fn item(room: &str, sender: Option<&str>) -> WorkItem {
+        WorkItem {
+            event_id: "$e".to_string(),
+            room_id: room.to_string(),
+            ts_ms: 1,
+            msgtype: "m.text".to_string(),
+            body: "b".to_string(),
+            state: WorkState::Pending,
+            sender: sender.map(str::to_string),
+        }
+    }
+
+    /// Only someone other than the target, only in a bound room. The target's
+    /// own (lowercased, as Synapse delivers it) MXID never counts as someone
+    /// else, and outside a bound room nothing is journalled whoever sent it,
+    /// so a handler without bound rooms writes exactly the old journal.
+    #[test]
+    fn journal_sender_only_for_others_in_bound_rooms() {
+        let delivered = TARGET.to_ascii_lowercase();
+        assert_eq!(journal_sender(COLLABORATOR, true, TARGET).as_deref(), Some(COLLABORATOR));
+        assert_eq!(journal_sender(&delivered, true, TARGET), None);
+        assert_eq!(journal_sender(TARGET, true, TARGET), None);
+        assert_eq!(journal_sender(COLLABORATOR, false, TARGET), None);
+        assert_eq!(journal_sender(&delivered, false, TARGET), None);
+    }
+
+    #[test]
+    fn replay_presents_the_journalled_sender() {
+        assert_eq!(replay_sender(&item(GROUP_ROOM, Some(COLLABORATOR)), TARGET), COLLABORATOR);
+        // No journalled sender (the target's, or an item from before the
+        // field): the target, exactly as before.
+        assert_eq!(replay_sender(&item(GROUP_ROOM, None), TARGET), TARGET);
+        assert_eq!(replay_sender(&item(DM_ROOM, None), TARGET), TARGET);
+    }
+
+    /// A journalled sender is replayed only while the policy still admits them
+    /// in that room; a narrowed policy (here: the override gone) drops it. An
+    /// item without one is replayed unchecked, as before.
+    #[test]
+    fn replay_rechecks_only_a_journalled_sender() {
+        let collab_in_group = item(GROUP_ROOM, Some(COLLABORATOR));
+        assert!(replay_admitted(&RoomPolicyHandler, &collab_in_group, TARGET));
+        assert!(!replay_admitted(&DefaultHandler, &collab_in_group, TARGET));
+        assert!(!replay_admitted(&RoomPolicyHandler, &item(DM_ROOM, Some(COLLABORATOR)), TARGET));
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            assert!(replay_admitted(&DefaultHandler, &item(room, None), TARGET));
+            assert!(replay_admitted(&RoomPolicyHandler, &item(room, None), TARGET));
+        }
+    }
+
+    #[test]
+    fn redelivery_goes_back_into_a_bound_room_only() {
+        let bound = [GROUP_ROOM.to_string()];
+        assert_eq!(redelivery_target(GROUP_ROOM, &bound), Redelivery::Room(GROUP_ROOM));
+        assert_eq!(redelivery_target(DM_ROOM, &bound), Redelivery::TargetDm);
+        assert_eq!(redelivery_target(OTHER_ROOM, &bound), Redelivery::TargetDm);
+        // Exact compare: no case fold, no prefix match.
+        assert_eq!(
+            redelivery_target(&GROUP_ROOM.to_ascii_uppercase(), &bound),
+            Redelivery::TargetDm
+        );
+        assert_eq!(redelivery_target("!grouproom", &bound), Redelivery::TargetDm);
+        // No bound rooms: every reply goes to the target DM, as before.
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""] {
+            assert_eq!(redelivery_target(room, &[]), Redelivery::TargetDm);
+        }
+    }
+
+    #[test]
+    fn default_handler_binds_no_room() {
+        assert!(DefaultHandler.bound_rooms().is_empty());
+    }
 }
 
 #[cfg(test)]
 mod backfill_verdict_tests {
-    use super::{backfill_verdict, mxid_authorized, BackfillVerdict};
+    use super::auth_tests::{
+        DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM,
+    };
+    use super::{
+        backfill_sender_admitted, backfill_verdict, mxid_authorized, BackfillVerdict,
+        MessageHandler,
+    };
 
     const PEER: &str = "@did-key-z6mkpeer:matrix.inblock.io";
     const AGENT: &str = "@did-key-z6mkagent:matrix.inblock.io";
@@ -1869,5 +3024,62 @@ mod backfill_verdict_tests {
         assert_eq!(verdict(WATERMARK + 1, PEER, true), BackfillVerdict::Undecryptable);
         assert_eq!(verdict(WATERMARK + 1, AGENT, true), BackfillVerdict::Skip);
         assert_eq!(verdict(WATERMARK - 1, PEER, true), BackfillVerdict::Skip);
+    }
+
+    /// Verdict for one event in `room`, through the same room-aware sender
+    /// check `backfill_missed` uses.
+    fn room_verdict<H: MessageHandler>(
+        h: &H,
+        ts: u64,
+        sender: &str,
+        room: &str,
+        utd: bool,
+    ) -> BackfillVerdict {
+        backfill_verdict(ts, WATERMARK, backfill_sender_admitted(h, Some(sender), room, PEER), utd)
+    }
+
+    /// Backfill must agree with `dispatch` about who is admitted where: a
+    /// sender a room policy admits is owed its missed messages in that room,
+    /// and only there, or a message it sent during the handler-less window
+    /// would be lost (or, the other way round, admitted in the wrong room).
+    #[test]
+    fn backfill_owes_room_scoped_sender_only_in_its_room() {
+        use BackfillVerdict::{Dispatch, Skip, Undecryptable};
+        let h = RoomPolicyHandler;
+        let fresh = WATERMARK + 1;
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, GROUP_ROOM, false), Dispatch);
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, DM_ROOM, false), Skip);
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, OTHER_ROOM, false), Skip);
+        // Its undecryptable events count as a key-sharing signal only where it
+        // is admitted.
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, GROUP_ROOM, true), Undecryptable);
+        assert_eq!(room_verdict(&h, fresh, COLLABORATOR, DM_ROOM, true), Skip);
+        // The watermark still gates it like any other sender.
+        assert_eq!(room_verdict(&h, WATERMARK, COLLABORATOR, GROUP_ROOM, false), Skip);
+        // The target stays owed everywhere; the agent's own messages nowhere.
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            assert_eq!(room_verdict(&h, fresh, PEER, room, false), Dispatch);
+            assert_eq!(room_verdict(&h, fresh, AGENT, room, false), Skip);
+        }
+    }
+
+    /// Without an override the room-aware backfill check is the old peer
+    /// check: the target in any room, nobody else in any room.
+    #[test]
+    fn backfill_default_handler_owes_only_the_target() {
+        use BackfillVerdict::{Dispatch, Skip};
+        let h = DefaultHandler;
+        let fresh = WATERMARK + 1;
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            assert_eq!(room_verdict(&h, fresh, PEER, room, false), Dispatch);
+            assert_eq!(room_verdict(&h, fresh, COLLABORATOR, room, false), Skip);
+            assert_eq!(room_verdict(&h, fresh, AGENT, room, false), Skip);
+        }
+    }
+
+    #[test]
+    fn backfill_event_without_sender_is_never_admitted() {
+        assert!(!backfill_sender_admitted(&DefaultHandler, None, DM_ROOM, PEER));
+        assert!(!backfill_sender_admitted(&RoomPolicyHandler, None, GROUP_ROOM, PEER));
     }
 }
