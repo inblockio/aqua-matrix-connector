@@ -29,7 +29,8 @@
 //!
 //! The outer loop in [`run_daemon`] builds a fresh [`AgentClient`] (which hits
 //! the refresh-grant path, preserving `device_id` and the crypto store), then:
-//!   1. joins any pending invites,
+//!   1. joins the pending invites its handler's `authorize` admits and
+//!      declines the others ([`invite_decision`]),
 //!   2. sends the handler's one-time `hello()` on the first cycle only,
 //!   3. upserts the fleet-registry entry,
 //!   4. runs a sync stream + optional periodic tick until the token nears
@@ -606,18 +607,16 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // spawns a DUPLICATE — which, against a programmatic peer, splits the two
         // sides into separate rooms and breaks Megolm key exchange (in
         // production it leaves stray empty rooms). The peer is the only party
-        // that DMs us, so any room it invited us to IS the DM room.
-        match agent.join_invited_rooms().await {
-            Ok(joined) => {
-                for room_id in &joined {
-                    if let Err(e) = agent.mark_dm(room_id, &target).await {
-                        tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
-                    } else {
-                        tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
-                    }
-                }
+        // that DMs us, so any room it invited us to IS the DM room. Only the
+        // invites `authorize` admits are joined, the same rule as the live
+        // `register_invite_autojoin` (R17, 2026-10-03: this path used to join
+        // every invite, whoever sent it).
+        for room_id in &join_authorized_invites(&agent, handler.as_ref(), &target).await {
+            if let Err(e) = agent.mark_dm(room_id, &target).await {
+                tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
+            } else {
+                tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
             }
-            Err(e) => tracing::warn!("{}: join_invited_rooms failed: {e:#}", handler.role()),
         }
 
         // One sync so the peer's device keys are known before we encrypt the
@@ -944,6 +943,77 @@ fn log_sync_end(res: Result<matrix_sdk::Result<()>, tokio::task::JoinError>) {
     }
 }
 
+/// What the relay does with one pending invite (R17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteDecision {
+    /// The inviter passes `authorize`: join.
+    Join,
+    /// Anyone else: decline (leave the invited room).
+    Decline,
+    /// The inviter is not known locally: neither join nor decline on a guess.
+    Undecided,
+}
+
+/// The one invite rule, shared by the cycle-start join and the live
+/// auto-join: join only an invite whose inviter passes
+/// `handler.authorize(inviter, target)`, decline every other invite, and leave
+/// one with an unknown inviter alone. Deliberately `authorize`, never
+/// `authorize_in_room`: a room-scoped sender must never make the agent join a
+/// room, and a join is followed by `mark_dm(.., target)`.
+pub fn invite_decision<H: MessageHandler + ?Sized>(
+    handler: &H,
+    inviter: Option<&str>,
+    target: &str,
+) -> InviteDecision {
+    match inviter {
+        None => InviteDecision::Undecided,
+        Some(inviter) if handler.authorize(inviter, target) => InviteDecision::Join,
+        Some(_) => InviteDecision::Decline,
+    }
+}
+
+/// The INFO line for a declined invite (one per invite, both paths). Kept in
+/// one place: the canary greps for it.
+fn declined_invite_line(role: &str, room_id: &str, inviter: &str) -> String {
+    format!("{role}: declined invite to {room_id} from {inviter} (inviter not authorized)")
+}
+
+/// Cycle-start half of the invite rule: act on every pending invite per
+/// [`invite_decision`] and return the rooms joined.
+async fn join_authorized_invites<H: MessageHandler + ?Sized>(
+    agent: &AgentClient,
+    handler: &H,
+    target: &str,
+) -> Vec<String> {
+    let role = handler.role();
+    let mut joined = Vec::new();
+    for inv in agent.pending_invites().await {
+        let room_id = inv.room_id.as_str();
+        match (invite_decision(handler, inv.inviter.as_deref(), target), inv.inviter.as_deref()) {
+            (InviteDecision::Join, inviter) => match agent.join_invited_room(room_id).await {
+                Ok(()) => {
+                    tracing::info!("{role}: joined invited room {room_id} from {}", inviter.unwrap_or("?"));
+                    joined.push(inv.room_id.clone());
+                }
+                Err(e) => tracing::warn!("{role}: joining invited room {room_id} failed: {e:#}"),
+            },
+            (InviteDecision::Decline, Some(inviter)) => {
+                warn_on_case_only_drop(inviter, target, role, "invite");
+                match agent.decline_invite(room_id).await {
+                    Ok(()) => tracing::info!("{}", declined_invite_line(role, room_id, inviter)),
+                    Err(e) => tracing::warn!(
+                        "{role}: declining the invite to {room_id} from {inviter} failed: {e:#}"
+                    ),
+                }
+            }
+            (InviteDecision::Decline, None) | (InviteDecision::Undecided, _) => tracing::info!(
+                "{role}: invite to {room_id} left pending: inviter unknown (not joined, not declined)"
+            ),
+        }
+    }
+    joined
+}
+
 /// Continuously auto-join rooms we are invited to (and record them as the DM
 /// with our peer), so the daemon converges on the SAME room the peer created
 /// rather than `create_dm` later spawning a duplicate. Registered on the sync
@@ -978,9 +1048,24 @@ fn register_invite_autojoin<H: MessageHandler>(
                 // room-scoped sender must never make the agent join a room, and
                 // a join here is followed by `mark_dm(.., target)`, which would
                 // also make that room the agent's `m.direct` DM with its peer.
-                if !handler.authorize(ev.sender.as_str(), &target) {
-                    warn_on_case_only_drop(ev.sender.as_str(), &target, handler.role(), "invite");
-                    return;
+                // Any other inviter's invite is declined (R17), not left
+                // pending for the next cycle start to reconsider.
+                let inviter = ev.sender.as_str();
+                match invite_decision(handler.as_ref(), Some(inviter), &target) {
+                    InviteDecision::Join => {}
+                    InviteDecision::Decline => {
+                        warn_on_case_only_drop(inviter, &target, handler.role(), "invite");
+                        let room_id = room.room_id().to_string();
+                        match room.leave().await {
+                            Ok(()) => tracing::info!("{}", declined_invite_line(&role, &room_id, inviter)),
+                            Err(e) => tracing::warn!(
+                                "{role}: declining the invite to {room_id} from {inviter} failed: {e:#}"
+                            ),
+                        }
+                        return;
+                    }
+                    // The sender of a live invite event is always known.
+                    InviteDecision::Undecided => return,
                 }
                 match room.join().await {
                     Ok(()) => {
@@ -1854,8 +1939,9 @@ fn room_watermark_file(room_id: &str) -> String {
 #[cfg(test)]
 mod auth_tests {
     use super::{
-        async_trait, is_case_only_mismatch, mxid_authorized, validate_target, AgentClient,
-        InboundMessage, MessageHandler,
+        async_trait, declined_invite_line, invite_decision, is_case_only_mismatch,
+        mxid_authorized, validate_target, AgentClient, InboundMessage, InviteDecision,
+        MessageHandler,
     };
 
     // The real fleet's two contrasting peers: one all-lowercase localpart, one
@@ -2080,6 +2166,47 @@ mod auth_tests {
         let h = RoomPolicyHandler;
         assert!(!h.authorize(COLLABORATOR, TARGET_MIXED));
         assert!(h.authorize(&TARGET_MIXED.to_ascii_lowercase(), TARGET_MIXED));
+    }
+
+    /// R17 invite gate, inviter x handler: only the target's invites are
+    /// joined (case folded like every other authorize), everyone else's are
+    /// declined, an unknown inviter is neither. A room-scoped collaborator is
+    /// declined too: admitted to talk in one room, never to pull the agent
+    /// into one. Same table for the cycle-start join and the live auto-join.
+    #[test]
+    fn invite_gate_joins_only_authorized_inviters() {
+        use InviteDecision::{Decline, Join, Undecided};
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        let cases: &[(Option<&str>, InviteDecision)] = &[
+            (Some(&delivered), Join),
+            (Some(TARGET_MIXED), Join),
+            (Some(STRANGER), Decline),
+            (Some(COLLABORATOR), Decline),
+            (Some(TARGET_LOWER), Decline),
+            (Some(""), Decline),
+            (None, Undecided),
+        ];
+        let handlers: [&dyn MessageHandler; 2] = [&DefaultHandler, &RoomPolicyHandler];
+        for h in handlers {
+            for (inviter, want) in cases {
+                assert_eq!(
+                    invite_decision(h, *inviter, TARGET_MIXED),
+                    *want,
+                    "{} inviter {inviter:?}",
+                    h.role()
+                );
+            }
+        }
+    }
+
+    /// The declined-invite INFO line names role, room and inviter in a fixed
+    /// shape (the canary greps it).
+    #[test]
+    fn declined_invite_line_names_room_and_inviter() {
+        assert_eq!(
+            declined_invite_line("aqua-consultant", GROUP_ROOM, STRANGER),
+            "aqua-consultant: declined invite to !grouproom:matrix.inblock.io from @stranger:matrix.inblock.io (inviter not authorized)"
+        );
     }
 }
 

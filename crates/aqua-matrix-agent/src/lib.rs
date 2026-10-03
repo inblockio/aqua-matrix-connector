@@ -301,6 +301,14 @@ impl Message {
     }
 }
 
+/// One invite waiting for this account ([`AgentClient::pending_invites`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInvite {
+    pub room_id: String,
+    /// Who sent the invite; `None` when the invite event is not known locally.
+    pub inviter: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentClient {
     client: Client,
@@ -1490,6 +1498,11 @@ impl AgentClient {
         self.client.device_id().map(|d| d.to_string())
     }
 
+    /// Join EVERY pending invite, whoever sent it. For one-shot tools, drivers
+    /// and tests that invite themselves. A long-running daemon must not use
+    /// this: the relay gates each invite on its handler's `authorize` via
+    /// [`AgentClient::pending_invites`] (2026-10-03, a stranger's invite made a
+    /// consultant join a test room at cycle start).
     pub async fn join_invited_rooms(&self) -> Result<Vec<String>> {
         let mut joined = Vec::new();
         for room in self.client.invited_rooms() {
@@ -1505,6 +1518,52 @@ impl AgentClient {
             }
         }
         Ok(joined)
+    }
+
+    /// Every pending invite with the MXID that sent it, acting on none. The
+    /// inviter is the sender of our own `m.room.member` invite event in the
+    /// invite's stripped state; `None` when that event is not known locally
+    /// (the caller must then neither join nor decline on a guess).
+    pub async fn pending_invites(&self) -> Vec<PendingInvite> {
+        let mut out = Vec::new();
+        for room in self.client.invited_rooms() {
+            let room_id = room.room_id().to_string();
+            let inviter = match room.invite_details().await {
+                Ok(d) => Some(d.inviter_id.to_string()),
+                Err(e) => {
+                    tracing::debug!("invite to {room_id}: inviter unknown ({e})");
+                    None
+                }
+            };
+            out.push(PendingInvite { room_id, inviter });
+        }
+        out
+    }
+
+    /// Join one room this account is invited to.
+    pub async fn join_invited_room(&self, room_id: &str) -> Result<()> {
+        self.known_room(room_id)?
+            .join()
+            .await
+            .with_context(|| format!("joining {room_id}"))
+    }
+
+    /// Decline one invite (leave the invited room). A room already left is a
+    /// no-op.
+    pub async fn decline_invite(&self, room_id: &str) -> Result<()> {
+        self.known_room(room_id)?
+            .leave()
+            .await
+            .with_context(|| format!("declining the invite to {room_id}"))
+    }
+
+    fn known_room(&self, room_id: &str) -> Result<matrix_sdk::Room> {
+        let id: &RoomId = room_id
+            .try_into()
+            .map_err(|e| anyhow!("invalid room_id {room_id:?}: {e}"))?;
+        self.client
+            .get_room(id)
+            .ok_or_else(|| anyhow!("room {room_id} is not known to this client"))
     }
 
     pub async fn dm_room_id(&self, target: &str) -> Result<Option<String>> {
