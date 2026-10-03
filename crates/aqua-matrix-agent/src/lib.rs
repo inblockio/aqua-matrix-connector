@@ -1508,10 +1508,12 @@ impl AgentClient {
     }
 
     /// Join EVERY pending invite, whoever sent it. For one-shot tools, drivers
-    /// and tests that invite themselves. A long-running daemon must not use
-    /// this: the relay gates each invite on its handler's `authorize` via
-    /// [`AgentClient::pending_invites`] (2026-10-03, a stranger's invite made a
-    /// consultant join a test room at cycle start).
+    /// and tests that invite themselves, and the relay's cycle start under its
+    /// default (Legacy) invite policy, unchanged since before 2026-10-03. A
+    /// daemon that must not join a stranger's invite (2026-10-03, one made a
+    /// consultant join a test room at cycle start) gates each invite via
+    /// [`AgentClient::pending_invites`] instead, as the relay's OwnerOnly
+    /// invite policy does.
     pub async fn join_invited_rooms(&self) -> Result<Vec<String>> {
         let mut joined = Vec::new();
         for room in self.client.invited_rooms() {

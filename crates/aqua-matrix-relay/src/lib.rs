@@ -29,8 +29,9 @@
 //!
 //! The outer loop in [`run_daemon`] builds a fresh [`AgentClient`] (which hits
 //! the refresh-grant path, preserving `device_id` and the crypto store), then:
-//!   1. joins the pending invites its handler's `authorize` admits and
-//!      declines the others ([`invite_decision`]),
+//!   1. joins pending invites per its handler's [`InvitePolicy`]: all of
+//!      them by default (Legacy), or only those [`invite_decision`] admits,
+//!      declining the others (OwnerOnly),
 //!   2. sends the handler's one-time `hello()` on the first cycle only,
 //!   3. upserts the fleet-registry entry,
 //!   4. runs a sync stream + optional periodic tick until the token nears
@@ -76,6 +77,8 @@ pub use aqua_matrix_agent::{
     RoomMention, TypingGuard, WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
+
+use aqua_matrix_agent::PendingInvite;
 
 mod media;
 
@@ -332,9 +335,22 @@ pub trait MessageHandler: Send + Sync + 'static {
     ///  3. `drain_deliveries` redelivers a journalled reply into the room, never
     ///     into the `target` DM.
     ///
-    /// Read once at daemon start; a change takes a restart.
+    /// Read once at daemon start for the watermarks (a change takes a
+    /// restart), and per invite under [`InvitePolicy::OwnerOnly`], so return
+    /// the same list every time.
     fn bound_rooms(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// How the relay treats room invites, see [`InvitePolicy`]. Default
+    /// [`InvitePolicy::Legacy`] keeps today's behaviour byte for byte (every
+    /// pending invite joined at cycle start, a live invite joined only from an
+    /// inviter [`authorize`](Self::authorize) admits and otherwise ignored,
+    /// never declined). Override per consultant from its config, never by a
+    /// code default. Consulted at every cycle start and on every live invite,
+    /// so return a constant.
+    fn invite_policy(&self) -> InvitePolicy {
+        InvitePolicy::Legacy
     }
 
     /// Handle one inbound message from `target` (or from a sender an
@@ -512,6 +528,15 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // that silently replies to no one. Non-fatal: we log and continue.
     validate_target(&target, handler.role());
 
+    // Logged only when not the default, so a Legacy daemon's output is
+    // unchanged.
+    if handler.invite_policy() == InvitePolicy::OwnerOnly {
+        tracing::info!(
+            "{}: invite policy owner_only (join invites from the target or into a bound room, decline the rest)",
+            handler.role()
+        );
+    }
+
     // The inbound-message dedupe watermark lives ACROSS cycles AND restarts:
     // loaded from `<store>/inbound-watermark` here (seeded to "now" only when
     // the file is absent or unparsable) and persisted by [`dispatch`] on every
@@ -607,17 +632,12 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // spawns a DUPLICATE — which, against a programmatic peer, splits the two
         // sides into separate rooms and breaks Megolm key exchange (in
         // production it leaves stray empty rooms). The peer is the only party
-        // that DMs us, so any room it invited us to IS the DM room. Only the
-        // invites `authorize` admits are joined, the same rule as the live
-        // `register_invite_autojoin` (R17, 2026-10-03: this path used to join
-        // every invite, whoever sent it).
-        for room_id in &join_authorized_invites(&agent, handler.as_ref(), &target).await {
-            if let Err(e) = agent.mark_dm(room_id, &target).await {
-                tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
-            } else {
-                tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
-            }
-        }
+        // that DMs us, so any room it invited us to IS the DM room. Which
+        // invites are joined is the handler's `invite_policy`: Legacy (the
+        // default) joins every one, as before R17; OwnerOnly joins only those
+        // `invite_decision` admits and declines the rest (R17, 2026-10-03: a
+        // stranger's invite made a consultant join a test room here).
+        accept_pending_invites(&agent, handler.as_ref(), &target).await;
 
         // One sync so the peer's device keys are known before we encrypt the
         // hello (otherwise the hello is undecryptable on their side until the
@@ -943,32 +963,79 @@ fn log_sync_end(res: Result<matrix_sdk::Result<()>, tokio::task::JoinError>) {
     }
 }
 
-/// What the relay does with one pending invite (R17).
+/// How the relay treats room invites ([`MessageHandler::invite_policy`]).
+/// A per-consultant config switch: the default is the pre-R17 behaviour, and a
+/// fleet-wide change is made by flipping configs, never this default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InvitePolicy {
+    /// The behaviour before R17, unchanged: at cycle start every pending
+    /// invite is joined, whoever sent it ([`AgentClient::join_invited_rooms`]),
+    /// and recorded as the DM with `target`; the live auto-join joins an
+    /// invite whose inviter passes `authorize` and ignores every other one
+    /// (left pending, never declined).
+    #[default]
+    Legacy,
+    /// R17: join an invite from an inviter `authorize` admits or into one of
+    /// the handler's own [`bound_rooms`](MessageHandler::bound_rooms), decline
+    /// every other one (one fixed INFO line each), and leave one with an
+    /// unknown inviter pending. Same rule at cycle start and live
+    /// ([`invite_decision`]).
+    OwnerOnly,
+}
+
+/// What the relay does with one invite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteDecision {
-    /// The inviter passes `authorize`: join.
+    /// Join (then `mark_dm`, which refuses anything but a true 1:1 with
+    /// `target`).
     Join,
-    /// Anyone else: decline (leave the invited room).
+    /// [`InvitePolicy::OwnerOnly`] only: decline (leave the invited room).
     Decline,
     /// The inviter is not known locally: neither join nor decline on a guess.
     Undecided,
+    /// [`InvitePolicy::Legacy`] live auto-join only: an inviter `authorize`
+    /// rejects is ignored, the invite stays pending, never declined (the next
+    /// cycle start joins it, as before R17).
+    Ignore,
 }
 
-/// The one invite rule, shared by the cycle-start join and the live
-/// auto-join: join only an invite whose inviter passes
-/// `handler.authorize(inviter, target)`, decline every other invite, and leave
-/// one with an unknown inviter alone. Deliberately `authorize`, never
-/// `authorize_in_room`: a room-scoped sender must never make the agent join a
-/// room, and a join is followed by `mark_dm(.., target)`.
+/// The [`InvitePolicy::OwnerOnly`] invite rule, shared by its cycle-start join
+/// and its live auto-join: join an invite whose inviter passes
+/// `handler.authorize(inviter, target)` or whose `room_id` is one of the
+/// handler's own [`bound_rooms`](MessageHandler::bound_rooms) (exact compare,
+/// the opaque `!id:server` form), decline every other invite, and leave one
+/// with an unknown inviter alone (bound room or not). Deliberately
+/// `authorize`, never `authorize_in_room`: a room-scoped sender must never
+/// make the agent join a room its config does not bind, and a join is
+/// followed by `mark_dm(.., target)`.
 pub fn invite_decision<H: MessageHandler + ?Sized>(
     handler: &H,
+    room_id: &str,
     inviter: Option<&str>,
     target: &str,
 ) -> InviteDecision {
     match inviter {
         None => InviteDecision::Undecided,
         Some(inviter) if handler.authorize(inviter, target) => InviteDecision::Join,
+        Some(_) if handler.bound_rooms().iter().any(|r| r == room_id) => InviteDecision::Join,
         Some(_) => InviteDecision::Decline,
+    }
+}
+
+/// The live auto-join's decision for one invite event, per the handler's
+/// [`InvitePolicy`]. Legacy is the pre-R17 check unchanged (`authorize`
+/// admits: join; anyone else: ignore, never decline); OwnerOnly is
+/// [`invite_decision`].
+fn live_invite_decision<H: MessageHandler + ?Sized>(
+    handler: &H,
+    room_id: &str,
+    inviter: &str,
+    target: &str,
+) -> InviteDecision {
+    match handler.invite_policy() {
+        InvitePolicy::Legacy if handler.authorize(inviter, target) => InviteDecision::Join,
+        InvitePolicy::Legacy => InviteDecision::Ignore,
+        InvitePolicy::OwnerOnly => invite_decision(handler, room_id, Some(inviter), target),
     }
 }
 
@@ -978,18 +1045,84 @@ fn declined_invite_line(role: &str, room_id: &str, inviter: &str) -> String {
     format!("{role}: declined invite to {room_id} from {inviter} (inviter not authorized)")
 }
 
-/// Cycle-start half of the invite rule: act on every pending invite per
-/// [`invite_decision`] and return the rooms joined.
-async fn join_authorized_invites<H: MessageHandler + ?Sized>(
-    agent: &AgentClient,
-    handler: &H,
-    target: &str,
-) -> Vec<String> {
+/// The [`AgentClient`] calls the cycle-start invite handling makes. A seam so
+/// a test can prove which calls each [`InvitePolicy`] makes without a
+/// homeserver; production is [`AgentClient`], by plain delegation.
+#[async_trait]
+trait InviteOps: Send + Sync {
+    async fn join_invited_rooms(&self) -> anyhow::Result<Vec<String>>;
+    async fn pending_invites(&self) -> Vec<PendingInvite>;
+    async fn join_invited_room(&self, room_id: &str) -> anyhow::Result<()>;
+    async fn decline_invite(&self, room_id: &str) -> anyhow::Result<()>;
+    async fn mark_dm(&self, room_id: &str, target: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl InviteOps for AgentClient {
+    async fn join_invited_rooms(&self) -> anyhow::Result<Vec<String>> {
+        AgentClient::join_invited_rooms(self).await
+    }
+    async fn pending_invites(&self) -> Vec<PendingInvite> {
+        AgentClient::pending_invites(self).await
+    }
+    async fn join_invited_room(&self, room_id: &str) -> anyhow::Result<()> {
+        AgentClient::join_invited_room(self, room_id).await
+    }
+    async fn decline_invite(&self, room_id: &str) -> anyhow::Result<()> {
+        AgentClient::decline_invite(self, room_id).await
+    }
+    async fn mark_dm(&self, room_id: &str, target: &str) -> anyhow::Result<()> {
+        AgentClient::mark_dm(self, room_id, target).await
+    }
+}
+
+/// Cycle start: act on the pending invites per the handler's
+/// [`InvitePolicy`], then record each joined room as the DM with our peer.
+async fn accept_pending_invites<O, H>(agent: &O, handler: &H, target: &str)
+where
+    O: InviteOps + ?Sized,
+    H: MessageHandler + ?Sized,
+{
+    match handler.invite_policy() {
+        // Pre-R17 main, unchanged: join EVERY pending invite, whoever sent it.
+        InvitePolicy::Legacy => match agent.join_invited_rooms().await {
+            Ok(joined) => {
+                for room_id in &joined {
+                    if let Err(e) = agent.mark_dm(room_id, target).await {
+                        tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
+                    } else {
+                        tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("{}: join_invited_rooms failed: {e:#}", handler.role()),
+        },
+        // R17: only the invites `invite_decision` admits are joined, the same
+        // rule as the live `register_invite_autojoin`; the others are declined.
+        InvitePolicy::OwnerOnly => {
+            for room_id in &join_authorized_invites(agent, handler, target).await {
+                if let Err(e) = agent.mark_dm(room_id, target).await {
+                    tracing::warn!("{}: mark_dm({room_id}) failed: {e:#}", handler.role());
+                } else {
+                    tracing::info!("{}: marked joined room {room_id} as DM with peer", handler.role());
+                }
+            }
+        }
+    }
+}
+
+/// [`InvitePolicy::OwnerOnly`] cycle-start half of the invite rule: act on
+/// every pending invite per [`invite_decision`] and return the rooms joined.
+async fn join_authorized_invites<O, H>(agent: &O, handler: &H, target: &str) -> Vec<String>
+where
+    O: InviteOps + ?Sized,
+    H: MessageHandler + ?Sized,
+{
     let role = handler.role();
     let mut joined = Vec::new();
     for inv in agent.pending_invites().await {
         let room_id = inv.room_id.as_str();
-        match (invite_decision(handler, inv.inviter.as_deref(), target), inv.inviter.as_deref()) {
+        match (invite_decision(handler, room_id, inv.inviter.as_deref(), target), inv.inviter.as_deref()) {
             (InviteDecision::Join, inviter) => match agent.join_invited_room(room_id).await {
                 Ok(()) => {
                     tracing::info!("{role}: joined invited room {room_id} from {}", inviter.unwrap_or("?"));
@@ -1008,6 +1141,10 @@ async fn join_authorized_invites<H: MessageHandler + ?Sized>(
             }
             (InviteDecision::Decline, None) | (InviteDecision::Undecided, _) => tracing::info!(
                 "{role}: invite to {room_id} left pending: inviter unknown (not joined, not declined)"
+            ),
+            // `invite_decision` never ignores (that is the Legacy live path).
+            (InviteDecision::Ignore, _) => tracing::info!(
+                "{role}: invite to {room_id} left pending (not joined, not declined)"
             ),
         }
     }
@@ -1048,16 +1185,25 @@ fn register_invite_autojoin<H: MessageHandler>(
                 // room-scoped sender must never make the agent join a room, and
                 // a join here is followed by `mark_dm(.., target)`, which would
                 // also make that room the agent's `m.direct` DM with its peer.
-                // Any other inviter's invite is declined (R17), not left
-                // pending for the next cycle start to reconsider.
+                // Which invites are joined is the handler's `invite_policy`
+                // (`live_invite_decision`): Legacy (the default) ignores any
+                // other inviter's invite, as before R17; OwnerOnly also joins
+                // one into a bound room and declines the rest (R17), instead of
+                // leaving them pending for the next cycle start to reconsider.
                 let inviter = ev.sender.as_str();
-                match invite_decision(handler.as_ref(), Some(inviter), &target) {
+                let invited_room = room.room_id().to_string();
+                match live_invite_decision(handler.as_ref(), &invited_room, inviter, &target) {
                     InviteDecision::Join => {}
+                    // Legacy: pre-R17 main, unchanged.
+                    InviteDecision::Ignore => {
+                        warn_on_case_only_drop(inviter, &target, handler.role(), "invite");
+                        return;
+                    }
                     InviteDecision::Decline => {
                         warn_on_case_only_drop(inviter, &target, handler.role(), "invite");
-                        let room_id = room.room_id().to_string();
+                        let room_id = invited_room.as_str();
                         match room.leave().await {
-                            Ok(()) => tracing::info!("{}", declined_invite_line(&role, &room_id, inviter)),
+                            Ok(()) => tracing::info!("{}", declined_invite_line(&role, room_id, inviter)),
                             Err(e) => tracing::warn!(
                                 "{role}: declining the invite to {room_id} from {inviter} failed: {e:#}"
                             ),
@@ -1950,7 +2096,7 @@ mod auth_tests {
     // accept the lowercased sender against EITHER configured form.
     const TARGET_LOWER: &str =
         "@did-key-zdnaezp2zvct2tp3zvjkqxynzyzbxnuuz3zw5mhf6cysgyfio:matrix.inblock.io";
-    const TARGET_MIXED: &str =
+    pub(super) const TARGET_MIXED: &str =
         "@did-key-zDnaef1WiYi9AXZgz55kptPRnTUkt3iZ7U6bqkjmoDMkpvdSL:matrix.inblock.io";
 
     #[test]
@@ -2034,7 +2180,7 @@ mod auth_tests {
     pub(super) const GROUP_ROOM: &str = "!grouproom:matrix.inblock.io";
     pub(super) const OTHER_ROOM: &str = "!otherroom:matrix.inblock.io";
     pub(super) const COLLABORATOR: &str = "@collaborator:matrix.inblock.io";
-    const STRANGER: &str = "@stranger:matrix.inblock.io";
+    pub(super) const STRANGER: &str = "@stranger:matrix.inblock.io";
     const ROOMS: [&str; 4] = [DM_ROOM, GROUP_ROOM, OTHER_ROOM, ""];
 
     /// Overrides nothing it does not have to: every consultant in the fleet.
@@ -2168,11 +2314,13 @@ mod auth_tests {
         assert!(h.authorize(&TARGET_MIXED.to_ascii_lowercase(), TARGET_MIXED));
     }
 
-    /// R17 invite gate, inviter x handler: only the target's invites are
-    /// joined (case folded like every other authorize), everyone else's are
-    /// declined, an unknown inviter is neither. A room-scoped collaborator is
-    /// declined too: admitted to talk in one room, never to pull the agent
-    /// into one. Same table for the cycle-start join and the live auto-join.
+    /// R17 invite gate (the OwnerOnly rule), inviter x handler x room: only
+    /// the target's invites are joined (case folded like every other
+    /// authorize), everyone else's are declined, an unknown inviter is
+    /// neither. A room-scoped collaborator is declined too: admitted to talk
+    /// in one room, never to pull the agent into one. Neither handler binds a
+    /// room, so the room never matters here (bound rooms: `invite_policy_tests`).
+    /// Same table for the cycle-start join and the live auto-join.
     #[test]
     fn invite_gate_joins_only_authorized_inviters() {
         use InviteDecision::{Decline, Join, Undecided};
@@ -2188,13 +2336,15 @@ mod auth_tests {
         ];
         let handlers: [&dyn MessageHandler; 2] = [&DefaultHandler, &RoomPolicyHandler];
         for h in handlers {
-            for (inviter, want) in cases {
-                assert_eq!(
-                    invite_decision(h, *inviter, TARGET_MIXED),
-                    *want,
-                    "{} inviter {inviter:?}",
-                    h.role()
-                );
+            for room in ROOMS {
+                for (inviter, want) in cases {
+                    assert_eq!(
+                        invite_decision(h, room, *inviter, TARGET_MIXED),
+                        *want,
+                        "{} room {room:?} inviter {inviter:?}",
+                        h.role()
+                    );
+                }
             }
         }
     }
@@ -2206,6 +2356,240 @@ mod auth_tests {
         assert_eq!(
             declined_invite_line("aqua-consultant", GROUP_ROOM, STRANGER),
             "aqua-consultant: declined invite to !grouproom:matrix.inblock.io from @stranger:matrix.inblock.io (inviter not authorized)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod invite_policy_tests {
+    use super::auth_tests::{
+        DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM, STRANGER,
+        TARGET_MIXED,
+    };
+    use super::{
+        accept_pending_invites, async_trait, invite_decision, live_invite_decision, AgentClient,
+        InboundMessage, InviteDecision, InviteOps, InvitePolicy, MessageHandler, PendingInvite,
+    };
+    use std::sync::Mutex;
+
+    const UNKNOWN_ROOM: &str = "!unknowninviter:matrix.inblock.io";
+
+    /// A consultant that binds `GROUP_ROOM` (its `rooms` config) under either
+    /// invite policy. Everything else is the trait default.
+    struct PolicyHandler(InvitePolicy);
+
+    #[async_trait]
+    impl MessageHandler for PolicyHandler {
+        fn role(&self) -> &str {
+            "test-invite-policy"
+        }
+        fn bound_rooms(&self) -> Vec<String> {
+            vec![GROUP_ROOM.to_string()]
+        }
+        fn invite_policy(&self) -> InvitePolicy {
+            self.0
+        }
+        async fn handle_message(
+            &self,
+            _agent: &AgentClient,
+            _target: &str,
+            _msg: &InboundMessage<'_>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One pending invite per decision-table row, as `pending_invites` would
+    /// report them.
+    fn pending() -> Vec<PendingInvite> {
+        let inv = |room: &str, inviter: Option<&str>| PendingInvite {
+            room_id: room.to_string(),
+            inviter: inviter.map(str::to_string),
+        };
+        vec![
+            inv(DM_ROOM, Some(TARGET_MIXED)),
+            inv(OTHER_ROOM, Some(STRANGER)),
+            inv(GROUP_ROOM, Some(STRANGER)),
+            inv(UNKNOWN_ROOM, None),
+        ]
+    }
+
+    /// Records every `InviteOps` call in order. `join_invited_rooms` joins
+    /// every pending invite, like the real one.
+    struct FakeInvites {
+        pending: Vec<PendingInvite>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeInvites {
+        fn new() -> Self {
+            Self {
+                pending: pending(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl InviteOps for FakeInvites {
+        async fn join_invited_rooms(&self) -> anyhow::Result<Vec<String>> {
+            self.log("join_invited_rooms".into());
+            Ok(self.pending.iter().map(|i| i.room_id.clone()).collect())
+        }
+        async fn pending_invites(&self) -> Vec<PendingInvite> {
+            self.log("pending_invites".into());
+            self.pending.clone()
+        }
+        async fn join_invited_room(&self, room_id: &str) -> anyhow::Result<()> {
+            self.log(format!("join {room_id}"));
+            Ok(())
+        }
+        async fn decline_invite(&self, room_id: &str) -> anyhow::Result<()> {
+            self.log(format!("decline {room_id}"));
+            Ok(())
+        }
+        async fn mark_dm(&self, room_id: &str, target: &str) -> anyhow::Result<()> {
+            self.log(format!("mark_dm {room_id} {target}"));
+            Ok(())
+        }
+    }
+
+    /// The code default is Legacy, for the enum and for a handler that does
+    /// not override `invite_policy` (every consultant today).
+    #[test]
+    fn default_invite_policy_is_legacy() {
+        assert_eq!(InvitePolicy::default(), InvitePolicy::Legacy);
+        assert_eq!(DefaultHandler.invite_policy(), InvitePolicy::Legacy);
+        assert_eq!(RoomPolicyHandler.invite_policy(), InvitePolicy::Legacy);
+    }
+
+    /// The decision table, both policies, for a handler that binds
+    /// `GROUP_ROOM`. Columns: Legacy live auto-join, OwnerOnly (cycle start
+    /// and live share `invite_decision`). Legacy cycle start joins every row
+    /// (`legacy_cycle_start_is_the_join_all_path`). `None` in the Legacy live
+    /// column: a live invite event always names its sender.
+    #[test]
+    fn invite_decision_table_both_policies() {
+        use InviteDecision::{Decline, Ignore, Join, Undecided};
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        #[rustfmt::skip]
+        let rows: &[(&str, Option<&str>, Option<InviteDecision>, InviteDecision)] = &[
+            // room,       inviter,                Legacy live,   OwnerOnly
+            (DM_ROOM,      Some(TARGET_MIXED),     Some(Join),    Join),
+            (DM_ROOM,      Some(&delivered),       Some(Join),    Join),
+            (GROUP_ROOM,   Some(TARGET_MIXED),     Some(Join),    Join),
+            (OTHER_ROOM,   Some(STRANGER),         Some(Ignore),  Decline),
+            (DM_ROOM,      Some(STRANGER),         Some(Ignore),  Decline),
+            (GROUP_ROOM,   Some(STRANGER),         Some(Ignore),  Join),
+            (GROUP_ROOM,   Some(COLLABORATOR),     Some(Ignore),  Join),
+            (OTHER_ROOM,   Some(COLLABORATOR),     Some(Ignore),  Decline),
+            (OTHER_ROOM,   None,                   None,          Undecided),
+            (GROUP_ROOM,   None,                   None,          Undecided),
+        ];
+        let legacy = PolicyHandler(InvitePolicy::Legacy);
+        let owner_only = PolicyHandler(InvitePolicy::OwnerOnly);
+        for (room, inviter, legacy_live, owner) in rows {
+            assert_eq!(
+                invite_decision(&owner_only, room, *inviter, TARGET_MIXED),
+                *owner,
+                "owner_only room {room} inviter {inviter:?}"
+            );
+            if let Some(inviter) = inviter {
+                assert_eq!(
+                    live_invite_decision(&owner_only, room, inviter, TARGET_MIXED),
+                    *owner,
+                    "owner_only live room {room} inviter {inviter}"
+                );
+                assert_eq!(
+                    live_invite_decision(&legacy, room, inviter, TARGET_MIXED),
+                    legacy_live.expect("a known inviter has a Legacy live verdict"),
+                    "legacy live room {room} inviter {inviter}"
+                );
+            }
+        }
+    }
+
+    /// Legacy live auto-join is the pre-R17 check, nothing else: Join exactly
+    /// when `authorize` admits the inviter, otherwise Ignore. It never
+    /// declines, whatever the room (bound or not) and whatever the handler.
+    #[test]
+    fn legacy_live_path_never_declines() {
+        let delivered = TARGET_MIXED.to_ascii_lowercase();
+        let inviters = [TARGET_MIXED, delivered.as_str(), STRANGER, COLLABORATOR, ""];
+        let rooms = [DM_ROOM, GROUP_ROOM, OTHER_ROOM, UNKNOWN_ROOM, ""];
+        let handlers: [&dyn MessageHandler; 3] = [
+            &DefaultHandler,
+            &RoomPolicyHandler,
+            &PolicyHandler(InvitePolicy::Legacy),
+        ];
+        for h in handlers {
+            assert_eq!(h.invite_policy(), InvitePolicy::Legacy);
+            for room in rooms {
+                for inviter in inviters {
+                    let want = if h.authorize(inviter, TARGET_MIXED) {
+                        InviteDecision::Join
+                    } else {
+                        InviteDecision::Ignore
+                    };
+                    assert_eq!(
+                        live_invite_decision(h, room, inviter, TARGET_MIXED),
+                        want,
+                        "{} room {room:?} inviter {inviter:?}",
+                        h.role()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Legacy cycle start is the pre-R17 join-all path: one
+    /// `join_invited_rooms` (every pending invite, inviter never consulted),
+    /// then `mark_dm` for each room it joined. No `pending_invites`, no
+    /// per-invite decision, no decline.
+    #[tokio::test]
+    async fn legacy_cycle_start_is_the_join_all_path() {
+        let handlers: [&dyn MessageHandler; 3] = [
+            &DefaultHandler,
+            &RoomPolicyHandler,
+            &PolicyHandler(InvitePolicy::Legacy),
+        ];
+        for h in handlers {
+            let fake = FakeInvites::new();
+            accept_pending_invites(&fake, h, TARGET_MIXED).await;
+            let mut want = vec!["join_invited_rooms".to_string()];
+            want.extend(
+                pending()
+                    .iter()
+                    .map(|i| format!("mark_dm {} {TARGET_MIXED}", i.room_id)),
+            );
+            assert_eq!(fake.calls(), want, "{}", h.role());
+        }
+    }
+
+    /// OwnerOnly cycle start: each pending invite decided by
+    /// `invite_decision`. The target's and the bound room's are joined (and
+    /// handed to `mark_dm`, which refuses any non 1:1), the stranger's is
+    /// declined, the unknown inviter's is left pending.
+    #[tokio::test]
+    async fn owner_only_cycle_start_gates_each_invite() {
+        let fake = FakeInvites::new();
+        accept_pending_invites(&fake, &PolicyHandler(InvitePolicy::OwnerOnly), TARGET_MIXED).await;
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "pending_invites".to_string(),
+                format!("join {DM_ROOM}"),
+                format!("decline {OTHER_ROOM}"),
+                format!("join {GROUP_ROOM}"),
+                format!("mark_dm {DM_ROOM} {TARGET_MIXED}"),
+                format!("mark_dm {GROUP_ROOM} {TARGET_MIXED}"),
+            ]
         );
     }
 }
