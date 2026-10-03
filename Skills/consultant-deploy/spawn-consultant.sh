@@ -30,12 +30,19 @@
 # a loud warning and is mounted as-is (never destructive). Skip the freshness pass
 # (presence stays fatal) with --no-refresh-refs.
 #
-# Extra refs (per consultant, opt-in): REFS_REPOS is fleet-wide, every consultant mounts it. A
-# consultant that needs MORE repos (private ones included) lists them in
-# <test-dir>/<key>-extra-refs.list (key = the label, or "generic" for --generic): one repo name
-# per line, `#` comments and blank lines ignored, names limited to [A-Za-z0-9._-] with no "..";
-# an invalid line aborts the spawn before anything changes. Each listed repo is mounted
-# read-only at /refs/<repo> into THAT consultant only, from a CLEAN single-branch clone of
+# Host block (per consultant, opt-in): settings for THIS script live in ONE `host` object in the
+# consultant JSON. The agent binary accepts the object and ignores its contents; this script
+# validates it STRICTLY before any side effect (Owner step, config render, clone, container):
+# `host` must be an object, its only keys are `extra_refs` and `refs_follow`, each a list of plain
+# repo names ([A-Za-z0-9._-], not ".", no "..", not the reserved "_developments"). Anything else
+# exits 2 with nothing changed. It is read from the config the spawn uses (the kept config, or the
+# render's base: the existing config, else the template). No `host` = today's argv, byte for byte.
+#   "host": { "extra_refs": ["aqua-mail", "siwx-oidc"], "refs_follow": ["aqua-rs-sdk"] }
+#
+# Extra refs (host.extra_refs): REFS_REPOS is fleet-wide, every consultant mounts it. A consultant
+# that needs MORE repos (private ones included) lists them in host.extra_refs. (This replaces the
+# former <test-dir>/<key>-extra-refs.list host file, which is no longer read.) Each listed repo is
+# mounted read-only at /refs/<repo> into THAT consultant only, from a CLEAN single-branch clone of
 # GitHub's default branch at <mirror>/<repo>, never from a working checkout (untracked .env or
 # target/ would ride along). <mirror> = ${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs},
 # on disk, never /tmp (RAM-backed tmpfs here). A missing mirror is cloned, a present one
@@ -43,7 +50,19 @@
 # or ANY local change in a mirror (modified, untracked or ignored files) aborts the spawn.
 # --no-refresh-refs (and so --print-run) mounts the mirrors as-is: no clone, no fetch, but a
 # missing or dirty mirror still aborts. A listed repo that is already in REFS_REPOS is skipped
-# with a note (the fleet mount wins).
+# with a note (the fleet mount wins), and so is one that is followed (host.refs_follow wins).
+#
+# Followed refs (host.refs_follow): each listed repo is mounted read-only at /refs/<repo> from
+# its FOLLOW mirror <follow>/<repo>, IN PLACE of the fleet mount for that repo (a repo outside
+# REFS_REPOS is simply added), for THIS consultant only; every other consultant keeps the fleet
+# checkout. Its digest dir <follow>/_developments/<repo> is mounted read-only at
+# /refs/_developments/<repo>. Directory mounts only (a single-file bind mount goes stale when the
+# file is replaced by rename). <follow> = ${CONSULTANT_REFS_FOLLOW_ROOT:-$HOME/.local/share/consultant-refs-follow}.
+# The follow mirrors and digests are owned by the host timer consultant-refs-follow.timer
+# (aqua-ops), which keeps them on the upstream default branch; this script NEVER clones, fetches
+# or updates them. FAIL-CLOSED: a missing mirror, a missing digest dir, or a dirty mirror (same
+# rule as extra refs) aborts the spawn before the container is touched, with
+# "run: systemctl --user start consultant-refs-follow.service".
 #
 # Rooms (per consultant, opt-in): when the directory <test-dir>/<key>-rooms/ exists it is
 # mounted read-only at /agent/rooms, and <test-dir>/<key>-room-state/ (created when missing,
@@ -111,8 +130,8 @@
 #
 # --print-run: assemble everything, print the `podman run` argument vector one arg per line,
 # exit 0. Stops BEFORE any container, systemd unit, DM, --replace removal or --fresh wipe,
-# and implies --no-refresh-refs (presence of every refs repo is still checked; extra-refs
-# mirrors must also be clean). It DOES render/patch the config file and create the persist
+# and implies --no-refresh-refs (presence of every refs repo is still checked; extra-refs and
+# follow mirrors must also be clean). It DOES render/patch the config file and create the persist
 # dirs (and a rooms consultant's room-state dir), since those are the run's
 # inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
 #
@@ -145,6 +164,8 @@
 #   CONSULTANT_REFS_BASE    parent dir of the REFS_REPOS checkouts (default /home/waldknoten-01)
 #   CONSULTANT_REFS_MIRROR  root of the extra-refs mirrors (default $HOME/.local/share/consultant-refs; never /tmp)
 #   CONSULTANT_REFS_REMOTE  clone base of the extra refs, <base>/<repo>.git (default https://github.com/inblockio)
+#   CONSULTANT_REFS_FOLLOW_ROOT  root of the follow mirrors + _developments digests (default
+#                           $HOME/.local/share/consultant-refs-follow; written only by the host timer)
 #   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
 #   AQUA_CLAUDE_TOKEN_FILE  OAuth token file (default ~/.aqua-matrix-heartbeat/claude-oauth-token)
 #   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
@@ -221,10 +242,13 @@ PERSONA_HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/consultant-perso
 # the freshness pass, and the podman -v flags, so the three can never drift apart.
 # Keep it in sync with ref_mounts in consultant-config.template.json.
 REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
-# Per-consultant extra refs (<key>-extra-refs.list): clean clones live under REFS_MIRROR, one
+# Per-consultant extra refs (host.extra_refs): clean clones live under REFS_MIRROR, one
 # dir per repo, cloned from REFS_REMOTE/<repo>.git. Disk only: /tmp is RAM-backed on this host.
 REFS_MIRROR="${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs}"
 REFS_REMOTE="${CONSULTANT_REFS_REMOTE:-https://github.com/inblockio}"
+# Followed refs (host.refs_follow): mirrors + _developments digests under FOLLOW_ROOT, kept current
+# by the host timer consultant-refs-follow.timer (aqua-ops). This script only reads them.
+FOLLOW_ROOT="${CONSULTANT_REFS_FOLLOW_ROOT:-$HOME/.local/share/consultant-refs-follow}"
 
 # Print the leading comment block (line 2 through the line before `set -euo pipefail`),
 # so this stays correct as the header grows.
@@ -291,8 +315,8 @@ else
   esac
   STEM="${LABEL}-aqua-consultant"
 fi
-# KEY names the per-consultant host assets in TEST_DIR (<key>-avatar.jpg, <key>-extra-refs.list,
-# <key>-rooms/): the label, or "generic" for the un-labeled consultant.
+# KEY names the per-consultant host assets in TEST_DIR (<key>-avatar.jpg, <key>-rooms/): the
+# label, or "generic" for the un-labeled consultant.
 if [ "$GENERIC" -eq 1 ]; then KEY="generic"; else KEY="$LABEL"; fi
 
 NAME="aqua-agent-${STEM}-1"
@@ -468,40 +492,121 @@ if [ "$PRINT_ONBOARDING" -eq 1 ]; then
   exit 0
 fi
 
-# ---------------------------------------------------------------- extra refs: read the list
-# <key>-extra-refs.list is parsed and validated HERE, before the Owner step, the config render
-# or any clone, so a bad line aborts with nothing changed. Names are plain GitHub repo names:
-# [A-Za-z0-9._-] only, so no slash and no ".." can steer the mirror path or the /refs mount.
-# A name already in REFS_REPOS is skipped (the fleet mount wins), a repeated one is dropped.
-EXTRA_REFS_LIST="$TEST_DIR/${KEY}-extra-refs.list"
+# ---------------------------------------------------------------- host block: read + validate
+# The config's `host` object (spawn-only settings, ignored by the agent) is parsed and validated
+# HERE, before the Owner step, the config render or any clone, so a bad block aborts with exit 2
+# and nothing changed. Source: the config this spawn uses (kept config, or the render's base).
+# Names are plain GitHub repo names: [A-Za-z0-9._-] only, so no slash and no ".." can steer a
+# mirror path or a /refs mount; "_developments" is reserved for the follow digests' mount point.
+host_block() {  # host_block <config.json>: prints HOST_EXTRA_REFS=(...) HOST_REFS_FOLLOW=(...)
+  python3 - "$1" <<'PY'
+import json, re, shlex, sys
+path = sys.argv[1]
+def die(msg):
+    print(f"!! host: {path}: {msg}", file=sys.stderr)
+    sys.exit(2)
+def jtype(v):
+    return {dict: "object", list: "array", str: "string", bool: "boolean", type(None): "null"}.get(type(v), "number")
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except (OSError, ValueError) as e:
+    die(f"cannot read the config as JSON: {e}")
+if not isinstance(cfg, dict):
+    die("the config is not a JSON object")
+host = cfg.get("host", {})
+if not isinstance(host, dict):
+    die(f"`host` must be a JSON object, got {jtype(host)}")
+unknown = sorted(k for k in host if k not in ("extra_refs", "refs_follow"))
+if unknown:
+    die(f"unknown key(s) in `host`: {', '.join(unknown)} (allowed: extra_refs, refs_follow)")
+name_ok = re.compile(r"[A-Za-z0-9._-]+")
+for key, var in (("extra_refs", "HOST_EXTRA_REFS"), ("refs_follow", "HOST_REFS_FOLLOW")):
+    names = host.get(key, [])
+    if not isinstance(names, list):
+        die(f"host.{key} must be a list of repo names, got {jtype(names)}")
+    for i, n in enumerate(names):
+        if not (isinstance(n, str) and name_ok.fullmatch(n)) or n == "." or ".." in n:
+            die(f"host.{key}[{i}]: invalid repo name {n!r}: plain repo names only, [A-Za-z0-9._-], no slash, no '..'")
+        if n == "_developments":
+            die(f"host.{key}[{i}]: '_developments' is reserved (mount point of the follow digests)")
+    print(var + "=(" + " ".join(shlex.quote(n) for n in names) + ")")
+PY
+}
+HOST_SRC="$CFG"; [ -f "$HOST_SRC" ] || HOST_SRC="$TEMPLATE"
+HOST_EXTRA_REFS=(); HOST_REFS_FOLLOW=()
+if ! HOST_ASSIGN="$(host_block "$HOST_SRC")"; then
+  echo "!! aborting: fix the host block in $HOST_SRC (nothing was changed)" >&2
+  exit 2
+fi
+eval "$HOST_ASSIGN"
+
+# REFS_FOLLOW: host.refs_follow, a repeated name dropped.
+REFS_FOLLOW=()
+for name in "${HOST_REFS_FOLLOW[@]}"; do
+  for r in "${REFS_FOLLOW[@]}"; do [ "$r" != "$name" ] || continue 2; done
+  REFS_FOLLOW+=( "$name" )
+done
+is_followed() { local r; for r in "${REFS_FOLLOW[@]}"; do [ "$r" != "$1" ] || return 0; done; return 1; }
+is_fleet_repo() { local r; for r in "${REFS_REPOS[@]}"; do [ "$r" != "$1" ] || return 0; done; return 1; }
+
+# EXTRA_REFS: host.extra_refs, minus followed repos (the follow mount wins) and REFS_REPOS (the
+# fleet mount wins), a repeated name dropped.
 EXTRA_REFS=()
-read_extra_refs() {
-  local line name n=0 r
-  [ -f "$EXTRA_REFS_LIST" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    n=$((n+1))
-    name="${line%%#*}"
-    name="${name#"${name%%[![:space:]]*}"}"   # trim leading whitespace
-    name="${name%"${name##*[![:space:]]}"}"   # trim trailing whitespace (also a CR)
-    [ -n "$name" ] || continue
-    if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$name" = . ] || [[ "$name" == *..* ]]; then
-      echo "!! extra refs: $EXTRA_REFS_LIST line $n: invalid repo name '$name'" >&2
-      echo "   one plain repo name per line: [A-Za-z0-9._-] only, no slash, no '..'" >&2
+for name in "${HOST_EXTRA_REFS[@]}"; do
+  if is_followed "$name"; then
+    echo ">> extra refs: $name is followed (host.refs_follow), skipped"
+    continue
+  fi
+  if is_fleet_repo "$name"; then
+    echo ">> extra refs: $name is already fleet-mounted (REFS_REPOS), skipped"
+    continue
+  fi
+  for r in "${EXTRA_REFS[@]}"; do [ "$r" != "$name" ] || continue 2; done
+  EXTRA_REFS+=( "$name" )
+done
+
+# Followed refs: the host timer consultant-refs-follow.timer owns FOLLOW_ROOT; this script never
+# clones, fetches or updates it, it only checks (read-only) that each followed mirror is a clean
+# git clone and that its digest dir exists. GIT_OPTIONAL_LOCKS=0: the status must not take the
+# index lock, which would race the timer's fast-forward. Checked here, before the Owner step, so
+# a missing or dirty mirror aborts with nothing changed.
+check_follow_refs() {
+  local repo dir dev st
+  for repo in "${REFS_FOLLOW[@]}"; do
+    dir="$FOLLOW_ROOT/$repo"; dev="$FOLLOW_ROOT/_developments/$repo"
+    if [ ! -e "$dir" ]; then
+      echo "!! refs follow: mirror MISSING: $dir" >&2
       return 1
     fi
-    for r in "${REFS_REPOS[@]}"; do
-      if [ "$r" = "$name" ]; then
-        echo ">> extra refs: $name is already fleet-mounted (REFS_REPOS), skipped"
-        continue 2
-      fi
-    done
-    for r in "${EXTRA_REFS[@]}"; do
-      [ "$r" != "$name" ] || continue 2
-    done
-    EXTRA_REFS+=( "$name" )
-  done < "$EXTRA_REFS_LIST"
+    if [ ! -d "$dir/.git" ]; then
+      echo "!! refs follow: $dir is not a git clone; refusing to mount it" >&2
+      return 1
+    fi
+    if ! st="$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" status --porcelain --ignored 2>&1)"; then
+      echo "!! refs follow: cannot read the status of $dir: $st" >&2
+      return 1
+    fi
+    if [ -n "$st" ]; then
+      echo "!! refs follow: mirror $dir has LOCAL CHANGES (modified, untracked or ignored files); refusing to mount it" >&2
+      echo "   inspect: git -C $dir status --ignored   (or delete the dir; the service re-clones it)" >&2
+      return 1
+    fi
+    if [ ! -d "$dev" ]; then
+      echo "!! refs follow: digest dir MISSING: $dev" >&2
+      return 1
+    fi
+  done
 }
-read_extra_refs || { echo "!! aborting: fix $EXTRA_REFS_LIST (nothing was changed)" >&2; exit 2; }
+if [ "${#REFS_FOLLOW[@]}" -gt 0 ]; then
+  if ! check_follow_refs; then
+    echo "   this script never clones or updates follow mirrors; the host timer does." >&2
+    echo "   run: systemctl --user start consultant-refs-follow.service" >&2
+    echo "!! aborting: follow mirror not usable (nothing was changed)" >&2
+    exit 1
+  fi
+  echo ">> refs follow: ${#REFS_FOLLOW[@]} repo(s) from $FOLLOW_ROOT (kept current by consultant-refs-follow.timer), ro at /refs, digests ro at /refs/_developments: ${REFS_FOLLOW[*]}"
+fi
 
 # ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
 # `--target did:...` is resolved through siwx-oidc's public GET /resolve?did=, which applies
@@ -661,12 +766,25 @@ refresh_refs() {
 }
 refresh_refs || { echo "!! aborting: missing refs repo(s), see clone hints above" >&2; exit 1; }
 
+# A followed fleet repo is mounted from its follow mirror IN PLACE of the fleet checkout (same
+# position in the argv); a followed repo outside REFS_REPOS is added after the fleet mounts, then
+# one digest dir per followed repo. No host.refs_follow = exactly the fleet mounts, as before.
 REF_MOUNT_ARGS=()
 for repo in "${REFS_REPOS[@]}"; do
-  REF_MOUNT_ARGS+=( -v "$REFS_BASE/$repo:/refs/$repo:ro" )
+  if is_followed "$repo"; then
+    REF_MOUNT_ARGS+=( -v "$FOLLOW_ROOT/$repo:/refs/$repo:ro" )
+  else
+    REF_MOUNT_ARGS+=( -v "$REFS_BASE/$repo:/refs/$repo:ro" )
+  fi
+done
+for repo in "${REFS_FOLLOW[@]}"; do
+  is_fleet_repo "$repo" || REF_MOUNT_ARGS+=( -v "$FOLLOW_ROOT/$repo:/refs/$repo:ro" )
+done
+for repo in "${REFS_FOLLOW[@]}"; do
+  REF_MOUNT_ARGS+=( -v "$FOLLOW_ROOT/_developments/$repo:/refs/_developments/$repo:ro" )
 done
 
-# Extra refs (EXTRA_REFS, from <key>-extra-refs.list): clean single-branch clones of each
+# Extra refs (EXTRA_REFS, from host.extra_refs): clean single-branch clones of each
 # repo's default branch under REFS_MIRROR. The whole tree is readable in the container, so the
 # mirror must be exactly what upstream has: FAIL-CLOSED on a missing mirror under
 # --no-refresh-refs, a failed clone or fetch, a non-fast-forward, and ANY local change
