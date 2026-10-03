@@ -208,6 +208,16 @@ setup_boundinvite() {
   fi
   elsewhere=$(bound_elsewhere "$br") && [ -z "$elsewhere" ] \
     || { echo "refusing: $br is bound by another consultant config: ${elsewhere:-config scan failed}" >&2; return 1; }
+  # The test owner joins too: with only the collaborator and the canary in it, the room is a true
+  # 1:1, and a DM lookup between those two (room_probe `dm`, the `ignored` step) would pick it.
+  m=$("$P" membership "${cid[@]}" "$br" "$OWNER" 2>/dev/null | kv membership)
+  if [ "$m" != join ]; then
+    [ "$m" = invite ] || "$P" invite "${cid[@]}" "$br" "$OWNER" >/dev/null 2>&1
+    "$P" join --key-file "$CDIR/owner/agent.pem" --store-dir "$CDIR/owner/store" "$br" >/dev/null 2>&1
+    m=$("$P" membership "${cid[@]}" "$br" "$OWNER" 2>/dev/null | kv membership)
+    [ "$m" = join ] || { echo "the test owner could not join $br (membership=$m)" >&2; return 1; }
+    echo "the test owner joined $br (the room is never a 1:1)"
+  fi
   python3 - "$CONFIG" "$BINDING" "$OWNER" "$ROOM" "$br" <<'PY'
 import copy, json, sys
 cfg_path, bind_path, owner, room, bound = sys.argv[1:]
@@ -637,6 +647,10 @@ if want ignored; then
   info "R17 invites: collab dm $CDM, stranger dm $SDM, stranger group $SGR"
   [ -n "$CDM" ] && [ -n "$SDM" ] && [ -n "$SGR" ] \
     || check FAIL R17.setup "room_probe could not create every invite" "collab dm=$CDM stranger dm=$SDM group=$SGR"
+  for r in "$CDM" "$SDM"; do  # room_probe reuses any true 1:1 room as "the DM"
+    [ "$(jq --arg r "$r" '[.rooms[]? | select(.room_id==$r)] | length' <<<"$LIVE")" = 0 ] \
+      || check FAIL R17.setup "a DM resolved to a room the canary config binds: rerun --setup-boundinvite (owner joins)" "room $r"
+  done
   if [ "$INVITE_POLICY" = owner_only ]; then
   sleep "$NEG"   # > one relay cycle (~4 min): covers the live handler and the cycle-start join
   m=$(probe collab membership "$CDM" "$CANARY" | kv membership)
@@ -706,8 +720,9 @@ if want boundinvite; then
     wait_lines 180 1 bi_joined >/dev/null
     m=$(probe collab membership "$BR" "$CANARY" | kv membership)
     jl=$(clogs "$tiso" | grep -F -e "auto-joined invited room $BR" -e "joined invited room $BR from" | tail -1)
+    om=$(probe collab membership "$BR" "$OWNER" | kv membership)
     check "$(verdict "$([ "$m" = join ] && echo 1)")" BI.joined "the canary joined the collaborator's invite into its bound room" \
-      "room $BR membership=$m" "$(printf '%s' "${jl:-no join line}" | cut -c1-200)"
+      "room $BR membership=$m (test owner: $om)" "$(printf '%s' "${jl:-no join line}" | cut -c1-200)"
     l=$(declined "$tiso" "$BR" "$COLLAB")
     check "$(verdict "$([ -z "$l" ] && echo 1)")" BI.no-decline "no declined-invite line for the bound room" "${l:-none}"
   fi
