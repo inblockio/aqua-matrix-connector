@@ -15,20 +15,15 @@
 //! Two Clients on one crypto store caused an OTK collision and Olm-deafness in
 //! the Scribe (2026-09-27), which is why the split is strict.
 //!
-//! This library holds the Matrix-free pieces both halves share: the socket
-//! protocol ([`proto`]), the allow-list of people and group rooms
-//! ([`allowlist`]), the `m.direct` repair ([`direct`]), the durable inbox
-//! ([`inbox`]), the per-recipient rate limit ([`ratelimit`]) and formatting
-//! helpers ([`format`]).
+//! Since the messenger refactor, the tools, policy and protocol are the shared
+//! connector crate `aqua-messenger` (host profile [`aqua_messenger::Profile::host`],
+//! the only profile with `wait_for_reply`); this crate re-exports its modules
+//! under their old paths and keeps the host specifics: the state directory and
+//! socket defaults, and the `m.direct` repair ([`direct`]).
 
-pub mod allowlist;
-pub mod attachments;
 pub mod direct;
-pub mod format;
-pub mod inbox;
-pub mod jsonrpc;
-pub mod proto;
-pub mod ratelimit;
+
+pub use aqua_messenger::{allowlist, attachments, format, inbox, jsonrpc, proto, ratelimit};
 
 use std::path::PathBuf;
 
@@ -67,4 +62,20 @@ pub fn sock_path() -> PathBuf {
         return PathBuf::from(s);
     }
     state_dir().join("bridge.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use aqua_messenger::Profile;
+
+    /// The host constants and the host profile must agree.
+    #[test]
+    fn host_profile_matches_constants() {
+        let l = Profile::host().limits;
+        assert_eq!(l.max_wait_secs, super::MAX_WAIT_SECS);
+        assert_eq!(l.max_message_bytes, super::MAX_MESSAGE_BYTES);
+        assert_eq!(l.max_file_bytes, super::MAX_FILE_BYTES);
+        assert_eq!(l.rate_count, super::RATE_LIMIT_COUNT);
+        assert_eq!(l.rate_window_secs, super::RATE_LIMIT_WINDOW_SECS);
+    }
 }

@@ -213,6 +213,19 @@ impl AgentClient {
         path: impl AsRef<Path>,
         caption: Option<&str>,
     ) -> Result<String> {
+        self.send_media_to_room_with(room_id, path, caption, None)
+            .await
+    }
+
+    /// [`send_media_to_room`](Self::send_media_to_room) with optional reply
+    /// parameters (see [`send_media_to_room_reply`](Self::send_media_to_room_reply)).
+    pub(crate) async fn send_media_to_room_with(
+        &self,
+        room_id: &str,
+        path: impl AsRef<Path>,
+        caption: Option<&str>,
+        reply: Option<matrix_sdk::room::reply::Reply>,
+    ) -> Result<String> {
         let room = self.joined_room(room_id)?;
         let path = path.as_ref();
         let data = tokio::fs::read(path)
@@ -223,7 +236,8 @@ impl AgentClient {
         let info = AttachmentInfo::File(BaseFileInfo {
             size: uint(data.len()),
         });
-        let config = attach_config(info, caption);
+        let mut config = attach_config(info, caption);
+        config.reply = reply;
         let resp = room
             .send_attachment(filename, &mime, data, config)
             .await

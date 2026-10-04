@@ -9,40 +9,36 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqua_matrix_agent::{
     connect_with_outage_retry, is_unknown_token, AgentClient, AgentConfig, ConnectOutcome,
 };
-use aqua_system_bridge::allowlist::{invite_action, InviteAction};
-use aqua_system_bridge::inbox::NewEntry;
+use aqua_messenger::allowlist::{invite_action, InviteAction};
+use aqua_messenger::{Dest, ReplyRef, SeenRoom};
+use aqua_messenger_matrix::inbound::{
+    backfill, joined_member_count, register_message_handler, survey_rooms,
+};
 use matrix_sdk::{
     config::SyncSettings,
     event_handler::EventHandlerHandle,
-    room::{MessagesOptions, Room},
+    room::Room,
     ruma::{
-        api::client::receipt::create_receipt::v3::ReceiptType,
         events::{
             direct::DirectEventContent,
-            receipt::ReceiptThread,
-            room::{
-                member::{MembershipState, StrippedRoomMemberEvent},
-                message::{MessageType, OriginalSyncRoomMessageEvent},
-            },
-            AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+            room::member::{MembershipState, StrippedRoomMemberEvent},
         },
-        OwnedUserId, RoomId, UInt,
+        OwnedUserId, RoomId,
     },
-    RoomMemberships, RoomState,
+    RoomState,
 };
 use serde_json::json;
 use tokio::sync::{mpsc, Notify};
 
-use crate::bridge::{CmdOk, Dest, SeenRoom, SendCmd, SendKind, Shared};
+use crate::bridge::{CmdOk, Engine, SendCmd, SendKind, Target};
+
+/// The daemon's shared state is the messenger engine (host profile).
+type Shared = Engine;
 
 const ROLE: &str = "aqua-system";
 const REFRESH_GUARD_SECS: u64 = 30;
 const MIN_CYCLE_SECS: u64 = 15;
 const MAX_CONNECT_FAILURES: u32 = 3;
-/// Per-room history scanned at each cycle start to catch messages that arrived
-/// while no handler was registered (the catch-up syncs, restarts, outages).
-const BACKFILL_LIMIT: u32 = 30;
-const BACKFILL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on one send attempt (the connector's own retries included).
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upper bound on one attachment download + decrypt (50 MiB on a slow link).
@@ -87,14 +83,13 @@ pub async fn run(
         };
         // connect() may have just generated the key: keep it owner-only.
         let _ = std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600));
-        {
-            let mut st = shared.status.lock().unwrap();
+        shared.set_status(|st| {
             st.connected = true;
             st.did = Some(agent.did().to_string());
             st.user_id = Some(agent.user_id().to_string());
             st.device_id = agent.device_id();
             st.last_error = None;
-        }
+        });
 
         if let Err(e) = agent.sync_once_nowait().await {
             tracing::warn!("pre-join sync failed: {e:#}");
@@ -115,11 +110,11 @@ pub async fn run(
         }
 
         let exit = run_cycle(&agent, &shared, &mut rx, &mut carry, &shutdown).await;
-        shared.status.lock().unwrap().connected = false;
+        shared.set_status(|st| st.connected = false);
         if exit == "shutdown" {
             // Fail anything still queued so callers are not left hanging.
             if let Some(c) = carry.take() {
-                let _ = c.reply.send(Err("bridge shutting down; not sent".into()));
+                let _ = c.done.send(Err("bridge shutting down; not sent".into()));
             }
             return;
         }
@@ -136,11 +131,11 @@ async fn run_cycle(
 ) -> &'static str {
     let own = agent.user_id().to_string();
     let handles: Vec<EventHandlerHandle> = vec![
-        register_message_handler(agent, shared.clone(), own.clone()),
+        register_message_handler(agent, shared.clone()),
         register_invite_handler(agent, shared.clone(), own.clone()),
     ];
 
-    backfill(agent, shared, &own).await;
+    backfill(agent, shared).await;
 
     let sync_client = agent.client().clone();
     aqua_matrix_agent::reload_olm_if_store_changed(&sync_client).await;
@@ -203,7 +198,7 @@ async fn run_cycle(
 /// was rejected (to retry on the next cycle's fresh Client); otherwise replies.
 async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<SendCmd> {
     if Instant::now() > cmd.deadline {
-        let _ = cmd.reply.send(Err(
+        let _ = cmd.done.send(Err(
             "the bridge could not reach Matrix before the send deadline (outage?); not sent".into(),
         ));
         return None;
@@ -215,37 +210,45 @@ async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<S
         _ => (SEND_ATTEMPT_TIMEOUT, "send"),
     };
     let fut = async {
+        let reply = cmd.reply.as_ref();
         match &cmd.kind {
             SendKind::Text(md) => {
-                let room_id = destination_room(agent, shared, &cmd.to, MissingDm::Create).await?;
-                agent
-                    .send_to_room_chunked(&room_id, md)
+                let room_id =
+                    destination_room(agent, shared, &cmd.to, reply, MissingDm::Create).await?;
+                aqua_messenger_matrix::outbound::send_text(agent, &room_id, md, reply)
                     .await
                     .map(CmdOk::Sent)
             }
             SendKind::File { path, caption } => {
-                let room_id = destination_room(agent, shared, &cmd.to, MissingDm::Create).await?;
-                agent
-                    .send_media_to_room(&room_id, path, Some(caption))
+                let room_id =
+                    destination_room(agent, shared, &cmd.to, reply, MissingDm::Create).await?;
+                aqua_messenger_matrix::outbound::send_file(agent, &room_id, path, caption, reply)
                     .await
                     .map(CmdOk::Sent)
             }
             SendKind::Edit { original, content } => {
-                let room_id = destination_room(agent, shared, &cmd.to, MissingDm::Refuse).await?;
+                let room_id =
+                    destination_room(agent, shared, &cmd.to, None, MissingDm::Refuse).await?;
                 crate::edit::ensure_editable(agent.client(), &room_id, original).await?;
                 agent
                     .send_content_to_room(&room_id, (**content).clone())
                     .await
-                    .map(CmdOk::Sent)
+                    .map(|id| CmdOk::Sent(id.into()))
             }
             SendKind::Fetch {
                 event_id,
                 room_id,
                 media,
                 max_bytes,
-            } => crate::media::fetch(agent.client(), room_id, event_id, media.clone(), *max_bytes)
-                .await
-                .map(|(bytes, mimetype)| CmdOk::Fetched { bytes, mimetype }),
+            } => aqua_messenger_matrix::media::fetch(
+                agent.client(),
+                room_id,
+                event_id,
+                media.clone(),
+                *max_bytes,
+            )
+            .await
+            .map(|(bytes, mimetype)| CmdOk::Fetched { bytes, mimetype }),
         }
     };
     let res = match tokio::time::timeout(limit, fut).await {
@@ -257,7 +260,7 @@ async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<S
     };
     match res {
         Ok(ok) => {
-            let _ = cmd.reply.send(Ok(ok));
+            let _ = cmd.done.send(Ok(ok));
             None
         }
         Err(e) if is_unknown_token(&e) => {
@@ -265,7 +268,7 @@ async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<S
             Some(cmd)
         }
         Err(e) => {
-            let _ = cmd.reply.send(Err(format!("{e:#}")));
+            let _ = cmd.done.send(Err(format!("{e:#}")));
             None
         }
     }
@@ -297,14 +300,12 @@ async fn handle_invite(
     is_direct: bool,
 ) {
     let room_id = room.room_id().to_string();
-    let (allowed, listed) = {
-        let mut allow = shared.allow.lock().unwrap();
-        allow.reload(false);
+    let (allowed, listed) = shared.with_allow(|allow| {
         (
             allow.by_mxid(&inviter).is_some(),
             allow.room_by_id(&room_id).map(|r| r.name.clone()),
         )
-    };
+    });
     let action = invite_action(allowed, is_direct, listed.is_some());
     if action == InviteAction::Decline {
         tracing::info!(%room_id, %inviter, "declining invite from a non-allow-listed user");
@@ -321,11 +322,7 @@ async fn handle_invite(
                 joined_members: joined_member_count(&room).await,
                 is_direct: action == InviteAction::JoinAsDm,
             };
-            shared
-                .joined_rooms
-                .lock()
-                .unwrap()
-                .insert(room_id.clone(), seen);
+            shared.note_joined_room(&room_id, seen);
             if action == InviteAction::JoinAsDm {
                 tracing::info!(%room_id, %inviter, "joined DM invite from allow-listed user");
                 if let Err(e) = agent.mark_dm(&room_id, &inviter).await {
@@ -364,9 +361,13 @@ enum MissingDm {
 async fn destination_room(
     agent: &AgentClient,
     shared: &Shared,
-    dest: &Dest,
+    to: &Target,
+    reply: Option<&ReplyRef>,
     missing: MissingDm,
 ) -> anyhow::Result<String> {
+    let Target::Dest(dest) = to else {
+        anyhow::bail!("internal error: send without a destination");
+    };
     match dest {
         Dest::Room(id) => {
             let rid = <&RoomId>::try_from(id.as_str())
@@ -381,27 +382,31 @@ async fn destination_room(
                 ),
             }
         }
-        Dest::Person(mxid) => dm_room_for(agent, shared, mxid, missing).await,
-        Dest::Nobody => anyhow::bail!("internal error: send without a destination"),
+        Dest::Person(mxid) => {
+            let prefer = reply.and_then(|r| r.room_id.as_deref());
+            dm_room_for(agent, shared, mxid, prefer, missing).await
+        }
     }
 }
 
 /// Resolve (or create, if `missing` allows) the 1:1 DM with `mxid`.
 /// Candidates: joined rooms with at most two joined members, not listed under
-/// `[[rooms]]`, where the person is joined (or invited). Preference: rooms
-/// recorded in `m.direct`, then the person joined over invited, then the
+/// `[[rooms]]`, where the person is joined (or invited). Preference: the room
+/// of the message being replied to (`prefer`, when it is a candidate), then
+/// rooms recorded in `m.direct`, then the person joined over invited, then the
 /// connector's own pick (most recent activity), then room id order.
 async fn dm_room_for(
     agent: &AgentClient,
     shared: &Shared,
     mxid: &str,
+    prefer: Option<&str>,
     missing: MissingDm,
 ) -> anyhow::Result<String> {
     let target =
         OwnedUserId::try_from(mxid).map_err(|e| anyhow::anyhow!("invalid MXID {mxid}: {e}"))?;
     let listed = listed_room_ids(shared);
     let connector_pick = agent.dm_room_id(mxid).await.ok().flatten();
-    let mut best: Option<((bool, u8, bool), String)> = None;
+    let mut best: Option<((bool, bool, u8, bool), String)> = None;
     for room in agent.client().joined_rooms() {
         let id = room.room_id().to_string();
         if listed.contains(&id) || joined_member_count(&room).await > 2 {
@@ -417,6 +422,7 @@ async fn dm_room_for(
         };
         let is_direct = room.is_direct().await.unwrap_or(false);
         let key = (
+            prefer == Some(id.as_str()),
             is_direct,
             rank,
             connector_pick.as_deref() == Some(id.as_str()),
@@ -456,37 +462,8 @@ async fn dm_room_for(
     Ok(id)
 }
 
-/// Joined members of `room`, from the full member list (fetched from the
-/// server when lazy-loaded). The sync summary's `joined_members_count()` is 0
-/// on our homeserver unless the filter lazy-loads members, so it cannot tell a
-/// group from a DM; it is only the fallback when the member fetch fails.
-async fn joined_member_count(room: &Room) -> u64 {
-    match room.members(RoomMemberships::JOIN).await {
-        Ok(m) => m.len() as u64,
-        Err(e) => {
-            tracing::debug!(room = %room.room_id(), "member list unavailable ({e:#}); using the sync summary count");
-            room.joined_members_count()
-        }
-    }
-}
-
-/// Whether a message's room is a group: listed-room status is decided by the
-/// caller; here, the member count from the last connect's snapshot (or the
-/// room's summary for a room joined since).
-fn is_group(shared: &Shared, room: &Room) -> bool {
-    let snap = shared
-        .joined_rooms
-        .lock()
-        .unwrap()
-        .get(room.room_id().as_str())
-        .map(|s| s.joined_members);
-    snap.unwrap_or(0).max(room.joined_members_count()) > 2
-}
-
 fn listed_room_ids(shared: &Shared) -> std::collections::HashSet<String> {
-    let mut allow = shared.allow.lock().unwrap();
-    allow.reload(false);
-    allow.rooms().iter().map(|r| r.room_id.clone()).collect()
+    shared.with_allow(|allow| allow.rooms().iter().map(|r| r.room_id.clone()).collect())
 }
 
 /// Remove group rooms from our `m.direct`: every `[[rooms]]` entry and every
@@ -546,40 +523,6 @@ async fn repair_m_direct(agent: &AgentClient, shared: &Shared) {
     }
 }
 
-/// Snapshot every joined room (display name, member count, DM flag, listing)
-/// for `list_recipients`, and log it on the first connect and whenever a room
-/// is new, so an operator can learn which room id is which.
-async fn survey_rooms(agent: &AgentClient, shared: &Shared, log_all: bool) {
-    let mut map = std::collections::BTreeMap::new();
-    for room in agent.client().joined_rooms() {
-        let id = room.room_id().to_string();
-        let seen = SeenRoom {
-            display_name: room.display_name().await.ok().map(|n| n.to_string()),
-            joined_members: joined_member_count(&room).await,
-            is_direct: room.is_direct().await.unwrap_or(false),
-        };
-        map.insert(id, seen);
-    }
-    let previous = std::mem::take(&mut *shared.joined_rooms.lock().unwrap());
-    {
-        let allow = shared.allow.lock().unwrap();
-        for (id, r) in &map {
-            if !log_all && previous.contains_key(id) {
-                continue;
-            }
-            tracing::info!(
-                room_id = %id,
-                display_name = r.display_name.as_deref().unwrap_or("?"),
-                joined_members = r.joined_members,
-                is_direct = r.is_direct,
-                listed = allow.room_by_id(id).map(|x| x.name.as_str()).unwrap_or("-"),
-                "joined room"
-            );
-        }
-    }
-    *shared.joined_rooms.lock().unwrap() = map;
-}
-
 fn register_invite_handler(
     agent: &AgentClient,
     shared: Arc<Shared>,
@@ -601,249 +544,4 @@ fn register_invite_handler(
                 handle_invite(&agent, &shared, room, ev.sender.to_string(), is_direct).await;
             }
         })
-}
-
-fn register_message_handler(
-    agent: &AgentClient,
-    shared: Arc<Shared>,
-    own: String,
-) -> EventHandlerHandle {
-    agent
-        .client()
-        .add_event_handler(move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-            let shared = shared.clone();
-            let own = own.clone();
-            async move {
-                let group = is_group(&shared, &room);
-                if ingest(&shared, &own, &ev, room.room_id().as_str(), group) {
-                    let event_id = ev.event_id.clone();
-                    tokio::spawn(async move {
-                        let _ = room
-                            .send_single_receipt(
-                                ReceiptType::Read,
-                                ReceiptThread::Unthreaded,
-                                event_id,
-                            )
-                            .await;
-                    });
-                }
-            }
-        })
-}
-
-/// True for the msgtypes that carry a file.
-fn is_media(msgtype: &MessageType) -> bool {
-    matches!(
-        msgtype,
-        MessageType::File(_)
-            | MessageType::Image(_)
-            | MessageType::Audio(_)
-            | MessageType::Video(_)
-    )
-}
-
-/// Record one inbound message: any member's message in a listed `[[rooms]]`
-/// room (tagged with the room name), or a DM from an allow-listed sender.
-/// Messages in unlisted group rooms (`group`: more than two joined members)
-/// are dropped, logged once per room; so are media messages when the instance
-/// refuses inbound media. Returns true when newly added.
-fn ingest(
-    shared: &Shared,
-    own: &str,
-    ev: &OriginalSyncRoomMessageEvent,
-    room_id: &str,
-    group: bool,
-) -> bool {
-    let sender = ev.sender.as_str();
-    if sender.eq_ignore_ascii_case(own) {
-        return false;
-    }
-    let (room_name, sender_name) = {
-        let allow = shared.allow.lock().unwrap();
-        (
-            allow.room_by_id(room_id).map(|r| r.name.clone()),
-            allow.by_mxid(sender).map(|r| r.name.clone()),
-        )
-    };
-    if room_name.is_none() && group {
-        if shared
-            .dropped
-            .lock()
-            .unwrap()
-            .insert(format!("room:{room_id}"))
-        {
-            tracing::info!(room = %room_id, "dropping messages in an unlisted group room (not under [[rooms]])");
-            shared.audit(json!({"event": "inbound_dropped_unlisted_room", "room": room_id}));
-        }
-        return false;
-    }
-    let name = match (&room_name, sender_name) {
-        (_, Some(n)) => Some(n),
-        (Some(_), None) => None,
-        (None, None) => {
-            let event_id = ev.event_id.to_string();
-            if shared.dropped.lock().unwrap().insert(event_id.clone()) {
-                tracing::info!(%sender, room = %room_id, "dropped message from non-allow-listed sender");
-                shared.audit(json!({"event": "inbound_dropped", "from": sender, "room": room_id, "event_id": event_id}));
-            }
-            return false;
-        }
-    };
-    // An instance configured to refuse inbound media records nothing for a
-    // media message (so no media reference or E2EE key is stored) and never
-    // downloads it. Logged once per event, metadata only.
-    if is_media(&ev.content.msgtype) && !shared.inbox.lock().unwrap().policy().accept_media {
-        let event_id = ev.event_id.to_string();
-        if shared.dropped.lock().unwrap().insert(event_id.clone()) {
-            tracing::info!(%sender, room = %room_id, "dropped a media message (inbound media is refused on this bridge)");
-            shared.audit(json!({"event": "inbound_dropped_media", "from": sender, "room": room_id, "event_id": event_id, "msgtype": ev.content.msgtype.msgtype()}));
-        }
-        return false;
-    }
-    let (kind, body, filename) = match &ev.content.msgtype {
-        MessageType::Text(t) => ("text", t.body.clone(), None),
-        MessageType::Notice(n) => ("notice", n.body.clone(), None),
-        MessageType::Emote(e) => ("emote", e.body.clone(), None),
-        MessageType::File(f) => (
-            "file",
-            f.body.clone(),
-            Some(f.filename.clone().unwrap_or_else(|| f.body.clone())),
-        ),
-        MessageType::Image(i) => (
-            "image",
-            i.body.clone(),
-            Some(i.filename.clone().unwrap_or_else(|| i.body.clone())),
-        ),
-        MessageType::Audio(a) => (
-            "audio",
-            a.body.clone(),
-            Some(a.filename.clone().unwrap_or_else(|| a.body.clone())),
-        ),
-        MessageType::Video(v) => (
-            "video",
-            v.body.clone(),
-            Some(v.filename.clone().unwrap_or_else(|| v.body.clone())),
-        ),
-        other => ("other", other.body().to_string(), None),
-    };
-    let entry = NewEntry {
-        event_id: ev.event_id.to_string(),
-        room_id: room_id.to_string(),
-        sender: sender.to_string(),
-        sender_name: name.clone(),
-        room: room_name.clone(),
-        ts_ms: u64::from(ev.origin_server_ts.0),
-        kind: kind.to_string(),
-        body,
-        filename,
-        media: crate::media::media_ref(&ev.content.msgtype),
-    };
-    let seq = shared.inbox.lock().unwrap().ingest(entry);
-    match seq {
-        Some(seq) => {
-            tracing::info!(
-                from = name.as_deref().unwrap_or(sender),
-                room = room_name.as_deref().unwrap_or("-"),
-                seq,
-                kind,
-                "inbox: new message"
-            );
-            shared.inbox_changed.notify_waiters();
-            true
-        }
-        None => false,
-    }
-}
-
-/// Scan recent history of every joined room and ingest what the handler-less
-/// catch-up syncs (or downtime) swallowed. Dedupe is by event id, so
-/// re-offering an already-ingested message is a no-op.
-async fn backfill(agent: &AgentClient, shared: &Arc<Shared>, own: &str) {
-    let scan = async {
-        let mut utd = 0usize;
-        let mut found: Vec<(u64, String, bool, OriginalSyncRoomMessageEvent)> = Vec::new();
-        for room in agent.client().joined_rooms() {
-            let group = is_group(shared, &room);
-            let mut opts = MessagesOptions::backward();
-            opts.limit = UInt::from(BACKFILL_LIMIT);
-            let resp = match room.messages(opts).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(room = %room.room_id(), "backfill failed: {e:#}");
-                    continue;
-                }
-            };
-            for event in resp.chunk {
-                if event.kind.is_utd() {
-                    utd += 1;
-                    continue;
-                }
-                let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
-                    msg,
-                ))) = event.raw().deserialize()
-                else {
-                    continue;
-                };
-                if let Some(orig) = msg.as_original() {
-                    found.push((
-                        u64::from(orig.origin_server_ts.0),
-                        room.room_id().to_string(),
-                        group,
-                        orig.clone(),
-                    ));
-                }
-            }
-        }
-        (found, utd)
-    };
-    let (mut found, utd) = match tokio::time::timeout(BACKFILL_TIMEOUT, scan).await {
-        Ok(v) => v,
-        Err(_) => {
-            tracing::warn!("backfill exceeded {}s; skipped", BACKFILL_TIMEOUT.as_secs());
-            return;
-        }
-    };
-    if utd > 0 {
-        tracing::debug!("backfill saw {utd} undecryptable event(s)");
-    }
-    found.sort_by_key(|(ts, _, _, _)| *ts);
-    let mut added = 0;
-    for (_, room_id, group, ev) in &found {
-        if ingest(shared, own, ev, room_id, *group) {
-            added += 1;
-        }
-    }
-    if added > 0 {
-        tracing::info!("backfill added {added} message(s) to the inbox");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use matrix_sdk::ruma::events::room::message::{
-        AudioMessageEventContent, FileMessageEventContent, ImageMessageEventContent,
-        VideoMessageEventContent,
-    };
-    use matrix_sdk::ruma::{mxc_uri, OwnedMxcUri};
-
-    #[test]
-    fn only_file_carrying_msgtypes_count_as_media() {
-        let mxc: OwnedMxcUri = mxc_uri!("mxc://x/y").to_owned();
-        for m in [
-            MessageType::File(FileMessageEventContent::plain("a.pdf".into(), mxc.clone())),
-            MessageType::Image(ImageMessageEventContent::plain("a.png".into(), mxc.clone())),
-            MessageType::Video(VideoMessageEventContent::plain("a.mp4".into(), mxc.clone())),
-            MessageType::Audio(AudioMessageEventContent::plain("a.ogg".into(), mxc)),
-        ] {
-            assert!(is_media(&m), "{}", m.msgtype());
-        }
-        for m in [
-            MessageType::text_plain("hello"),
-            MessageType::notice_plain("note"),
-            MessageType::emote_plain("waves"),
-        ] {
-            assert!(!is_media(&m), "{}", m.msgtype());
-        }
-    }
 }

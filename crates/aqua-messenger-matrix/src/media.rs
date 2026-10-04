@@ -12,7 +12,7 @@
 use std::io::Read as _;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aqua_system_bridge::inbox::MediaRef;
+use aqua_messenger::inbox::MediaRef;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};

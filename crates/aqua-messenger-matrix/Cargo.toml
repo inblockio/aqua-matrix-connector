@@ -1,0 +1,26 @@
+[package]
+name = "aqua-messenger-matrix"
+version.workspace = true
+edition.workspace = true
+description = "Matrix side of aqua-messenger: inbound ingest/backfill of DMs and listed rooms into the messenger inbox (with reply/thread metadata), threaded replies on send, on-demand E2EE attachment download (authenticated media, SHA-256 verified), and the in-process backend that lets an agent embedding aqua-matrix-connector expose the messenger tools over its OWN live AgentClient (never a second Client on its crypto store)."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_messenger_matrix"
+path = "src/lib.rs"
+
+[dependencies]
+aqua-messenger.workspace = true
+aqua-matrix-agent.workspace = true
+matrix-sdk.workspace = true
+matrix-sdk-base.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+clap.workspace = true
+tracing-subscriber.workspace = true

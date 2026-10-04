@@ -20,7 +20,6 @@
 mod bridge;
 mod edit;
 mod matrix;
-mod media;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -167,41 +166,49 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
-    let policy = aqua_system_bridge::attachments::AttachmentPolicy {
+    // The host profile: all six tools (the only profile with wait_for_reply),
+    // origin tags, the file allow-list of people and [[rooms]].
+    let mut profile = aqua_messenger::Profile::host();
+    profile.attachments = aqua_system_bridge::attachments::AttachmentPolicy {
         max_bytes: args.attachment_max_bytes,
         retention_days: args.attachment_retention_days,
     };
-    let inbox_policy = aqua_system_bridge::inbox::InboxPolicy {
+    profile = profile.with_inbox(aqua_messenger::inbox::InboxPolicy {
         max_entries: usize::try_from(args.inbox_max_entries).unwrap_or(usize::MAX),
         max_age: (args.inbox_max_age_hours > 0)
             .then(|| std::time::Duration::from_secs(args.inbox_max_age_hours.saturating_mul(3600))),
         hard_cap: args.inbox_hard_cap,
         accept_media: args.inbound_media == InboundMedia::Fetch,
         track_processed: args.inbox_track_processed,
-    };
-    let shared = Arc::new(bridge::Shared::new(&state, cmd_tx, policy, inbox_policy));
+    });
+    let inbox_policy = profile.inbox;
+    let allow = aqua_messenger::allowlist::AllowList::new(state.join("allowlist.toml"));
+    let shared = Arc::new(aqua_messenger::Engine::new(
+        profile,
+        &state,
+        allow,
+        bridge::QueueTransport::new(cmd_tx),
+    ));
     tracing::info!(
         max_entries = inbox_policy.max_entries,
         max_age_hours = args.inbox_max_age_hours,
         hard_cap = inbox_policy.hard_cap,
         accept_media = inbox_policy.accept_media,
         track_processed = inbox_policy.track_processed,
-        held = shared.inbox.lock().unwrap().len(),
+        held = shared.inbox_len(),
         "inbox policy in force"
     );
-    let pruned = shared
-        .attachments
-        .prune(policy.retention_days, std::time::SystemTime::now());
+    let pruned = shared.prune_attachments();
     if pruned > 0 {
         tracing::info!(pruned, "removed fetched attachments past retention");
     }
 
-    let listener = bridge::bind_socket(&sock)?;
+    let listener = aqua_messenger::server::bind_socket(&sock)?;
     tracing::info!(sock = %sock.display(), state = %state.display(), matrix = %args.matrix_url, "aqua-system-bridged starting");
-    let server = tokio::spawn(bridge::serve(listener, shared.clone()));
+    let server = tokio::spawn(aqua_messenger::server::serve(listener, shared.clone()));
     let sweeper = inbox_policy
         .max_age
-        .map(|_| tokio::spawn(bridge::retention_loop(shared.clone())));
+        .map(|_| tokio::spawn(aqua_messenger::engine::retention_loop(shared.clone())));
 
     let shutdown = Arc::new(Notify::new());
     spawn_shutdown_listener(shutdown.clone());
