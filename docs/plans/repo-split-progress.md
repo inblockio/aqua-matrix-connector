@@ -1,7 +1,7 @@
 # Repo-Split Execution — PROGRESS LEDGER (self-handover)
 
-> **Purpose:** durable state for the autonomous execution of `repo-split-execution-handover.md`.
-> If context was compacted: RE-READ this file + `repo-split-execution-handover.md`, run
+> **Purpose:** durable state for the autonomous execution of [`repo-split-execution-handover.md` (archived)](https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md).
+> If context was compacted: RE-READ this file + [`repo-split-execution-handover.md` (archived)](https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md), run
 > `git -C ~/aqua-matrix-agent log --oneline -15` and `git status`, then resume at the first
 > unchecked phase below. Each phase is committed ONLY on a green gate (cargo build + cargo test).
 
