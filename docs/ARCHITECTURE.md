@@ -80,7 +80,7 @@ These three crates, plus the agent content (`types/*.json`, `instances/*.toml.ex
 
 ## Repo boundary
 
-The two halves now live in **two repos** with a **strictly one-way dependency rule**, so the connector substrate can evolve independently of any agent that rides on it. This is the invariant the whole split exists to create; see [`docs/plans/repo-split-execution-handover.md`](plans/repo-split-execution-handover.md) (§1 locked decisions, §4 target architecture) for the full rationale.
+The two halves now live in **two repos** with a **strictly one-way dependency rule**, so the connector substrate can evolve independently of any agent that rides on it. This is the invariant the whole split exists to create; see [`repo-split-execution-handover.md` (archived)](https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md) (§1 locked decisions, §4 target architecture) for the full rationale.
 
 - **Connector half (this repo, `aqua-matrix-agent`):** `aqua-matrix-agent`, `aqua-matrix-relay`, `aqua-matrix-ask-mcp`, `aqua-matrix-orchestrator`, `aqua-matrix-gating`. A reusable "run any agent over Matrix + Podman" substrate.
 - **Agents half (sibling repo, `../aqua-agents`):** `aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`. The concrete backends + the capability schema + the agent content. Its `[workspace.dependencies]` pull the connector crates in by path (`../aqua-matrix-agent/crates/...`), the same cross-repo path-dep pattern `siwx-oidc-auth` uses.

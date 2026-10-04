@@ -3,7 +3,7 @@
 # check-dep-direction.sh — connector/agents dependency-direction guard.
 #
 # Enforces the one invariant the repo split exists to create
-# (see docs/plans/repo-split-execution-handover.md §1, §4):
+# (see https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md §1, §4):
 #
 #     one-way only:  aqua-agents -> connector,  NEVER the reverse.
 #
@@ -72,7 +72,7 @@ echo
 if [[ "${violations}" -ne 0 ]]; then
   echo "FAIL: ${violations} connector crate(s) violate the one-way dependency rule."
   echo "      Connector crates must never name aqua-matrix-{template,heartbeat,claude-p}."
-  echo "      See docs/plans/repo-split-execution-handover.md §1, §4."
+  echo "      See https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md §1, §4."
   exit 1
 fi
 
