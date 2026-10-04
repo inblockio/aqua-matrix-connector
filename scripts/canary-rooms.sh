@@ -36,7 +36,8 @@
 #   --binding FILE       the rooms block (default <config dir>/canaryrooms-rooms-binding.json)
 #   --only "STEPS"       run only these steps, space separated, in this fixed order:
 #                        k dm burst header noreply ignored boundinvite redteam persona needstim
-#                        security dmheader follow digest pause log logs. The preflight always runs.
+#                        security dmheader toroom follow digest pause log logs. The preflight
+#                        always runs.
 #   --invite-policy P    owner_only (default) or legacy: what the canary's LIVE config sets
 #                        (`invite_policy`, absent = legacy); a mismatch ends the run. It flips the
 #                        `ignored` invite checks: owner_only = R17 (every non-owner invite declined,
@@ -67,8 +68,8 @@
 #
 # Not checkable here (see ~/.aqua-matrix-test/canaryrooms-NOTES.md): AC5 (Marina's full extra refs;
 # the canary carries one, host.extra_refs, checked by podman inspect), AC6 (Aqua System is not
-# in the test room), AC8 (build and fleet gates), the R8 daily limit at 48, R11 media, R15c
-# to-room drafts (T3b, after T8).
+# in the test room), AC8 (build and fleet gates), the R8 daily limit at 48, R11 media. R15c
+# (to-room drafts) is the `toroom` step; its once-only note to the next room batch is unit-tested.
 set -uo pipefail
 
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -76,7 +77,7 @@ REPO=$(cd "$SELF_DIR/.." && pwd)
 TEST_DIR=${CONSULTANT_TEST_DIR:-$HOME/.aqua-matrix-test}
 MARINA_CONTAINER='aqua-agent-aqua-consultant-1'
 KICKOFF_TEXT='Open the conversation with the collaborator: introduce yourself in two sentences and ask what they want to tackle first.'
-STEPS_ALL="k dm burst header noreply ignored boundinvite redteam persona needstim security dmheader follow digest pause log logs"
+STEPS_ALL="k dm burst header noreply ignored boundinvite redteam persona needstim security dmheader toroom follow digest pause log logs"
 LIVE_FOLLOW_ROOT=$HOME/.local/share/consultant-refs-follow
 
 usage() { sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
@@ -306,6 +307,11 @@ dm_from_canary() {  # canary DM messages (incl. streamed edits) since <ms>, hell
     | jq -c --arg c "$(lc "$CANARY")" --arg h "$HELLO" 'select((.sender|ascii_downcase)==$c and (.content.body // "") != $h)' || true
 }
 private_dm() { dm_from_canary "$1" | jq -c --arg p "Private from the $RNAME room" 'select((.content.body // "")|startswith($p))'; }
+dm_offer() {  # dm_offer <ms> <marker>: the R15c draft offer DM carrying <marker>
+  dm_from_canary "$1" | jq -c --arg p "Draft for the \`$RNAME\` room:" --arg m "$2" \
+    'select(((.content.body // "")|startswith($p)) and ((.content.body // "")|contains($m)))'
+}
+dm_confirm() { dm_from_canary "$1" | jq -c --arg p "Posted in the \`$RNAME\` room." 'select((.content.body // "") == $p)'; }
 texts() { jq -r '.content["m.new_content"].body // .content.body // ""'; }
 brief() { jq -r '"\(.event_id) at \(.ts/1000|floor|todate) mentions=\(.content["m.mentions"].user_ids // []|join(",")) body=\((.content.body // "")|gsub("\n";" ")|.[0:160])"'; }
 event_ts() { room_since "$2" | jq -r --arg e "$1" 'select(.event_id==$e) | .ts' | head -1; }
@@ -914,6 +920,43 @@ if want dmheader; then
     n=$(canary_posts "$RUN_START" | texts | grep -cF "$SECRET" || true)
     check "$(verdict "$([ "$n" = 0 ] && echo 1)")" AC7.room-clean "the DM code word never appeared in the room" "hits=$n"
   fi
+fi
+
+# ------------------------------------------------------------------ toroom: R15c / AC9
+if want toroom; then
+  step toroom "R15c/AC9: a DM draft reaches the room only after post; any other DM discards it"
+  TR1=$(mark TOROOM)
+  t=$(nowms)
+  probe owner dm "$CANARY" "Test of the back-room post. Write a draft for the $RNAME room whose whole text is exactly: $TR1 . Put it in the to-room block for the $RNAME room, and in your reply to me say only: draft ready." >/dev/null
+  offer=$(wait_lines $(( TURN + 90 )) 1 dm_offer "$t" "$TR1" | head -1)
+  check "$(verdict "$([ -n "$offer" ] && echo 1)")" R15c.offer "the canary DMs the draft for confirmation" "$(printf '%s\n' "$offer" | brief)"
+  sleep 30  # the DM path streams: let the final edit land
+  leak=$(dm_from_canary "$t" | texts | grep -ciF '[[to-room' || true)
+  check "$(verdict "$([ "${leak:-0}" = 0 ] && echo 1)")" R15c.no-marker-in-dm "no DM message or streamed edit shows a to-room marker" "hits=${leak:-0}"
+  n=$(canary_matching "$t" "$TR1" | count)
+  check "$(verdict "$([ "$n" = 0 ] && echo 1)")" R15c.not-before-post "nothing is posted in the room before post" "hits=$n"
+  t2=$(nowms)
+  probe owner dm "$CANARY" "post" >/dev/null
+  p=$(wait_lines 120 1 canary_matching "$t2" "$TR1" | head -1)
+  check "$(verdict "$([ -n "$p" ] && echo 1)")" R15c.posted "post puts the draft into the room" "$(printf '%s\n' "$p" | brief)"
+  c=$(wait_lines 60 1 dm_confirm "$t2" | head -1)
+  check "$(verdict "$([ -n "$c" ] && echo 1)")" R15c.confirmed "the canary confirms the post in the DM" "$(printf '%s\n' "$c" | brief)"
+  logged=$(cexec cat "/agent/room-state/$RNAME/log.md" 2>/dev/null | grep -F "posted from the back-room on Tim's instruction" | count)
+  check "$(verdict "$([ "${logged:-0}" -ge 1 ] && echo 1)")" R15c.logged "the room log records the back-room post" "entries=${logged:-0}"
+  # Discard path: a second draft, then a DM that is not post.
+  TR2=$(mark TOROOM)
+  t3=$(nowms)
+  probe owner dm "$CANARY" "Another test: a draft for the $RNAME room whose whole text is exactly: $TR2 . Put it in the to-room block, and say only: draft ready." >/dev/null
+  offer2=$(wait_lines $(( TURN + 90 )) 1 dm_offer "$t3" "$TR2" | head -1)
+  sleep 30
+  probe owner dm "$CANARY" "Thanks, never mind that one. Reply with just: ok." >/dev/null
+  sleep 120
+  n2=$(canary_matching "$t3" "$TR2" | count)
+  check "$(verdict "$([ -n "$offer2" ] && [ "$n2" = 0 ] && echo 1)")" R15c.discarded "a DM other than post discards the draft (nothing posted)" "offer=$([ -n "$offer2" ] && echo yes || echo no) hits=$n2"
+  probe owner dm "$CANARY" "post" >/dev/null
+  sleep 90
+  n3=$(canary_matching "$t3" "$TR2" | count)
+  check "$(verdict "$([ "$n3" = 0 ] && echo 1)")" R15c.no-stale-post "a later post does not revive a discarded draft" "hits=$n3"
 fi
 
 # ------------------------------------------------------------------ follow: H5 / H7
