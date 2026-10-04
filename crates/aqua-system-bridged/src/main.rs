@@ -89,6 +89,12 @@ struct Args {
     /// records nothing and downloads nothing.
     #[arg(long, env = "AQUA_SYSTEM_BRIDGE_INBOUND_MEDIA", value_enum, default_value_t = InboundMedia::Fetch)]
     inbound_media: InboundMedia,
+    /// Inbox: sessions mark messages processed (with a note) once handled,
+    /// and a read without `since` returns every message not yet processed
+    /// (default: off, a read returns unread messages and nothing is ever
+    /// marked processed).
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_INBOX_TRACK_PROCESSED")]
+    inbox_track_processed: bool,
     /// Print the identity (DID, and MXID once logged in) and exit.
     #[arg(long)]
     print_identity: bool,
@@ -171,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
             .then(|| std::time::Duration::from_secs(args.inbox_max_age_hours.saturating_mul(3600))),
         hard_cap: args.inbox_hard_cap,
         accept_media: args.inbound_media == InboundMedia::Fetch,
+        track_processed: args.inbox_track_processed,
     };
     let shared = Arc::new(bridge::Shared::new(&state, cmd_tx, policy, inbox_policy));
     tracing::info!(
@@ -178,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         max_age_hours = args.inbox_max_age_hours,
         hard_cap = inbox_policy.hard_cap,
         accept_media = inbox_policy.accept_media,
+        track_processed = inbox_policy.track_processed,
         held = shared.inbox.lock().unwrap().len(),
         "inbox policy in force"
     );

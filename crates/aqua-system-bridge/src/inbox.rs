@@ -26,6 +26,19 @@
 //! bound does not restart numbering at 1 and make a session's `after_seq`
 //! cursor miss new messages.
 //!
+//! Every entry has a handling [`State`], shared by all sessions on the host:
+//! `new` (no session was shown it yet) -> `seen` (returned by a read) ->
+//! `processed` (a session acted on it, or decided nothing needs doing, and
+//! said so with a note). The state and its marks (who, which session, when)
+//! are recorded state, kept on every instance. What an instance DOES with it
+//! is policy: only with `track_processed` can entries be marked processed,
+//! and only then does "open" (what a read without `since` returns) widen
+//! from `new` to `new` + `seen`, so a message one session only looked at stays
+//! open until some session handled it. Without it an instance behaves as
+//! before the states (open = unread). On disk the `read` flag keeps mirroring
+//! "not new", so a bridge binary from before the states still sees handled
+//! messages as read after a rollback.
+//!
 //! Dedupe is by Matrix `event_id`, never by timestamp: the host clock on this
 //! WSL box skews against the homeserver, so no host-clock watermark is used for
 //! dedupe or delivery (memory `wsl-clock-skew-watermark-gotcha`). Timestamps
@@ -56,6 +69,10 @@ pub struct InboxPolicy {
     pub hard_cap: bool,
     /// `false`: media messages are refused at ingest and purged on load.
     pub accept_media: bool,
+    /// Sessions mark entries `processed` (with a note) once handled, and the
+    /// open view is `new` + `seen`. `false`: `mark_processed` is refused and
+    /// the open view is `new` only (the behaviour from before the states).
+    pub track_processed: bool,
 }
 
 impl Default for InboxPolicy {
@@ -65,7 +82,33 @@ impl Default for InboxPolicy {
             max_age: None,
             hard_cap: false,
             accept_media: true,
+            track_processed: false,
         }
+    }
+}
+
+impl InboxPolicy {
+    /// The states still to be handled on this instance: what a read without
+    /// `since` returns.
+    pub fn open_states(&self) -> Vec<State> {
+        if self.track_processed {
+            vec![State::New, State::Seen]
+        } else {
+            vec![State::New]
+        }
+    }
+}
+
+/// [`Inbox::mark_processed`] on an instance without `track_processed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotTracked;
+
+impl std::fmt::Display for NotTracked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this bridge does not track processed messages \
+             (operator setting AQUA_SYSTEM_BRIDGE_INBOX_TRACK_PROCESSED is off)",
+        )
     }
 }
 
@@ -73,8 +116,75 @@ impl Default for InboxPolicy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pruned {
     pub removed: usize,
-    /// Of `removed`, how many had never been read.
+    /// Of `removed`, how many had never been shown to a session (`new`).
     pub unread: usize,
+}
+
+/// Where an inbox entry stands in its handling (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum State {
+    /// No session has been shown it yet.
+    New,
+    /// Returned to a session by a read, not yet handled.
+    Seen,
+    /// A session acted on it (or decided nothing needs doing). Final.
+    Processed,
+}
+
+impl State {
+    pub const ALL: [State; 3] = [State::New, State::Seen, State::Processed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::New => "new",
+            State::Seen => "seen",
+            State::Processed => "processed",
+        }
+    }
+}
+
+/// Who moved an entry into a state, when, and (for `processed`) why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Mark {
+    /// Origin label of the session (cwd basename and host, or a caller label).
+    pub by: String,
+    /// The Claude Code session id, when the session's MCP server knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Host clock, milliseconds since the epoch.
+    pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The session acting on the inbox (a read that marks entries seen, or a
+/// `mark_processed`). Labels are stored as given; the daemon sanitizes them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Actor {
+    pub by: String,
+    pub session: Option<String>,
+}
+
+impl Actor {
+    fn mark(&self, at_ms: u64, note: Option<String>) -> Mark {
+        Mark {
+            by: self.by.clone(),
+            session: self.session.clone(),
+            at_ms,
+            note,
+        }
+    }
+}
+
+/// Result of [`Inbox::mark_processed`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Processed {
+    /// Seqs moved to `processed` by this call.
+    pub marked: Vec<u64>,
+    /// Seqs that were already processed, with the earlier (kept) mark.
+    pub already: Vec<(u64, Mark)>,
+    /// Requested seqs not (or no longer) in the inbox.
+    pub missing: Vec<u64>,
 }
 
 /// Milliseconds since the epoch on the host clock.
@@ -118,8 +228,15 @@ pub struct InboxEntry {
     /// holds the file's decryption key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaRef>,
+    /// `state() != New`, kept on disk for binaries that predate the states.
     #[serde(default)]
     pub read: bool,
+    /// The first session shown this entry. `None` with `read` set: read
+    /// before the states existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<Mark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processed: Option<Mark>,
 }
 
 /// Where an attachment's bytes live, as recorded from the event at ingest
@@ -140,6 +257,16 @@ impl InboxEntry {
     /// True when the entry is an attachment `fetch_attachment` can download.
     pub fn has_attachment(&self) -> bool {
         crate::attachments::MEDIA_KINDS.contains(&self.kind.as_str())
+    }
+
+    pub fn state(&self) -> State {
+        if self.processed.is_some() {
+            State::Processed
+        } else if self.read || self.seen.is_some() {
+            State::Seen
+        } else {
+            State::New
+        }
     }
 
     /// A copy safe to hand to a session process: the media reference keeps
@@ -181,7 +308,8 @@ pub struct Query {
     pub room_id: Option<String>,
     pub since_seq: Option<u64>,
     pub since_ts_ms: Option<u64>,
-    pub unread_only: bool,
+    /// Only entries in one of these states; `None` = any state.
+    pub states: Option<Vec<State>>,
     pub limit: Option<usize>,
 }
 
@@ -272,8 +400,22 @@ impl Inbox {
         self.entries.is_empty()
     }
 
+    /// Entries no session has been shown yet (`new`).
     pub fn unread_count(&self) -> usize {
-        self.entries.iter().filter(|e| !e.read).count()
+        self.count(State::New)
+    }
+
+    pub fn count(&self, state: State) -> usize {
+        self.entries.iter().filter(|e| e.state() == state).count()
+    }
+
+    /// Entries still to be handled under this instance's policy.
+    pub fn open_count(&self) -> usize {
+        let open = self.policy.open_states();
+        self.entries
+            .iter()
+            .filter(|e| open.contains(&e.state()))
+            .count()
     }
 
     /// Add a message unless its event id was already ingested, it is media on
@@ -307,6 +449,8 @@ impl Inbox {
             filename: new.filename,
             media: new.media,
             read: false,
+            seen: None,
+            processed: None,
         });
         // With a hard cap the entry just added can itself be the oldest.
         let pruned = self.prune_at(now_ms);
@@ -342,7 +486,9 @@ impl Inbox {
 
     /// Remove media entries (if refused), entries past the age bound and, if
     /// still over the cap, the oldest entries by server timestamp (ties: lowest
-    /// seq): read ones only, or any with a hard cap. In memory only; the
+    /// seq): without a hard cap only entries a session was shown, processed
+    /// ones before seen (still open) ones; with a hard cap any, by age alone
+    /// (so a re-offered evicted event is evicted again). In memory only; the
     /// caller persists.
     fn prune_at(&mut self, now_ms: u64) -> Pruned {
         let before = self.entries.len();
@@ -353,14 +499,15 @@ impl Inbox {
             .retain(|e| (accept_media || !is_media_kind(&e.kind)) && e.ts_ms >= cutoff);
         let excess = self.entries.len().saturating_sub(self.policy.max_entries);
         if excess > 0 {
-            let mut order: Vec<(u64, u64)> = self
+            let hard = self.policy.hard_cap;
+            let mut order: Vec<(bool, u64, u64)> = self
                 .entries
                 .iter()
-                .filter(|e| self.policy.hard_cap || e.read)
-                .map(|e| (e.ts_ms, e.seq))
+                .filter(|e| hard || e.state() != State::New)
+                .map(|e| (!hard && e.state() == State::Seen, e.ts_ms, e.seq))
                 .collect();
             order.sort_unstable();
-            let drop: HashSet<u64> = order.iter().take(excess).map(|&(_, seq)| seq).collect();
+            let drop: HashSet<u64> = order.iter().take(excess).map(|&(_, _, seq)| seq).collect();
             self.entries.retain(|e| !drop.contains(&e.seq));
         }
         if self.policy.max_age.is_some() {
@@ -385,7 +532,7 @@ impl Inbox {
             .filter(|e| q.room_id.as_ref().is_none_or(|r| &e.room_id == r))
             .filter(|e| q.since_seq.is_none_or(|s| e.seq > s))
             .filter(|e| q.since_ts_ms.is_none_or(|t| e.ts_ms > t))
-            .filter(|e| !q.unread_only || !e.read)
+            .filter(|e| q.states.as_ref().is_none_or(|s| s.contains(&e.state())))
             .cloned()
             .collect();
         out.sort_by_key(|e| e.seq);
@@ -402,19 +549,60 @@ impl Inbox {
         self.entries.iter().find(|e| e.seq == seq)
     }
 
-    /// Mark the given seqs read. Persists if anything changed.
-    pub fn mark_read(&mut self, seqs: &[u64]) {
+    /// Move the given seqs from `new` to `seen`, recording `who` as the first
+    /// session shown them. Entries already seen or processed are left alone.
+    /// Persists if anything changed.
+    pub fn mark_seen(&mut self, seqs: &[u64], who: &Actor) {
         let set: HashSet<u64> = seqs.iter().copied().collect();
+        let now = now_ms();
         let mut changed = false;
         for e in self.entries.iter_mut() {
-            if set.contains(&e.seq) && !e.read {
+            if set.contains(&e.seq) && e.state() == State::New {
                 e.read = true;
+                e.seen = Some(who.mark(now, None));
                 changed = true;
             }
         }
         if changed {
             self.persist();
         }
+    }
+
+    /// Mark the given seqs `processed` by `who` with `note` (what was done, or
+    /// why nothing needs doing). Final: an entry already processed keeps its
+    /// first mark and is reported in `already`. Persists if anything changed.
+    /// Refused unless the policy tracks processing.
+    pub fn mark_processed(
+        &mut self,
+        seqs: &[u64],
+        who: &Actor,
+        note: &str,
+    ) -> Result<Processed, NotTracked> {
+        if !self.policy.track_processed {
+            return Err(NotTracked);
+        }
+        let now = now_ms();
+        let mut out = Processed::default();
+        let mut wanted: Vec<u64> = seqs.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        for seq in wanted {
+            let Some(e) = self.entries.iter_mut().find(|e| e.seq == seq) else {
+                out.missing.push(seq);
+                continue;
+            };
+            if let Some(m) = &e.processed {
+                out.already.push((seq, m.clone()));
+                continue;
+            }
+            e.read = true;
+            e.processed = Some(who.mark(now, Some(note.to_string())));
+            out.marked.push(seq);
+        }
+        if !out.marked.is_empty() {
+            self.persist();
+        }
+        Ok(out)
     }
 
     /// Atomic rewrite: temp file (mode 600) + rename. The seq high-water mark
@@ -549,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn query_filters_and_mark_read() {
+    fn query_filters_and_mark_seen() {
         let p = tmp_path("query");
         let mut ib = Inbox::load(p.clone());
         ib.ingest(msg("$1", "@t:x", 100));
@@ -557,12 +745,12 @@ mod tests {
         ib.ingest(msg("$3", "@T:x", 300));
         let q = Query {
             sender: Some("@t:x".into()),
-            unread_only: true,
+            states: Some(vec![State::New]),
             ..Default::default()
         };
         let got = ib.query(&q);
         assert_eq!(got.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 3]);
-        ib.mark_read(&[1]);
+        ib.mark_seen(&[1], &Actor::default());
         assert_eq!(ib.query(&q).len(), 1);
         assert_eq!(ib.unread_count(), 2);
         let since = Query {
@@ -672,7 +860,7 @@ mod tests {
         let (mut ib, _) = with(policy, "soft");
         ib.ingest_at(aged("$1", 3000), NOW);
         ib.ingest_at(aged("$2", 2000), NOW);
-        ib.mark_read(&[1]);
+        ib.mark_seen(&[1], &Actor::default());
         assert_eq!(ib.ingest_at(aged("$3", 1000), NOW), Some(3));
         // the read one went; both unread ones stay
         assert_eq!(
@@ -698,7 +886,7 @@ mod tests {
         for (i, id) in ["$1", "$2", "$3"].iter().enumerate() {
             ib.ingest_at(aged(id, (10 - i as u64) * 1000), NOW);
         }
-        ib.mark_read(&[1]);
+        ib.mark_seen(&[1], &Actor::default());
         assert_eq!(ib.ingest_at(aged("$4", 500), NOW), Some(4));
         assert_eq!(ib.len(), 3);
         let held = |ib: &Inbox| {
@@ -736,7 +924,7 @@ mod tests {
         ib.ingest_at(aged("$old-read", 23 * HOUR), NOW);
         ib.ingest_at(aged("$old-unread", 23 * HOUR + 1000), NOW);
         ib.ingest_at(aged("$fresh", HOUR), NOW);
-        ib.mark_read(&[1]);
+        ib.mark_seen(&[1], &Actor::default());
         // an event already past the bound is never ingested (backfill after a restart)
         assert_eq!(ib.ingest_at(aged("$ancient", 25 * HOUR), NOW), None);
         assert!(!ib.contains("$ancient"));
@@ -813,5 +1001,154 @@ mod tests {
         assert!(!std::fs::read_to_string(&p2).unwrap().contains("SECRETKEY"));
         assert_eq!(strict.high_water(), 2);
         let _ = p;
+    }
+
+    // ---- handling states ----
+
+    fn tracking() -> InboxPolicy {
+        InboxPolicy {
+            track_processed: true,
+            ..InboxPolicy::default()
+        }
+    }
+
+    fn actor(by: &str) -> Actor {
+        Actor {
+            by: by.into(),
+            session: Some(format!("sess-{by}")),
+        }
+    }
+
+    fn seqs_in(ib: &Inbox, states: &[State]) -> Vec<u64> {
+        ib.query(&Query {
+            states: Some(states.to_vec()),
+            ..Default::default()
+        })
+        .iter()
+        .map(|e| e.seq)
+        .collect()
+    }
+
+    #[test]
+    fn states_go_new_seen_processed_and_processed_is_final() {
+        let p = tmp_path("states");
+        let mut ib = Inbox::load_with(p.clone(), tracking(), now_ms());
+        for (i, id) in ["$1", "$2", "$3"].iter().enumerate() {
+            ib.ingest(msg(id, "@t:x", 10 + i as u64));
+        }
+        let open = [State::New, State::Seen];
+        assert_eq!(seqs_in(&ib, &open), vec![1, 2, 3]);
+
+        ib.mark_seen(&[1], &actor("a"));
+        let e1 = ib.get(1).unwrap();
+        assert_eq!(e1.state(), State::Seen);
+        assert_eq!(e1.seen.as_ref().unwrap().by, "a");
+        assert_eq!(e1.seen.as_ref().unwrap().session.as_deref(), Some("sess-a"));
+
+        // processed straight from new works too; unknown seqs are reported
+        let r = ib
+            .mark_processed(&[2, 1, 99, 1], &actor("b"), "replied in DM")
+            .unwrap();
+        assert_eq!(r.marked, vec![1, 2]);
+        assert_eq!(r.missing, vec![99]);
+        assert!(r.already.is_empty());
+        assert_eq!(ib.get(2).unwrap().state(), State::Processed);
+        assert!(ib.get(2).unwrap().seen.is_none());
+
+        // a second session cannot overwrite the first disposition
+        let again = ib
+            .mark_processed(&[1], &actor("c"), "did it again")
+            .unwrap();
+        assert!(again.marked.is_empty());
+        assert_eq!(again.already.len(), 1);
+        let (seq, kept) = &again.already[0];
+        assert_eq!(*seq, 1);
+        assert_eq!(kept.by, "b");
+        assert_eq!(kept.note.as_deref(), Some("replied in DM"));
+
+        // seeing a processed entry does not demote it
+        ib.mark_seen(&[1, 2], &actor("d"));
+        assert_eq!(ib.get(2).unwrap().state(), State::Processed);
+        assert_eq!(ib.get(1).unwrap().seen.as_ref().unwrap().by, "a");
+
+        assert_eq!(seqs_in(&ib, &open), vec![3]);
+        assert_eq!(seqs_in(&ib, &[State::Processed]), vec![1, 2]);
+        assert_eq!(
+            (
+                ib.count(State::New),
+                ib.count(State::Seen),
+                ib.count(State::Processed)
+            ),
+            (1, 0, 2)
+        );
+
+        // all of it survives a reload, also by an instance that does not track
+        let re = Inbox::load(p);
+        assert_eq!(seqs_in(&re, &[State::Processed]), vec![1, 2]);
+        let m = re.get(1).unwrap().processed.clone().unwrap();
+        assert_eq!(
+            (m.by.as_str(), m.session.as_deref(), m.note.as_deref()),
+            ("b", Some("sess-b"), Some("replied in DM"))
+        );
+        assert_eq!(re.unread_count(), 1);
+    }
+
+    #[test]
+    fn legacy_read_flag_loads_as_seen_and_stays_readable_by_old_binaries() {
+        let p = tmp_path("legacy");
+        let line = |seq: u64, read: bool| {
+            format!(
+                r#"{{"seq":{seq},"event_id":"$e{seq}","room_id":"!r:x","sender":"@t:x","sender_name":"tim","ts_ms":{seq},"kind":"text","body":"b","read":{read}}}"#
+            )
+        };
+        std::fs::write(&p, format!("{}\n{}\n", line(1, true), line(2, false))).unwrap();
+        let mut ib = Inbox::load_with(p.clone(), tracking(), now_ms());
+        assert_eq!(ib.get(1).unwrap().state(), State::Seen);
+        assert!(ib.get(1).unwrap().seen.is_none());
+        assert_eq!(ib.get(2).unwrap().state(), State::New);
+
+        ib.mark_processed(&[2], &actor("a"), "done").unwrap();
+        // what a pre-states binary deserializes: `read` must be set for handled entries
+        let text = std::fs::read_to_string(&p).unwrap();
+        let l2 = text.lines().find(|l| l.contains("\"$e2\"")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(l2).unwrap();
+        assert_eq!(v["read"], true);
+        assert_eq!(v["processed"]["note"], "done");
+    }
+
+    #[test]
+    fn soft_cap_evicts_processed_before_still_open_entries() {
+        let policy = InboxPolicy {
+            max_entries: 2,
+            ..tracking()
+        };
+        let (mut ib, _) = with(policy, "soft-states");
+        ib.ingest_at(aged("$1", 3000), NOW);
+        ib.ingest_at(aged("$2", 2000), NOW);
+        ib.mark_seen(&[1], &actor("a"));
+        ib.mark_processed(&[2], &actor("a"), "done").unwrap();
+        // $1 is older, but only seen (open work); the processed $2 goes first
+        assert_eq!(ib.ingest_at(aged("$3", 1000), NOW), Some(3));
+        assert_eq!(seqs_in(&ib, &State::ALL), vec![1, 3]);
+    }
+
+    #[test]
+    fn without_tracking_open_means_unread_and_processing_is_refused() {
+        let d = InboxPolicy::default();
+        assert!(!d.track_processed);
+        assert_eq!(d.open_states(), vec![State::New]);
+        assert_eq!(tracking().open_states(), vec![State::New, State::Seen]);
+        let mut ib = Inbox::load(tmp_path("untracked"));
+        ib.ingest(msg("$1", "@t:x", 1));
+        ib.ingest(msg("$2", "@t:x", 2));
+        ib.mark_seen(&[1], &actor("a"));
+        assert_eq!(ib.open_count(), 1);
+        assert_eq!(
+            ib.mark_processed(&[2], &actor("a"), "done"),
+            Err(NotTracked)
+        );
+        assert_eq!(ib.get(2).unwrap().state(), State::New);
+        // the read is still recorded as state, with its provenance
+        assert_eq!(ib.get(1).unwrap().seen.as_ref().unwrap().by, "a");
     }
 }
