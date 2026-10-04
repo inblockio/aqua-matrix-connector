@@ -52,25 +52,57 @@ pub enum Request {
         /// Only entries whose server timestamp is `> since_ts_ms`.
         #[serde(default)]
         since_ts_ms: Option<u64>,
-        /// Only entries not yet marked read.
+        /// Only entries still open under the instance's inbox policy: `new`
+        /// ones, or `new` + `seen` on an instance that tracks processing.
         #[serde(default)]
         unread_only: bool,
-        /// Mark the returned entries read.
+        /// Mark the returned `new` entries read (state `seen`).
         #[serde(default)]
         mark_read: bool,
         #[serde(default)]
         limit: Option<usize>,
+        /// Origin label of the reading session, recorded on entries it marks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        /// Claude Code session id of the reading session, if known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
-    /// Block until an unread message from `from` arrives (or `timeout_s`
+    /// Block until a `new` message from `from` arrives (or `timeout_s`
     /// passes, capped at [`crate::MAX_WAIT_SECS`]). Returned entries are marked
-    /// read.
+    /// `seen`.
     WaitForReply {
         from: String,
         timeout_s: u64,
         /// Only count entries with `seq > after_seq` (e.g. the `inbox_seq`
-        /// returned by the send this is a reply to). `None` = any unread.
+        /// returned by the send this is a reply to). `None` = any new one.
         #[serde(default)]
         after_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+    /// Mark entries `processed`: a session acted on them, or decided nothing
+    /// needs doing. Final; an entry already processed keeps its first mark.
+    /// Refused unless the instance tracks processing.
+    MarkProcessed {
+        /// Explicit inbox seqs.
+        #[serde(default)]
+        seqs: Vec<u64>,
+        /// Also every open entry with `seq <= up_to_seq` (restricted to
+        /// `from`, if given).
+        #[serde(default)]
+        up_to_seq: Option<u64>,
+        /// Person (DMs only) or room, as for `read_inbox`; only with `up_to_seq`.
+        #[serde(default)]
+        from: Option<String>,
+        /// What was done, or why nothing needs doing.
+        note: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
     /// Download (on demand), decrypt and store the attachment of one inbox
     /// entry; a second call returns the cached file.
@@ -160,7 +192,51 @@ mod tests {
                 since_ts_ms: None,
                 unread_only: false,
                 mark_read: false,
-                limit: None
+                limit: None,
+                by: None,
+                session: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pre_states_clients_still_parse() {
+        // exactly what an MCP server from before the states sends
+        let old = r#"{"op":"read_inbox","from":null,"since_seq":null,"since_ts_ms":null,"unread_only":true,"mark_read":true,"limit":50}"#;
+        let Request::ReadInbox {
+            unread_only,
+            mark_read,
+            by,
+            ..
+        } = serde_json::from_str(old).unwrap()
+        else {
+            panic!("not a read_inbox")
+        };
+        assert!(unread_only && mark_read && by.is_none());
+        let wait = r#"{"op":"wait_for_reply","from":"tim","timeout_s":5,"after_seq":3}"#;
+        assert!(matches!(
+            serde_json::from_str(wait).unwrap(),
+            Request::WaitForReply {
+                after_seq: Some(3),
+                by: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_processed_wire() {
+        let wire = r#"{"op":"mark_processed","seqs":[3,4],"note":"answered","by":"repo@host"}"#;
+        let r: Request = serde_json::from_str(wire).unwrap();
+        assert_eq!(
+            r,
+            Request::MarkProcessed {
+                seqs: vec![3, 4],
+                up_to_seq: None,
+                from: None,
+                note: "answered".into(),
+                by: Some("repo@host".into()),
+                session: None,
             }
         );
     }

@@ -12,7 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aqua_system_bridge::allowlist::{is_valid_mxid, is_valid_room_id, AllowList, Target};
 use aqua_system_bridge::attachments::{AttachmentPolicy, AttachmentStore};
 use aqua_system_bridge::format;
-use aqua_system_bridge::inbox::{Inbox, InboxEntry, MediaRef, Query};
+use aqua_system_bridge::inbox::{
+    Actor, Inbox, InboxEntry, InboxPolicy, MediaRef, NotTracked, Query, State,
+};
 use aqua_system_bridge::proto::{self, Request, Response};
 use aqua_system_bridge::ratelimit::RateLimiter;
 use aqua_system_bridge::{
@@ -126,6 +128,7 @@ impl Shared {
         state_dir: &Path,
         cmd_tx: mpsc::Sender<SendCmd>,
         attach_policy: AttachmentPolicy,
+        inbox_policy: InboxPolicy,
     ) -> Self {
         Self {
             attach_policy,
@@ -133,7 +136,11 @@ impl Shared {
             fetch_lock: tokio::sync::Mutex::new(()),
             state_dir: state_dir.to_path_buf(),
             allow: Mutex::new(AllowList::new(state_dir.join("allowlist.toml"))),
-            inbox: Mutex::new(Inbox::load(state_dir.join("inbox.jsonl"))),
+            inbox: Mutex::new(Inbox::load_with(
+                state_dir.join("inbox.jsonl"),
+                inbox_policy,
+                aqua_system_bridge::inbox::now_ms(),
+            )),
             inbox_changed: Notify::new(),
             rate: Mutex::new(RateLimiter::new(
                 RATE_LIMIT_COUNT,
@@ -167,6 +174,23 @@ impl Shared {
         if let Err(e) = res {
             tracing::warn!("audit write failed: {e}");
         }
+    }
+}
+
+/// How often the inbox policy is enforced while no request or message
+/// triggers it (so an idle inbox still ages out).
+pub const RETENTION_SWEEP: Duration = Duration::from_secs(300);
+
+/// Enforce the inbox policy on a timer. Only worth running when an age bound is
+/// configured: everything else is already enforced on load, on every ingest and
+/// before every read.
+pub async fn retention_loop(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(RETENTION_SWEEP);
+    // After a Modern Standby the missed ticks collapse into one sweep.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        shared.inbox.lock().unwrap().enforce();
     }
 }
 
@@ -346,6 +370,15 @@ fn apply_from(q: &mut Query, f: Option<FromFilter>) {
     }
 }
 
+/// The session behind a read or `mark_processed`, with its labels sanitized
+/// (they are stored and shown to every later reader).
+fn actor(by: Option<String>, session: Option<String>) -> Actor {
+    Actor {
+        by: format::sanitize_origin(by.as_deref().unwrap_or("")),
+        session: format::sanitize_session(session.as_deref()),
+    }
+}
+
 async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
     match req {
         Request::SendMessage {
@@ -471,35 +504,121 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             unread_only,
             mark_read,
             limit,
+            by,
+            session,
         } => {
             let filter = match from.as_deref().map(|f| resolve_from(shared, f)).transpose() {
                 Ok(s) => s,
                 Err(e) => return Response::err(e),
             };
+            let mut inbox = shared.inbox.lock().unwrap();
+            // Never hand out what the inbox policy already dropped.
+            inbox.enforce();
+            let policy = inbox.policy();
             let mut q = Query {
                 since_seq,
                 since_ts_ms,
-                unread_only,
+                states: unread_only.then(|| policy.open_states()),
                 limit,
                 ..Default::default()
             };
             apply_from(&mut q, filter);
-            let mut inbox = shared.inbox.lock().unwrap();
+            // Shown with the state they had when read: a `new` entry tells
+            // this session that no other session has looked at it yet.
             let entries = inbox.query(&q);
             if mark_read {
                 let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
-                inbox.mark_read(&seqs);
+                inbox.mark_seen(&seqs, &actor(by, session));
             }
             let entries: Vec<_> = entries.iter().map(|e| e.public()).collect();
-            Response::ok(
-                json!({"entries": entries, "high_water": inbox.high_water(), "unread_remaining": inbox.unread_count()}),
-            )
+            Response::ok(json!({
+                "entries": entries,
+                "high_water": inbox.high_water(),
+                "unread_remaining": inbox.unread_count(),
+                "open_remaining": inbox.open_count(),
+                "track_processed": policy.track_processed,
+            }))
+        }
+        Request::MarkProcessed {
+            seqs,
+            up_to_seq,
+            from,
+            note,
+            by,
+            session,
+        } => {
+            let Some(note) = format::sanitize_note(&note) else {
+                return Response::err(
+                    "mark_processed needs a non-empty note (what was done, or why nothing needs doing)",
+                );
+            };
+            if from.is_some() && up_to_seq.is_none() {
+                return Response::err(
+                    "`from` narrows `up_to_seq`; give up_to_seq as well, or list the seqs",
+                );
+            }
+            let filter = match from.as_deref().map(|f| resolve_from(shared, f)).transpose() {
+                Ok(s) => s,
+                Err(e) => return Response::err(e),
+            };
+            let who = actor(by, session);
+            let mut inbox = shared.inbox.lock().unwrap();
+            if !inbox.policy().track_processed {
+                return Response::err(NotTracked.to_string());
+            }
+            inbox.enforce();
+            let mut targets = seqs;
+            if let Some(up_to) = up_to_seq {
+                let mut q = Query {
+                    states: Some(inbox.policy().open_states()),
+                    ..Default::default()
+                };
+                apply_from(&mut q, filter);
+                targets.extend(
+                    inbox
+                        .query(&q)
+                        .iter()
+                        .map(|e| e.seq)
+                        .filter(|&s| s <= up_to),
+                );
+            }
+            if targets.is_empty() {
+                return Response::ok(json!({
+                    "marked": [], "already_processed": [], "missing": [],
+                    "open_remaining": inbox.open_count(),
+                    "note": "nothing open matched; nothing changed",
+                }));
+            }
+            let r = match inbox.mark_processed(&targets, &who, &note) {
+                Ok(r) => r,
+                Err(e) => return Response::err(e.to_string()),
+            };
+            let already: Vec<_> = r
+                .already
+                .iter()
+                .map(|(seq, m)| json!({"seq": seq, "processed": format::mark_json(m)}))
+                .collect();
+            shared.audit(json!({
+                "event": "inbox_processed",
+                "seqs": r.marked,
+                "by": who.by,
+                "session": who.session,
+            }));
+            Response::ok(json!({
+                "marked": r.marked,
+                "already_processed": already,
+                "missing": r.missing,
+                "open_remaining": inbox.open_count(),
+            }))
         }
         Request::WaitForReply {
             from,
             timeout_s,
             after_seq,
+            by,
+            session,
         } => {
+            let who = actor(by, session);
             let filter = match resolve_from(shared, &from) {
                 Ok(s) => s,
                 Err(e) => return Response::err(e),
@@ -508,7 +627,7 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
             let mut q = Query {
                 since_seq: after_seq,
-                unread_only: true,
+                states: Some(vec![State::New]),
                 ..Default::default()
             };
             apply_from(&mut q, Some(filter));
@@ -520,14 +639,18 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 notified.as_mut().enable();
                 {
                     let mut inbox = shared.inbox.lock().unwrap();
+                    inbox.enforce();
                     let entries = inbox.query(&q);
                     if !entries.is_empty() {
                         let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
-                        inbox.mark_read(&seqs);
+                        inbox.mark_seen(&seqs, &who);
                         let entries: Vec<_> = entries.iter().map(|e| e.public()).collect();
-                        return Response::ok(
-                            json!({"entries": entries, "waited_s": secs, "high_water": inbox.high_water()}),
-                        );
+                        return Response::ok(json!({
+                            "entries": entries,
+                            "waited_s": secs,
+                            "high_water": inbox.high_water(),
+                            "track_processed": inbox.policy().track_processed,
+                        }));
                     }
                 }
                 tokio::select! {
@@ -549,7 +672,15 @@ async fn handle(req: Request, shared: &Arc<Shared>) -> Response {
                 "device_id": st.device_id,
                 "last_error": st.last_error,
                 "inbox_entries": inbox.len(),
+                "inbox_max_entries": inbox.policy().max_entries,
+                "inbox_max_age_hours": inbox.policy().max_age.map(|a| a.as_secs() / 3600),
+                "inbox_hard_cap": inbox.policy().hard_cap,
+                "inbox_accept_media": inbox.policy().accept_media,
+                "inbox_track_processed": inbox.policy().track_processed,
                 "inbox_unread": inbox.unread_count(),
+                "inbox_new": inbox.count(State::New),
+                "inbox_seen": inbox.count(State::Seen),
+                "inbox_processed": inbox.count(State::Processed),
                 "inbox_high_water": inbox.high_water(),
             }))
         }
@@ -748,6 +879,12 @@ fn fetch_permitted(shared: &Shared, entry: &InboxEntry) -> Result<(), String> {
 /// `fetch_attachment`: serve the cached copy, or download + decrypt + verify
 /// on the live Client and store it (mode 600) under `<state>/attachments/`.
 async fn fetch_attachment(shared: &Arc<Shared>, inbox_seq: u64) -> Response {
+    if !shared.inbox.lock().unwrap().policy().accept_media {
+        return Response::err(
+            "REFUSED: this bridge is configured not to accept inbound media \
+             (AQUA_SYSTEM_BRIDGE_INBOUND_MEDIA=refuse); there is nothing to fetch",
+        );
+    }
     let _guard = shared.fetch_lock.lock().await;
     let entry = match shared.inbox.lock().unwrap().get(inbox_seq).cloned() {
         Some(e) => e,
@@ -864,6 +1001,7 @@ mod tests {
             &state_dir_with(allowlist, tag),
             tx,
             AttachmentPolicy::default(),
+            InboxPolicy::default(),
         )
     }
 
@@ -895,6 +1033,7 @@ mod tests {
             &state_dir_with(allowlist, tag),
             tx,
             AttachmentPolicy::default(),
+            InboxPolicy::default(),
         );
         (Arc::new(sh), seen)
     }
@@ -1087,6 +1226,8 @@ room_id = "!daily:x"
                 unread_only: false,
                 mark_read: false,
                 limit: None,
+                by: None,
+                session: None,
             },
             &sh,
         )
@@ -1102,6 +1243,8 @@ room_id = "!daily:x"
                 from: "daily-updates".into(),
                 timeout_s: 1,
                 after_seq: None,
+                by: None,
+                session: None,
             },
             &sh,
         )
@@ -1112,6 +1255,298 @@ room_id = "!daily:x"
             !out.contains("SECRETKEY") && !out.contains("secretmedia"),
             "{out}"
         );
+    }
+
+    fn shared_with_inbox_policy(policy: InboxPolicy, tag: &str) -> Arc<Shared> {
+        let (tx, _rx) = mpsc::channel(1);
+        Arc::new(Shared::new(
+            &state_dir_with(LIST, tag),
+            tx,
+            AttachmentPolicy::default(),
+            policy,
+        ))
+    }
+
+    fn read_all() -> Request {
+        Request::ReadInbox {
+            from: None,
+            since_seq: None,
+            since_ts_ms: None,
+            unread_only: false,
+            mark_read: false,
+            limit: None,
+            by: None,
+            session: None,
+        }
+    }
+
+    fn add_text(sh: &Shared, ev: &str, room_id: &str, sender: &str, room: Option<&str>) -> u64 {
+        let e = aqua_system_bridge::inbox::NewEntry {
+            event_id: ev.into(),
+            room_id: room_id.into(),
+            sender: sender.into(),
+            sender_name: None,
+            room: room.map(Into::into),
+            ts_ms: 1,
+            kind: "text".into(),
+            body: format!("body {ev}"),
+            filename: None,
+            media: None,
+        };
+        sh.inbox.lock().unwrap().ingest(e).unwrap()
+    }
+
+    /// A read as the MCP server sends it: `open` = no `since` (unread_only),
+    /// otherwise a history read of everything.
+    fn read(from: Option<&str>, open: bool, by: Option<&str>) -> Request {
+        Request::ReadInbox {
+            from: from.map(Into::into),
+            since_seq: None,
+            since_ts_ms: None,
+            unread_only: open,
+            mark_read: true,
+            limit: None,
+            by: by.map(Into::into),
+            session: by.map(|_| "ABC-123".into()),
+        }
+    }
+
+    fn processed(
+        seqs: &[u64],
+        up_to: Option<u64>,
+        from: Option<&str>,
+        note: &str,
+        by: &str,
+    ) -> Request {
+        Request::MarkProcessed {
+            seqs: seqs.to_vec(),
+            up_to_seq: up_to,
+            from: from.map(Into::into),
+            note: note.into(),
+            by: Some(by.into()),
+            session: None,
+        }
+    }
+
+    fn seqs_of(r: &Response) -> Vec<u64> {
+        assert!(r.ok, "{r:?}");
+        r.data["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_instance_keeps_unread_semantics_and_refuses_processing() {
+        let sh = Arc::new(shared_with(LIST, "untracked"));
+        let dm1 = add_text(&sh, "$d1", "!dm:x", "@tim:x", None);
+        let r = handle(read(None, true, Some("repo@host")), &sh).await;
+        assert_eq!(seqs_of(&r), vec![dm1]);
+        assert_eq!(r.data["track_processed"], false);
+        // read = gone from the open view, exactly as before the states
+        assert!(seqs_of(&handle(read(None, true, None), &sh).await).is_empty());
+        // ... but who read it is recorded state
+        let seen = sh.inbox.lock().unwrap().get(dm1).unwrap().seen.clone();
+        assert_eq!(seen.unwrap().by, "repo@host");
+        let e = handle(processed(&[dm1], None, None, "done", "repo@host"), &sh).await;
+        assert!(
+            e.error
+                .as_deref()
+                .unwrap()
+                .contains("does not track processed"),
+            "{e:?}"
+        );
+        let e = handle(processed(&[], Some(9), None, "done", "repo@host"), &sh).await;
+        assert!(!e.ok);
+        assert_eq!(sh.inbox.lock().unwrap().count(State::Processed), 0);
+        let st = handle(Request::Status, &sh).await.data;
+        assert_eq!(st["inbox_track_processed"], false);
+    }
+
+    #[tokio::test]
+    async fn handling_states_through_the_socket_ops() {
+        let tracking = InboxPolicy {
+            track_processed: true,
+            ..InboxPolicy::default()
+        };
+        let sh = shared_with_inbox_policy(tracking, "states");
+        let dm1 = add_text(&sh, "$d1", "!dm:x", "@tim:x", None);
+        let r1 = add_text(&sh, "$r1", "!daily:x", "@bob:x", Some("daily-updates"));
+        let r2 = add_text(&sh, "$r2", "!daily:x", "@bob:x", Some("daily-updates"));
+        let dm2 = add_text(&sh, "$d2", "!dm:x", "@tim:x", None);
+
+        // an MCP server from before the states (no by/session): its unread
+        // read gets the instance's open view, and seen messages stay open
+        let old = handle(read(Some("tim"), true, None), &sh).await;
+        assert_eq!(seqs_of(&old), vec![dm1, dm2]);
+        assert_eq!(
+            seqs_of(&handle(read(Some("tim"), true, None), &sh).await),
+            vec![dm1, dm2]
+        );
+
+        let r = handle(read(None, true, Some("repo@host")), &sh).await;
+        assert_eq!(seqs_of(&r), vec![dm1, r1, r2, dm2]);
+        assert_eq!(r.data["open_remaining"], 4);
+        assert_eq!(r.data["track_processed"], true);
+        {
+            let ib = sh.inbox.lock().unwrap();
+            assert_eq!(
+                ib.get(dm1).unwrap().seen.as_ref().unwrap().by,
+                "unknown session"
+            );
+            let m = ib.get(r1).unwrap().seen.clone().unwrap();
+            assert_eq!(
+                (m.by.as_str(), m.session.as_deref()),
+                ("repo@host", Some("abc-123"))
+            );
+        }
+
+        // settle the room backlog in one call, then one DM
+        let p = handle(
+            processed(
+                &[],
+                Some(r2),
+                Some("daily-updates"),
+                "room chatter, no action",
+                "repo@host",
+            ),
+            &sh,
+        )
+        .await;
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.data["marked"], json!([r1, r2]));
+        assert_eq!(p.data["open_remaining"], 2);
+        let p = handle(
+            processed(&[dm1], None, None, "answered in DM", "repo@host"),
+            &sh,
+        )
+        .await;
+        assert_eq!(p.data["marked"], json!([dm1]));
+
+        // a second session cannot redo or overwrite it
+        let p = handle(
+            processed(&[dm1, 99], None, None, "answered again", "other@host"),
+            &sh,
+        )
+        .await;
+        assert_eq!(p.data["marked"], json!([]));
+        assert_eq!(p.data["missing"], json!([99]));
+        assert_eq!(p.data["already_processed"][0]["seq"], dm1);
+        assert_eq!(
+            p.data["already_processed"][0]["processed"]["by"],
+            "repo@host"
+        );
+        assert_eq!(
+            p.data["already_processed"][0]["processed"]["note"],
+            "answered in DM"
+        );
+
+        // open reads no longer return processed messages; history still does
+        assert_eq!(
+            seqs_of(&handle(read(None, true, Some("x@h")), &sh).await),
+            vec![dm2]
+        );
+        let all = handle(read(None, false, Some("x@h")), &sh).await;
+        assert_eq!(seqs_of(&all), vec![dm1, r1, r2, dm2]);
+        assert_eq!(
+            all.data["entries"][0]["processed"]["note"],
+            "answered in DM"
+        );
+
+        // refusals
+        let e = handle(processed(&[dm2], None, None, " \n ", "repo@host"), &sh).await;
+        assert!(e.error.unwrap().contains("non-empty note"));
+        let e = handle(processed(&[dm2], None, Some("tim"), "x", "repo@host"), &sh).await;
+        assert!(e.error.unwrap().contains("up_to_seq"));
+        let e = handle(
+            processed(&[], Some(9), Some("nobody here"), "x", "repo@host"),
+            &sh,
+        )
+        .await;
+        assert!(!e.ok);
+
+        let st = handle(Request::Status, &sh).await.data;
+        assert_eq!(
+            (
+                st["inbox_new"].as_u64(),
+                st["inbox_seen"].as_u64(),
+                st["inbox_processed"].as_u64()
+            ),
+            (Some(0), Some(1), Some(3))
+        );
+        let audit = std::fs::read_to_string(sh.state_dir.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("\"inbox_processed\""), "{audit}");
+    }
+
+    #[tokio::test]
+    async fn media_refusing_instance_refuses_fetch_and_reports_it() {
+        let refuse = InboxPolicy {
+            accept_media: false,
+            ..InboxPolicy::default()
+        };
+        let sh = shared_with_inbox_policy(refuse, "nomedia");
+        let e = fetch_attachment(&sh, 1).await.error.unwrap();
+        assert!(
+            e.starts_with("REFUSED") && e.contains("not to accept inbound media"),
+            "{e}"
+        );
+        let data = handle(Request::Status, &sh).await.data;
+        assert_eq!(data["inbox_accept_media"], false);
+        // the default instance reports media accepted and keeps the fetch path
+        let open = Arc::new(shared_with(LIST, "media-default"));
+        assert_eq!(
+            handle(Request::Status, &open).await.data["inbox_accept_media"],
+            true
+        );
+        let e = fetch_attachment(&open, 1).await.error.unwrap();
+        assert!(e.contains("no inbox entry"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn read_inbox_never_returns_entries_past_the_age_bound() {
+        use aqua_system_bridge::inbox::{now_ms, NewEntry};
+        const H: u64 = 3_600_000;
+        let policy = InboxPolicy {
+            max_age: Some(Duration::from_secs(24 * 3600)),
+            ..InboxPolicy::default()
+        };
+        let sh = shared_with_inbox_policy(policy, "age");
+        let now = now_ms();
+        let entry = |id: &str, age_ms: u64| NewEntry {
+            event_id: id.into(),
+            room_id: "!dm:x".into(),
+            sender: "@tim:x".into(),
+            sender_name: Some("tim".into()),
+            room: None,
+            ts_ms: now - age_ms,
+            kind: "text".into(),
+            body: id.into(),
+            filename: None,
+            media: None,
+        };
+        {
+            let mut ib = sh.inbox.lock().unwrap();
+            // already past 24 h: refused outright
+            assert_eq!(ib.ingest(entry("$stale", 30 * H)), None);
+            assert!(ib.ingest(entry("$fresh", H)).is_some());
+            // 30 h old, but ingested "as of" 29 h ago, i.e. inside the bound
+            // then and aged out since (what happens between two sweeps)
+            assert!(ib
+                .ingest_at(entry("$aging", 30 * H), now - 29 * H)
+                .is_some());
+            assert_eq!(ib.len(), 2);
+        }
+        let out = serde_json::to_string(&handle(read_all(), &sh).await).unwrap();
+        assert!(out.contains("$fresh") && !out.contains("$aging"), "{out}");
+        assert_eq!(sh.inbox.lock().unwrap().len(), 1);
+        let data = handle(Request::Status, &sh).await.data;
+        assert_eq!(data["inbox_max_age_hours"], 24);
+        assert_eq!(data["inbox_max_entries"], 5000);
+        // the default instance has no age bound
+        let open = Arc::new(shared_with(LIST, "age-default"));
+        assert!(handle(Request::Status, &open).await.data["inbox_max_age_hours"].is_null());
     }
 
     #[test]

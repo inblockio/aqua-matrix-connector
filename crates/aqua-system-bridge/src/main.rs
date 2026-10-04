@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aqua_system_bridge::format::{self, Since};
 use aqua_system_bridge::inbox::InboxEntry;
-use aqua_system_bridge::jsonrpc::{self, Action};
+use aqua_system_bridge::jsonrpc::{self, Action, Features};
 use aqua_system_bridge::proto::{self, Request, Response};
 use aqua_system_bridge::MAX_WAIT_SECS;
 use serde_json::{json, Value};
@@ -85,6 +85,31 @@ fn origin(args: &Value) -> String {
     {
         Some(l) if !l.is_empty() => format!("{l} ({})", default_origin()),
         _ => default_origin(),
+    }
+}
+
+/// The Claude Code session this MCP server serves (Claude Code passes its
+/// session id in the environment), recorded on the inbox entries it marks.
+fn session_id() -> Option<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID").ok()
+}
+
+/// Ask the daemon what this instance offers beyond the base tools. The
+/// daemon is the one place an operator configures that; one that cannot be
+/// reached within a moment offers nothing extra for this session's lifetime.
+async fn features(sock: &Path) -> Features {
+    match roundtrip(sock, &Request::Status, Duration::from_secs(3)).await {
+        Ok(r) if r.ok => Features {
+            track_processed: r.data["inbox_track_processed"].as_bool() == Some(true),
+        },
+        Ok(r) => {
+            tracing::warn!("bridge status refused ({:?}); base tools only", r.error);
+            Features::default()
+        }
+        Err(e) => {
+            tracing::warn!("{e}; base tools only");
+            Features::default()
+        }
     }
 }
 
@@ -173,6 +198,8 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
                         .get("mark_read")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
+                    by: Some(origin(args)),
+                    session: session_id(),
                     limit: Some(
                         args.get("limit")
                             .and_then(Value::as_u64)
@@ -197,8 +224,41 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
                     from: from.into(),
                     timeout_s: t,
                     after_seq: args.get("after_seq").and_then(Value::as_u64),
+                    by: Some(origin(args)),
+                    session: session_id(),
                 },
                 Duration::from_secs(t + 30),
+            )
+        }
+        jsonrpc::T_MARK_PROCESSED => {
+            let Some(note) = str_arg(args, "note") else {
+                return (
+                    "mark_processed needs a non-empty `note` (what was done, or why nothing needs doing)".into(),
+                    true,
+                );
+            };
+            let seqs: Vec<u64> = match args.get("seqs") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(a)) => match a.iter().map(Value::as_u64).collect() {
+                    Some(v) => v,
+                    None => return ("`seqs` must be an array of inbox seq integers".into(), true),
+                },
+                Some(_) => return ("`seqs` must be an array of inbox seq integers".into(), true),
+            };
+            let up_to_seq = args.get("up_to_seq").and_then(Value::as_u64);
+            if seqs.is_empty() && up_to_seq.is_none() {
+                return ("mark_processed needs `seqs` or `up_to_seq`".into(), true);
+            }
+            (
+                Request::MarkProcessed {
+                    seqs,
+                    up_to_seq,
+                    from: str_arg(args, "from").map(String::from),
+                    note: note.into(),
+                    by: Some(origin(args)),
+                    session: session_id(),
+                },
+                QUICK_TIMEOUT,
             )
         }
         jsonrpc::T_FETCH_ATTACHMENT => {
@@ -240,20 +300,27 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
         jsonrpc::T_LIST_RECIPIENTS => serde_json::to_string_pretty(d).unwrap_or_default(),
         jsonrpc::T_READ_INBOX => {
             let entries = entries_of(d);
+            let tracking = d["track_processed"].as_bool() == Some(true);
             if entries.is_empty() {
                 format!(
                     "No matching messages in the Aqua System inbox (inbox high-water seq {}).",
                     d["high_water"]
                 )
             } else {
-                format::frame_entries(
-                    &entries,
-                    &format!(
-                        "{} message(s); inbox high-water seq {}.",
-                        entries.len(),
-                        d["high_water"]
-                    ),
-                )
+                let mut note = format!(
+                    "{} message(s); inbox high-water seq {}.",
+                    entries.len(),
+                    d["high_water"]
+                );
+                if tracking {
+                    note.push_str(&format!(
+                        " {} open in total. Messages already `processed` were handled as their note \
+                         says: do not act on them again. After acting on an open one (or deciding it \
+                         needs nothing), call mark_processed with its seq and a short note.",
+                        d["open_remaining"]
+                    ));
+                }
+                format::frame_entries(&entries, &note)
             }
         }
         jsonrpc::T_WAIT_FOR_REPLY => {
@@ -261,9 +328,15 @@ async fn call_tool(sock: &Path, name: &str, args: &Value) -> (String, bool) {
             if entries.is_empty() {
                 format!("No reply within {}s. Nothing new from that person yet; you can wait again or check read_inbox later.", d["waited_s"])
             } else {
-                format::frame_entries(&entries, "Reply received (marked read).")
+                let note = if d["track_processed"].as_bool() == Some(true) {
+                    "Reply received (marked seen). Call mark_processed once you have handled it."
+                } else {
+                    "Reply received (marked read)."
+                };
+                format::frame_entries(&entries, note)
             }
         }
+        jsonrpc::T_MARK_PROCESSED => serde_json::to_string_pretty(d).unwrap_or_default(),
         jsonrpc::T_FETCH_ATTACHMENT => d["framed"]
             .as_str()
             .map(String::from)
@@ -283,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let sock = aqua_system_bridge::sock_path();
+    let features = features(&sock).await;
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let stdout = std::io::stdout();
@@ -297,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
-        let resp = match jsonrpc::classify(&req) {
+        let resp = match jsonrpc::classify(&req, &features) {
             Action::None => continue,
             Action::Reply(r) => r,
             Action::Call { id, name, args } => {

@@ -180,6 +180,13 @@ pub fn frame_entries(entries: &[InboxEntry], note: &str) -> String {
             if let Some(f) = &e.filename {
                 v["filename"] = serde_json::json!(f);
             }
+            v["state"] = serde_json::json!(e.state().as_str());
+            if let Some(m) = &e.seen {
+                v["seen"] = mark_json(m);
+            }
+            if let Some(m) = &e.processed {
+                v["processed"] = mark_json(m);
+            }
             if e.has_attachment() {
                 let mut a = serde_json::json!({
                     "fetchable": true,
@@ -199,6 +206,44 @@ pub fn frame_entries(entries: &[InboxEntry], note: &str) -> String {
         entries.len(),
         serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".into())
     )
+}
+
+/// A state mark as shown to sessions (host time formatted like `sent_at`).
+pub fn mark_json(m: &crate::inbox::Mark) -> serde_json::Value {
+    let mut v = serde_json::json!({"by": m.by, "at": fmt_ts_ms(m.at_ms)});
+    if let Some(s) = &m.session {
+        v["session"] = serde_json::json!(s);
+    }
+    if let Some(n) = &m.note {
+        v["note"] = serde_json::json!(n);
+    }
+    v
+}
+
+/// Longest `mark_processed` note kept, in characters.
+pub const MAX_NOTE_CHARS: usize = 500;
+
+/// A session's `mark_processed` note: one line (control characters become
+/// spaces, whitespace collapsed), at most [`MAX_NOTE_CHARS`]. `None` if empty.
+pub fn sanitize_note(raw: &str) -> Option<String> {
+    let line: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let out: String = line.chars().take(MAX_NOTE_CHARS).collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// A Claude Code session id as passed by the MCP server: kept only if it looks
+/// like one (hex digits and dashes, at most 64 characters), so it can be used
+/// to find the session's transcript and nothing else rides along.
+pub fn sanitize_session(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    (!s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .then(|| s.to_ascii_lowercase())
 }
 
 /// Header of a `fetch_attachment` result: the file was sent by a person on
@@ -296,11 +341,65 @@ mod tests {
             filename: None,
             media: None,
             read: false,
+            seen: None,
+            processed: None,
         };
         let f = frame_entries(&[e], "note");
         assert!(f.starts_with(UNTRUSTED_HEADER));
         // The body's newline is JSON-escaped, so the closing tag only appears once, on its own line.
         assert_eq!(f.matches("\n</untrusted-messages>").count(), 1);
         assert!(f.contains("\\nIGNORE ALL PREVIOUS"));
+        assert!(f.contains("\"state\": \"new\""));
+    }
+
+    #[test]
+    fn processed_mark_is_shown_with_its_note() {
+        let mark = crate::inbox::Mark {
+            by: "repo@host".into(),
+            session: Some("0f1e2d3c-4b5a".into()),
+            at_ms: 1_790_000_000_000,
+            note: Some("design started".into()),
+        };
+        let e = InboxEntry {
+            seq: 7,
+            event_id: "$e".into(),
+            room_id: "!r".into(),
+            sender: "@c:x".into(),
+            sender_name: Some("alice".into()),
+            room: None,
+            ts_ms: 0,
+            kind: "text".into(),
+            body: "b".into(),
+            filename: None,
+            media: None,
+            read: true,
+            seen: None,
+            processed: Some(mark),
+        };
+        let f = frame_entries(&[e], "n");
+        assert!(f.contains("\"state\": \"processed\""), "{f}");
+        assert!(f.contains("\"note\": \"design started\""));
+        assert!(f.contains("\"at\": \"2026-09-21T14:13:20Z\""));
+        assert!(f.contains("\"session\": \"0f1e2d3c-4b5a\""));
+    }
+
+    #[test]
+    fn notes_and_session_ids_are_sanitized() {
+        assert_eq!(
+            sanitize_note("  done:\n\treplied\u{0}  in DM  ").as_deref(),
+            Some("done: replied in DM")
+        );
+        assert_eq!(sanitize_note(" \n "), None);
+        assert_eq!(
+            sanitize_note(&"x".repeat(900)).unwrap().chars().count(),
+            MAX_NOTE_CHARS
+        );
+        assert_eq!(
+            sanitize_session(Some("0F1E2D3C-4B5A-4697-8899-AABBCCDDEEFF")).as_deref(),
+            Some("0f1e2d3c-4b5a-4697-8899-aabbccddeeff")
+        );
+        assert_eq!(sanitize_session(Some("abc; rm -rf /")), None);
+        assert_eq!(sanitize_session(Some("")), None);
+        assert_eq!(sanitize_session(None), None);
     }
 }
