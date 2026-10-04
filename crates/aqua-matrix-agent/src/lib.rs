@@ -11,6 +11,7 @@ mod media;
 pub mod net_retry;
 mod recovery;
 mod registry;
+pub mod reply;
 mod rtc_keys;
 mod rtc_member;
 
@@ -20,6 +21,7 @@ pub use net_retry::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
     ConnectErrorClass, ConnectOutcome,
 };
+pub use reply::ReplyTarget;
 pub use rtc_keys::{
     CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };

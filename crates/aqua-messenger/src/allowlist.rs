@@ -192,63 +192,137 @@ pub fn parse_all(text: &str) -> Result<Parsed, String> {
 
 /// The allow-list plus the file it came from, reloaded on mtime change.
 pub struct AllowList {
-    path: PathBuf,
+    /// The allow-list file, if any (hot-reloaded on mtime change).
+    path: Option<PathBuf>,
     mtime: Option<SystemTime>,
+    /// Entries that are always present (an embedded agent's owner),
+    /// independent of the file; a file can never re-point or remove them.
+    fixed: Vec<Recipient>,
     recipients: Vec<Recipient>,
     rooms: Vec<RoomEntry>,
     load_error: Option<String>,
+    /// Identity named in refusals ("the Aqua System allow-list").
+    label: String,
+    /// Who must approve additions ("Tim", "the agent's owner").
+    approver: String,
 }
 
 impl AllowList {
+    /// The host bridge's list: the file only (a missing or bad file is an
+    /// EMPTY list, fail closed).
     pub fn new(path: PathBuf) -> Self {
+        Self::build(Some(path), Vec::new(), "Aqua System", "Tim")
+    }
+
+    /// The embedded-agent default: ONLY the owner. More people or rooms need
+    /// an explicit `extra_file` (same TOML: `[[recipients]]` + `[[rooms]]`),
+    /// merged on top and hot-reloaded. A missing extra file is simply
+    /// owner-only; a broken one fails closed back to owner-only (never to
+    /// nobody, never to more). The owner's name cannot be re-pointed by the
+    /// file.
+    pub fn owner_only(owner: Recipient, extra_file: Option<PathBuf>, label: &str) -> Self {
+        Self::build(extra_file, vec![owner], label, "the agent's owner")
+    }
+
+    fn build(path: Option<PathBuf>, fixed: Vec<Recipient>, label: &str, approver: &str) -> Self {
         let mut a = Self {
             path,
             mtime: None,
-            recipients: Vec::new(),
+            recipients: fixed.clone(),
+            fixed,
             rooms: Vec::new(),
             load_error: None,
+            label: label.to_string(),
+            approver: approver.to_string(),
         };
         a.reload(true);
         a
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The allow-list file, if this list has one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// The file as shown in messages (or "the messenger configuration").
+    pub fn path_display(&self) -> String {
+        self.path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "the messenger configuration".into())
     }
 
     /// Re-read the file if its mtime changed (or `force`). Returns true when a
-    /// reload happened.
+    /// reload happened. A list without a file never reloads.
     pub fn reload(&mut self, force: bool) -> bool {
-        let mtime = std::fs::metadata(&self.path)
-            .and_then(|m| m.modified())
-            .ok();
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if !force && mtime == self.mtime && self.mtime.is_some() {
             return false;
         }
         self.mtime = mtime;
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => match parse_all(&text) {
+        let mut recipients = self.fixed.clone();
+        let mut rooms = Vec::new();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match parse_all(&text).and_then(|p| self.merge_checked(p)) {
                 Ok(p) => {
-                    tracing::info!(count = p.recipients.len(), rooms = p.rooms.len(), path = %self.path.display(), "allow-list loaded");
-                    self.recipients = p.recipients;
-                    self.rooms = p.rooms;
+                    for e in p.recipients {
+                        if !recipients
+                            .iter()
+                            .any(|r| r.mxid.eq_ignore_ascii_case(&e.mxid))
+                        {
+                            recipients.push(e);
+                        }
+                    }
+                    rooms = p.rooms;
+                    tracing::info!(count = recipients.len(), rooms = rooms.len(), path = %path.display(), "allow-list loaded");
                     self.load_error = None;
                 }
                 Err(e) => {
-                    tracing::error!(path = %self.path.display(), "allow-list rejected, failing closed: {e}");
-                    self.recipients.clear();
-                    self.rooms.clear();
+                    tracing::error!(path = %path.display(), "allow-list rejected, failing closed: {e}");
                     self.load_error = Some(e);
                 }
             },
+            // An embedded agent's optional extra file may simply not exist.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.fixed.is_empty() => {
+                self.load_error = None;
+            }
             Err(e) => {
-                tracing::error!(path = %self.path.display(), "allow-list unreadable, failing closed: {e}");
-                self.recipients.clear();
-                self.rooms.clear();
-                self.load_error = Some(format!("cannot read {}: {e}", self.path.display()));
+                tracing::error!(path = %path.display(), "allow-list unreadable, failing closed: {e}");
+                self.load_error = Some(format!("cannot read {}: {e}", path.display()));
             }
         }
+        self.recipients = recipients;
+        self.rooms = rooms;
         true
+    }
+
+    /// Reject a file that reuses a built-in (owner) name for another MXID or
+    /// names a room like the owner.
+    fn merge_checked(&self, p: Parsed) -> Result<Parsed, String> {
+        for f in &self.fixed {
+            if let Some(c) = p.recipients.iter().find(|e| {
+                e.name.eq_ignore_ascii_case(&f.name) && !e.mxid.eq_ignore_ascii_case(&f.mxid)
+            }) {
+                return Err(format!(
+                    "allow-list entry {:?} reuses the built-in name {:?} for a different MXID",
+                    c.name, f.name
+                ));
+            }
+            if let Some(r) = p
+                .rooms
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(&f.name))
+            {
+                return Err(format!(
+                    "[[rooms]] entry {:?} reuses the built-in name {:?}",
+                    r.name, f.name
+                ));
+            }
+        }
+        Ok(p)
     }
 
     pub fn recipients(&self) -> &[Recipient] {
@@ -309,18 +383,22 @@ impl AllowList {
 
     /// The error a session sees when `who` is not on the list.
     pub fn refusal(&self, who: &str) -> String {
+        let file = self.path_display();
         if let Some(e) = &self.load_error {
-            return format!("REFUSED: the allow-list failed to load ({e}); no one can be messaged until {} is fixed", self.path.display());
+            if self.fixed.is_empty() {
+                return format!("REFUSED: the allow-list failed to load ({e}); no one can be messaged until {file} is fixed");
+            }
         }
         let names: Vec<&str> = self.recipients.iter().map(|r| r.name.as_str()).collect();
         let rooms: Vec<&str> = self.rooms.iter().map(|r| r.name.as_str()).collect();
         format!(
-            "REFUSED: {who:?} is not on the Aqua System allow-list. Allowed recipients: [{}]; \
+            "REFUSED: {who:?} is not on the {} allow-list. Allowed recipients: [{}]; \
              allowed rooms: [{}]. To add someone, append a [[recipients]] entry (a group room: a \
-             [[rooms]] entry) to {} (no restart needed), and only with Tim's approval.",
+             [[rooms]] entry) to {file} (no restart needed), and only with {}'s approval.",
+            self.label,
             names.join(", "),
             rooms.join(", "),
-            self.path.display()
+            self.approver
         )
     }
 }
@@ -358,11 +436,14 @@ room_id = " !rvKzMvUBBaewXApthx:matrix.inblock.io "
     fn list(text: &str) -> AllowList {
         let p = parse_all(text).unwrap();
         AllowList {
-            path: PathBuf::from("/nonexistent"),
+            path: Some(PathBuf::from("/nonexistent")),
             mtime: None,
+            fixed: Vec::new(),
             recipients: p.recipients,
             rooms: p.rooms,
             load_error: None,
+            label: "Aqua System".into(),
+            approver: "Tim".into(),
         }
     }
 
@@ -489,5 +570,85 @@ room_id = " !rvKzMvUBBaewXApthx:matrix.inblock.io "
         let r = a.refusal("mallory");
         assert!(r.starts_with("REFUSED"));
         assert!(r.contains("tim, Kenn"));
+    }
+
+    fn owner() -> Recipient {
+        Recipient {
+            name: "owner".into(),
+            mxid: "@own:x".into(),
+            note: None,
+        }
+    }
+
+    fn cache_file(tag: &str, text: &str) -> PathBuf {
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let d = base
+            .join(".cache")
+            .join(format!("msgr-allow-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("extra.toml");
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    #[test]
+    fn owner_only_default_allows_just_the_owner() {
+        let a = AllowList::owner_only(owner(), None, "Marina");
+        assert_eq!(a.recipients().len(), 1);
+        assert!(a.rooms().is_empty());
+        assert!(a.resolve("owner").is_some());
+        assert!(a.by_mxid("@OWN:x").is_some());
+        assert!(a.resolve_target("@someone:x").is_none());
+        assert!(a.resolve_target("!room:x").is_none());
+        let r = a.refusal("@someone:x");
+        assert!(
+            r.contains("not on the Marina allow-list") && r.contains("[owner]"),
+            "{r}"
+        );
+        assert!(r.contains("the agent's owner's approval"), "{r}");
+        // A missing optional extra file is fine: still owner-only, no error.
+        let missing =
+            AllowList::owner_only(owner(), Some(PathBuf::from("/nonexistent/extra.toml")), "M");
+        assert_eq!(missing.recipients().len(), 1);
+        assert!(missing.load_error().is_none());
+    }
+
+    #[test]
+    fn owner_only_extra_file_is_explicit_and_fails_closed() {
+        let p = cache_file("ok", WITH_ROOMS);
+        let a = AllowList::owner_only(owner(), Some(p.clone()), "M");
+        assert_eq!(a.recipients().len(), 2);
+        assert_eq!(a.rooms().len(), 2);
+        assert!(matches!(
+            a.resolve_target("daily-updates"),
+            Some(Target::Room(_))
+        ));
+        // Broken extra file: back to owner-only (no rooms), owner still reachable.
+        std::fs::write(&p, "not = [valid").unwrap();
+        let b = AllowList::owner_only(owner(), Some(p.clone()), "M");
+        assert_eq!(b.recipients().len(), 1);
+        assert!(b.rooms().is_empty());
+        assert!(b.load_error().is_some());
+        assert!(b.resolve("owner").is_some());
+        assert!(!b.refusal("x").contains("failed to load"));
+        // The extra file cannot re-point the owner's name.
+        std::fs::write(&p, "[[recipients]]\nname = \"owner\"\nmxid = \"@evil:x\"\n").unwrap();
+        let c = AllowList::owner_only(owner(), Some(p.clone()), "M");
+        assert_eq!(c.resolve("owner").unwrap().mxid, "@own:x");
+        assert!(c.by_mxid("@evil:x").is_none());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn host_refusal_text_is_unchanged() {
+        let a = list(WITH_ROOMS);
+        assert_eq!(
+            a.refusal("mallory"),
+            "REFUSED: \"mallory\" is not on the Aqua System allow-list. Allowed recipients: [tim]; \
+             allowed rooms: [daily-updates, aqua-internal]. To add someone, append a [[recipients]] entry \
+             (a group room: a [[rooms]] entry) to /nonexistent (no restart needed), and only with Tim's approval."
+        );
     }
 }

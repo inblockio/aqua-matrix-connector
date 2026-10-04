@@ -276,6 +276,19 @@ pub trait MessageHandler: Send + Sync + 'static {
     /// `Some`). The default is a no-op.
     async fn on_tick(&self, _agent: &AgentClient, _target: &str) {}
 
+    /// Called once per connect cycle with the cycle's live Client, after the
+    /// relay registered its handlers and ran its backfill, before the live
+    /// sync starts. An embedding backend attaches per-Client state here (for
+    /// example `aqua_messenger_matrix::AgentMessenger::attach`), so it never
+    /// builds a second Client on the crypto store. Default: no-op.
+    async fn on_cycle_start(&self, _agent: &AgentClient) {}
+
+    /// Called once when the cycle ends (shutdown, rotation, sync end), after
+    /// the live sync stopped and BEFORE the relay removes its handlers and
+    /// drops the Client. Release every reference to the cycle's Client here
+    /// (for example `AgentMessenger::detach`). Default: no-op.
+    async fn on_cycle_end(&self) {}
+
     /// DID/MXID allow-deny SEAM. Default == today's exact behavior (single
     /// target, ASCII-case-insensitive — see [`mxid_authorized`] for why that is
     /// both correct and safe against impersonation). `register_invite_autojoin`
@@ -889,6 +902,10 @@ async fn run_cycle<H: MessageHandler>(
     )
     .await;
 
+    // Cycle seam: the handler may attach per-Client state now (the live
+    // Client is fully set up; handlers are registered, backfill ran).
+    handler.on_cycle_start(agent).await;
+
     let sync_client = agent.client().clone();
     // Reload the OlmMachine if another Client wrote the shared crypto store
     // since this one last did (the live loop below syncs directly, not through
@@ -943,6 +960,10 @@ async fn run_cycle<H: MessageHandler>(
         sync_task.abort();
         let _ = sync_task.await;
     }
+
+    // Cycle seam: the handler releases its references to this cycle's Client
+    // before the handlers are removed and the Client is dropped.
+    handler.on_cycle_end().await;
 
     // Break the Client<->handler reference cycle: removing each handler drops the
     // stored closure (and the Arc clone of the Client it captured), so once this

@@ -1,0 +1,27 @@
+[package]
+name = "aqua-messenger"
+version.workspace = true
+edition.workspace = true
+description = "Transport-agnostic messenger toolset (MCP tools send_message/send_file/list_recipients/read_inbox/fetch_attachment, optional wait_for_reply) with its policy: allow-list of people and rooms (owner-only by default for embedded agents), rate limit, size caps, reply threading, durable inbox, on-demand attachment store, untrusted framing, MCP tool annotations. Matrix-free; Matrix is reached through the Transport trait."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_messenger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aqua-messenger-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+hex.workspace = true

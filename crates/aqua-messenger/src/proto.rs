@@ -1,4 +1,5 @@
-//! The socket protocol between `aqua-system-bridge-mcp` and the daemon.
+//! The socket protocol between a stdio MCP server (`aqua-system-bridge-mcp`,
+//! `aqua-messenger-mcp`) and the process that owns the Matrix Client.
 //!
 //! One request per connection: the client writes one JSON line, the daemon
 //! writes one JSON line back and closes. Newline-delimited JSON keeps it
@@ -13,12 +14,19 @@ use serde_json::Value;
 pub enum Request {
     /// Send a Markdown message to an allow-listed recipient.
     SendMessage {
-        /// Allow-list name or MXID.
+        /// Allow-list name, MXID, `[[rooms]]` name or room id; empty = the
+        /// profile's default recipient (an embedded agent's owner).
+        #[serde(default)]
         to: String,
         markdown: String,
         /// Short origin tag appended to the message (cwd basename + host, or a
         /// caller-supplied label).
+        #[serde(default)]
         origin: String,
+        /// Send as a Matrix reply to this message: an inbox `seq` (as a
+        /// decimal string) or a Matrix event id (`$...`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
     },
     /// Replace (`m.replace`) the text of a message the bridge itself sent
     /// earlier in the room `to` resolves to. `markdown` is the full new body;
@@ -33,11 +41,16 @@ pub enum Request {
     },
     /// Upload a local file (absolute path, read by the daemon) as an attachment.
     SendFile {
+        #[serde(default)]
         to: String,
         path: String,
         #[serde(default)]
         caption: Option<String>,
+        #[serde(default)]
         origin: String,
+        /// See [`Request::SendMessage::reply_to`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
     },
     /// List the allow-listed recipients.
     ListRecipients,
@@ -107,6 +120,10 @@ pub enum Request {
     /// Download (on demand), decrypt and store the attachment of one inbox
     /// entry; a second call returns the cached file.
     FetchAttachment { inbox_seq: u64 },
+    /// The tool surface of this backend (`{server_name, instructions, tools,
+    /// ...}`, see `jsonrpc::describe`), so a stdio server advertises exactly
+    /// the tools, limits and annotations the backend serves.
+    Describe,
     /// Daemon health: identity, connection state, inbox counts.
     Status,
 }
@@ -155,9 +172,13 @@ mod tests {
             to: "tim".into(),
             markdown: "# hi".into(),
             origin: "x@y".into(),
+            reply_to: None,
         };
         let line = encode_line(&r);
         assert!(line.contains("\"op\":\"send_message\""));
+        // no reply_to key on the wire when absent (an older daemon sees the
+        // exact pre-reply request)
+        assert!(!line.contains("reply_to"));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(back, r);
     }
@@ -179,6 +200,26 @@ mod tests {
         assert!(line.contains("\"op\":\"edit_message\""));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn reply_to_and_optional_to_parse() {
+        let r: Request =
+            serde_json::from_str(r#"{"op":"send_message","markdown":"x","reply_to":"12"}"#)
+                .unwrap();
+        let Request::SendMessage {
+            to,
+            reply_to,
+            origin,
+            ..
+        } = r
+        else {
+            panic!()
+        };
+        assert!(to.is_empty() && origin.is_empty());
+        assert_eq!(reply_to.as_deref(), Some("12"));
+        let d: Request = serde_json::from_str(r#"{"op":"describe"}"#).unwrap();
+        assert_eq!(d, Request::Describe);
     }
 
     #[test]
