@@ -6,21 +6,26 @@
 //! which must read as a new joiner and bring a fresh
 //! `io.element.call.encryption_keys` to-device message from every peer.
 //!
-//! One human, about two minutes, against dev (Element Web 1.12.29 with
-//! Element Call 0.24.0, Synapse 1.161.0):
+//! One human, about two minutes, against a dev stack:
 //!
 //!   cargo run -p aqua-matrix-agent --example rtc_rejoin_probe -- \
-//!     --key-file ~/.aqua-secrets/aqua-e2e-dev-c.pem \
+//!     --key-file <path to a throwaway dev identity key file> \
 //!     --human @<you>:dev.matrix.inblock.io
 //!
-//! The probe signs in as the throwaway dev test identity (fresh device and
-//! fresh store under `~/.cache/keyloss-h3/` per run, so no live store and no
-//! stale one-time keys), opens an encrypted DM with `--human`, holds a call
+//! The probe signs in as that throwaway dev identity (fresh device and fresh
+//! store under `~/.cache/keyloss-h3/` per run, so no live store and no stale
+//! one-time keys), opens an encrypted DM with `--human`, holds a call
 //! membership there (no LiveKit media), and then:
 //!
 //!   1. waits for the human's first media key (the human joined the call),
 //!   2. CONTROL: 20 s with no membership change; expects no new key,
 //!   3. rejoins in place and waits up to 20 s for a new key from the human.
+//!
+//! The rejoin's event id is compared with the join's (the membership event
+//! this client has synced just before the rejoin), and the probe says which
+//! case it is: the SAME id means Synapse dropped the rejoin as identical
+//! state; a DIFFERENT id means Synapse accepted a new membership event, so a
+//! missing key then means Element Call did not react to it.
 //!
 //! Verdict on stdout (`H3: PASS|FAIL|INCONCLUSIVE ...`), exit 0 / 1 / 2. Key
 //! material is never printed. Talks only to the URLs given (dev by default).
@@ -35,7 +40,7 @@ use tokio::time::Instant;
 
 #[derive(Parser)]
 struct Args {
-    /// The throwaway dev identity's PEM (never a live agent's key).
+    /// A throwaway dev identity's key file (never a live agent's key).
     #[arg(long)]
     key_file: PathBuf,
     /// The human who joins the call (their MXID on the dev homeserver).
@@ -75,6 +80,44 @@ fn pump(mut src: mpsc::Receiver<CallEncryptionKeys>, to: mpsc::Sender<CallEncryp
             }
         }
     });
+}
+
+/// Event id of our own current `call.member` state event in `room_id`, as
+/// this client has synced it (the join, unless a refresh came since): the
+/// non-empty membership event sent by us from `device`. `None` when it is not
+/// in the state store (not synced yet, or the room is unknown).
+async fn own_member_event_id(agent: &AgentClient, room_id: &str, device: &str) -> Option<String> {
+    let room = agent.client().get_room(<&matrix_sdk::ruma::RoomId>::try_from(room_id).ok()?)?;
+    let events = room
+        .get_state_events(matrix_sdk::ruma::events::StateEventType::from(
+            "org.matrix.msc3401.call.member",
+        ))
+        .await
+        .ok()?;
+    events.iter().find_map(|e| {
+        let v = serde_json::to_value(e).ok()?;
+        let ours = v["sender"].as_str() == Some(agent.user_id())
+            && v["state_key"].as_str().is_some_and(|k| k.contains(device));
+        let live = v["content"].as_object().is_some_and(|c| !c.is_empty());
+        if ours && live {
+            v["event_id"].as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+/// Which case a rejoin is, from its event id and the join's: the same id
+/// means Synapse returned the existing event (it dropped the rejoin as
+/// identical state), a different one means it stored a new event.
+fn rejoin_case(join_event: Option<&str>, rejoin_event: &str) -> &'static str {
+    match join_event {
+        Some(j) if j == rejoin_event => {
+            "rejoin event id == join event id: Synapse DROPPED the rejoin as identical state"
+        }
+        Some(_) => "rejoin event id != join event id: Synapse ACCEPTED a new membership event",
+        None => "join event id unavailable: cannot tell whether Synapse accepted a new event",
+    }
 }
 
 /// Next key set from `human` within `limit`, as (seconds waited, key count).
@@ -200,6 +243,13 @@ async fn main() {
     }
     println!("H3: control window {} s: no new key without a membership change", args.control_secs);
 
+    // The join's event id, read just before the rejoin (a join and the
+    // hourly refresh are the only membership events before it).
+    let join_event = own_member_event_id(&agent, &room_id, &device).await;
+    match &join_event {
+        Some(id) => println!("H3: join event {id}"),
+        None => println!("H3: (join event id not in the synced state)"),
+    }
     let rejoined = match membership.rejoin().await {
         Ok(r) => r,
         Err(e) => {
@@ -211,12 +261,20 @@ async fn main() {
         "H3: rejoined in place: event {} created_ts {}",
         rejoined.event_id, rejoined.created_ts_ms
     );
+    let case = rejoin_case(join_event.as_deref(), &rejoined.event_id);
+    println!("H3: {case}");
     let after = next_human_key(&mut inbox, human.as_str(), Duration::from_secs(args.verdict_secs)).await;
     let _ = membership.leave().await;
     syncer.abort();
     match after {
         Some((t, n)) => verdict(0, &format!("PASS new key from the human {t:.1} s after the rejoin ({n} keys)")),
-        None => verdict(1, &format!("FAIL no key from the human within {} s of the rejoin", args.verdict_secs)),
+        None => verdict(
+            1,
+            &format!(
+                "FAIL no key from the human within {} s of the rejoin ({case})",
+                args.verdict_secs
+            ),
+        ),
     }
 }
 
