@@ -25,7 +25,7 @@ pub use reply::ReplyTarget;
 pub use rtc_keys::{
     CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };
-pub use rtc_member::{RtcMemberTiming, RtcMembership};
+pub use rtc_member::{RtcMemberTiming, RtcMembership, RtcRejoined};
 
 use anyhow::{anyhow, Context, Result};
 use matrix_sdk::{
