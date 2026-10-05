@@ -35,6 +35,23 @@
 //!   reads as "already shared" (keys are not re-sent). A refresh keeps the old
 //!   one; a rejoin after our leave fired must take a new one.
 //!
+//! ## Rejoin in place (2026-10-05, KEYLOSS-1)
+//!
+//! Element Call re-sends its media key to a member only when that member's
+//! `(user, device, createdTs())` is new to it, and Synapse drops a state event
+//! whose content equals the current one (no new event, no new `createdTs`).
+//! [`RtcMembership::rejoin`] asks the RUNNING keeper to re-publish the
+//! membership with a fresh `created_ts`, so every Element Call peer reads a
+//! new joiner and sends its key again. Same keeper, same state key, no empty
+//! membership in between, and the MSC4140 delayed leave stays armed
+//! throughout (Synapse cancels pending delayed state only for OTHER senders,
+//! `synapse/handlers/delayed_events.py` `_handle_state_deltas`). The keeper
+//! adopts the new `created_ts` for every later hourly refresh, so a refresh
+//! never flips back to the old one. The new value is the server-anchored
+//! estimate of "now" (`origin_server_ts` of the chain's first event plus the
+//! monotonic time since), never below the old value plus 1 ms; the host
+//! wall clock is used only when that anchor could not be read.
+//!
 //! [`hold_rtc_member`](AgentClient::hold_rtc_member) implements the same two
 //! mechanisms for a server-side agent, with timings suited to a daemon
 //! ([`RtcMemberTiming`]): a 60 s dead-man delay restarted every 15 s (instead
@@ -86,7 +103,7 @@ use matrix_sdk::ruma::exports::http;
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, UInt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::call::{rtc_member_content, rtc_member_state_key_for};
@@ -651,6 +668,68 @@ impl<T: MemberTransport> Keeper<T> {
         }
     }
 
+    /// [`RtcMembership::rejoin`]: re-publish the membership IN PLACE as a new
+    /// chain with a fresh `created_ts`, keeping this keeper, its state key
+    /// and its armed delayed leave. On success the keeper adopts the new
+    /// `created_ts` (and restarts its refresh schedule from now), so later
+    /// refreshes continue the NEW chain. On failure nothing changes: the old
+    /// chain is still what the server holds and keeps being refreshed.
+    async fn rejoin_in_place(&mut self) -> Result<RtcRejoined> {
+        if self.created_ts.is_none() {
+            self.anchor_created_ts().await;
+        }
+        let at = self.now();
+        let created_ts = self.next_created_ts(at);
+        let expiry = self.sched.timing.expiry;
+        match self.transport.send_member(Some(created_ts), expiry).await {
+            Ok(event_id) => {
+                self.chain_event = Some(event_id.clone());
+                self.created_ts = Some(created_ts);
+                self.sched.rejoined(at);
+                self.succeeded();
+                tracing::info!(
+                    room_id = %self.room_id,
+                    created_ts = u64::from(created_ts.0),
+                    "RTC membership re-published in place (new created_ts, peers read a rejoin)"
+                );
+                Ok(RtcRejoined {
+                    event_id: event_id.to_string(),
+                    created_ts_ms: u64::from(created_ts.0),
+                })
+            }
+            Err(e) => {
+                self.failed("rejoining the call in place", &e);
+                Err(e
+                    .into_anyhow()
+                    .context("failed to re-publish the RTC membership"))
+            }
+        }
+    }
+
+    /// The `created_ts` of a chain started at monotonic `at`: the current
+    /// chain's anchor plus the monotonic time since its start (the server
+    /// clock's "now", no host wall clock), at least 1 ms past the anchor so
+    /// it always differs. Without an anchor (its `origin_server_ts` could not
+    /// be read) the host wall clock is the only estimate left.
+    fn next_created_ts(&self, at: Duration) -> MilliSecondsSinceUnixEpoch {
+        match self.created_ts {
+            Some(anchor) => {
+                let elapsed = at.saturating_sub(self.sched.joined_at).as_millis();
+                let elapsed = u64::try_from(elapsed).unwrap_or(u64::MAX).max(1);
+                MilliSecondsSinceUnixEpoch(UInt::new_saturating(
+                    u64::from(anchor.0).saturating_add(elapsed),
+                ))
+            }
+            None => {
+                tracing::warn!(
+                    room_id = %self.room_id,
+                    "rejoin without a created_ts anchor; using the host clock for the new created_ts"
+                );
+                MilliSecondsSinceUnixEpoch::now()
+            }
+        }
+    }
+
     async fn restart_leave(&mut self) {
         let Some(id) = self.delay_id() else {
             self.sched.leave_lost(self.now());
@@ -699,9 +778,12 @@ impl<T: MemberTransport> Keeper<T> {
         true
     }
 
-    /// Run every due action, then sleep until the next one. Returns early
-    /// with the reason when the transport reports a fatal condition.
-    async fn tick(&mut self) -> Option<String> {
+    /// Run every due action, then wait until the next one, serving a
+    /// [`RtcMembership::rejoin`] request if one comes first. A rejoin never
+    /// interrupts a request in flight (it waits for the due actions), so it
+    /// cannot orphan a delayed leave the server already scheduled. Returns
+    /// early with the reason when the transport reports a fatal condition.
+    async fn tick(&mut self, rejoins: &mut mpsc::Receiver<RejoinRequest>) -> Option<String> {
         loop {
             if let Some(fatal) = self.transport.fatal() {
                 return Some(fatal);
@@ -713,7 +795,18 @@ impl<T: MemberTransport> Keeper<T> {
         if let Some(fatal) = self.transport.fatal() {
             return Some(fatal);
         }
-        tokio::time::sleep_until(self.origin + self.sched.next_wake()).await;
+        tokio::select! {
+            biased;
+            Some(reply) = rejoins.recv() => {
+                // A caller that already gave up (timeout, dropped) is not
+                // served late: no surprise rejoin minutes after the ask.
+                if !reply.is_closed() {
+                    let res = self.rejoin_in_place().await;
+                    let _ = reply.send(res);
+                }
+            }
+            _ = tokio::time::sleep_until(self.origin + self.sched.next_wake()) => {}
+        }
         None
     }
 
@@ -769,7 +862,11 @@ impl<T: MemberTransport> Keeper<T> {
     /// Run until told to leave or hand over (a dropped sender counts as
     /// leave). The command preempts any in-flight request, so a hung
     /// homeserver or token endpoint can never keep a leave from starting.
-    pub(crate) async fn run(mut self, mut cmd: watch::Receiver<Cmd>) -> Result<()> {
+    pub(crate) async fn run(
+        mut self,
+        mut cmd: watch::Receiver<Cmd>,
+        mut rejoins: mpsc::Receiver<RejoinRequest>,
+    ) -> Result<()> {
         let mut fatal = None;
         let why = loop {
             let current = *cmd.borrow_and_update();
@@ -783,7 +880,7 @@ impl<T: MemberTransport> Keeper<T> {
                         break Cmd::Leave;
                     }
                 }
-                stop = self.tick() => {
+                stop = self.tick(&mut rejoins) => {
                     if let Some(reason) = stop {
                         fatal = Some(reason);
                         break Cmd::Leave;
@@ -818,6 +915,22 @@ impl<T: MemberTransport> Keeper<T> {
 /// How long [`RtcMembership::leave`] waits for the leave request(s), and how
 /// long a new hold waits for the previous keeper of the same membership.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound of [`RtcMembership::rejoin`]: the keeper may first finish the
+/// actions due (each request bounded by [`REQUEST_TIMEOUT`], a token rotation
+/// and one retry included), then sends the rejoin.
+const REJOIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One [`RtcMembership::rejoin`] request: where the keeper sends the outcome.
+type RejoinRequest = oneshot::Sender<Result<RtcRejoined>>;
+
+/// What [`RtcMembership::rejoin`] published: the membership event that now
+/// starts the chain, and its `created_ts` (ms since the Unix epoch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtcRejoined {
+    pub event_id: String,
+    pub created_ts_ms: u64,
+}
 
 /// Ask the keeper to leave or hand over, unless it was already told to.
 fn request(cmd: &watch::Sender<Cmd>, to: Cmd) {
@@ -934,6 +1047,8 @@ pub struct RtcMembership {
     cmd: Arc<watch::Sender<Cmd>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     dead_man_switch: bool,
+    /// [`Self::rejoin`] requests to the keeper (one pending at a time).
+    rejoin: mpsc::Sender<RejoinRequest>,
 }
 
 impl RtcMembership {
@@ -944,9 +1059,10 @@ impl RtcMembership {
         let dead_man_switch = keeper.sched.leave_enabled();
         let (tx, rx) = watch::channel(Cmd::Hold);
         let cmd = Arc::new(tx);
+        let (rejoin, rejoins) = mpsc::channel(1);
         let (done_tx, done_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let res = keeper.run(rx).await;
+            let res = keeper.run(rx, rejoins).await;
             let _ = done_tx.send(true);
             res
         });
@@ -960,8 +1076,46 @@ impl RtcMembership {
             cmd,
             task: Some(task),
             dead_man_switch,
+            rejoin,
         };
         (membership, slot)
+    }
+
+    /// Rejoin the call IN PLACE: the running keeper re-publishes this
+    /// membership with a fresh `created_ts` (see the module docs, "Rejoin in
+    /// place"), so every Element Call peer reads a new joiner and re-sends
+    /// its media key. Element Call shares keys per `(user, device,
+    /// createdTs())` and Synapse drops identical state content, so neither a
+    /// plain re-send nor a refresh can do this.
+    ///
+    /// The membership is never emptied, the delayed leave stays armed, and
+    /// the keeper's later hourly refreshes carry the new `created_ts`. A
+    /// failed rejoin changes nothing (the old chain keeps being refreshed).
+    /// Inert unless called. The returned future owns what it needs (it can
+    /// be spawned) and is bounded by 60 s; the keeper serves the request
+    /// after the actions already due, and drops it unserved if this future
+    /// was dropped first. Errors when a rejoin is already pending or the
+    /// keeper has stopped (left, handed over, or its session expired).
+    pub fn rejoin(&self) -> impl Future<Output = Result<RtcRejoined>> + Send + 'static {
+        let tx = self.rejoin.clone();
+        async move {
+            let (reply, answer) = oneshot::channel();
+            tx.try_send(reply).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    anyhow!("a rejoin of this RTC membership is already pending")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    anyhow!("the RTC membership keeper has stopped; nothing to rejoin")
+                }
+            })?;
+            match tokio::time::timeout(REJOIN_TIMEOUT, answer).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(anyhow!(
+                    "the RTC membership keeper stopped before the rejoin ran"
+                )),
+                Err(_) => Err(anyhow!("rejoining the call timed out after {REJOIN_TIMEOUT:?}")),
+            }
+        }
     }
 
     /// Whether a delayed leave (MSC4140) protects this membership. `false`
@@ -1014,7 +1168,9 @@ impl AgentClient {
     /// [`leave_delay`](RtcMemberTiming::leave_delay). If our membership
     /// disappears mid-call (the delayed leave fired during an outage) or
     /// lapses, it is re-published as a new membership. See the module docs
-    /// for the matrix-js-sdk behaviour this mirrors.
+    /// for the matrix-js-sdk behaviour this mirrors. [`RtcMembership::rejoin`]
+    /// does the same on demand while the membership is live (peers re-send
+    /// their media keys).
     ///
     /// A previous hold of the same room by this agent device is retired
     /// first (it hands over; its delayed leave is cancelled), so an old
@@ -1952,6 +2108,112 @@ mod tests {
             .await
             .expect("join");
         (m, state)
+    }
+
+    /// KEYLOSS-1 F1: a rejoin in the FIRST hour (before any refresh, when
+    /// the server still holds the join's content) is a real new event: the
+    /// running keeper sends the membership with a fresh created_ts (anchor +
+    /// time since the join), adopts it for every later hourly refresh (no
+    /// flip back), and the delayed leave stays armed throughout: never
+    /// cancelled, never re-scheduled, restarted on its 15 s cadence, no
+    /// empty membership at any point.
+    #[tokio::test(start_paused = true)]
+    async fn rejoin_republishes_in_place_with_a_new_created_ts_that_refreshes_keep() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            ..Default::default()
+        })
+        .await;
+        tokio::time::sleep(30 * 60 * Duration::from_secs(1)).await;
+        let r = m.rejoin().await.expect("rejoin");
+        tokio::time::sleep(2 * H + Duration::from_secs(1)).await;
+        assert!(m.is_active(), "the same keeper still holds");
+        m.leave().await.unwrap();
+
+        let sends = members(&state);
+        assert_eq!(sends.len(), 4, "join, rejoin, 2 hourly refreshes: {sends:?}");
+        let (join_at, join_created, join_expires) = sends[0];
+        assert_eq!((join_created, join_expires), (None, 4 * H), "the join");
+        let anchor = SERVER_EPOCH_MS + join_at.as_millis() as u64;
+        let (rejoin_at, rejoin_created, rejoin_expires) = sends[1];
+        assert_eq!(rejoin_at, join_at + 30 * 60 * Duration::from_secs(1));
+        let fresh = anchor + (rejoin_at - join_at).as_millis() as u64;
+        assert_eq!(rejoin_created, Some(fresh), "server-anchored now, not the old anchor");
+        assert!(fresh > anchor);
+        assert_eq!(rejoin_expires, 4 * H, "a new chain: valid 4 h from its created_ts");
+        assert_eq!(r.created_ts_ms, fresh);
+        for (k, (at, created, expires)) in sends.iter().enumerate().skip(2) {
+            let k = k as u32 - 1;
+            assert_eq!(*created, Some(fresh), "refresh {k} keeps the NEW created_ts");
+            assert_eq!(*at, rejoin_at + H * k, "hourly from the rejoin");
+            assert_eq!(*expires, H * k + 4 * H, "relative to the new chain");
+        }
+        assert_eq!(count(&state, |c| matches!(c, Call::Schedule { .. })), 1, "armed once");
+        assert_eq!(count(&state, |c| matches!(c, Call::Cancel(_))), 0, "never cancelled");
+        assert_eq!(count(&state, |c| *c == Call::Clear), 0, "never emptied");
+        assert_eq!(count(&state, |c| *c == Call::IsLive), 0);
+        let total = rejoin_at + 2 * H + Duration::from_secs(1);
+        let restarts = count(&state, |c| matches!(c, Call::Restart { .. }));
+        assert_eq!(restarts as u64, total.as_secs() / 15, "the dead-man switch never paused");
+        let calls = state.lock().unwrap().calls.clone();
+        assert_eq!(calls.last(), Some(&Call::LeaveNow), "the leave is the only removal");
+    }
+
+    /// Two rejoins: each takes a newer created_ts than the last.
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_rejoins_each_take_a_newer_created_ts() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            ..Default::default()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let a = m.rejoin().await.expect("first");
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let b = m.rejoin().await.expect("second");
+        m.leave().await.unwrap();
+        assert!(b.created_ts_ms > a.created_ts_ms);
+        assert_eq!(b.created_ts_ms - a.created_ts_ms, 15_000);
+        let created: Vec<_> = members(&state).into_iter().map(|(_, c, _)| c).collect();
+        assert_eq!(created, vec![None, Some(a.created_ts_ms), Some(b.created_ts_ms)]);
+    }
+
+    /// A failed rejoin changes nothing: the error comes back, the old chain
+    /// (old created_ts) is what the next refresh continues, nothing emptied.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_rejoin_keeps_the_old_chain() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            fail_member_between: Some((Duration::from_secs(60), Duration::from_secs(61))),
+            ..Default::default()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(m.rejoin().await.is_err(), "the 502 is reported");
+        tokio::time::sleep(H).await;
+        m.leave().await.unwrap();
+        let sends = members(&state);
+        let anchor = SERVER_EPOCH_MS + sends[0].0.as_millis() as u64;
+        assert_eq!(sends.len(), 3, "join, failed rejoin, refresh: {sends:?}");
+        assert_eq!(sends[2].1, Some(anchor), "the refresh continues the OLD chain");
+        assert_eq!(sends[2].0, sends[0].0 + H, "on the original schedule");
+        assert_eq!(count(&state, |c| *c == Call::Clear), 0);
+        assert_eq!(count(&state, |c| matches!(c, Call::Schedule { .. })), 1);
+    }
+
+    /// A rejoin of a keeper that already stopped is refused and sends nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_after_leave_is_refused_and_sends_nothing() {
+        let (m, state) = hold(Fake {
+            msc4140: true,
+            ..Default::default()
+        })
+        .await;
+        let late = m.rejoin();
+        m.leave().await.unwrap();
+        let err = late.await.expect_err("nothing to rejoin");
+        assert!(format!("{err:#}").contains("stopped"), "{err:#}");
+        assert_eq!(members(&state).len(), 1, "only the join was ever sent");
     }
 
     /// Every re-send must land while the previous one is still valid, with the
@@ -2926,5 +3188,49 @@ mod tests {
             );
         }
         assert!(code.contains("mint_session_token("));
+    }
+
+    /// KEYLOSS-1 F1, on the wire (the bodies the keeper PUTs): the rejoin
+    /// content differs from BOTH the join's (what the server holds in the
+    /// first hour) and a refresh's (later), so Synapse's identical-content
+    /// dedupe (`handlers/message.py` `deduplicate_state_event`, canonical JSON
+    /// of the content) cannot swallow it; it carries the new created_ts,
+    /// which the refresh after it keeps.
+    #[tokio::test]
+    async fn rejoin_wire_content_differs_from_join_and_refresh_and_carries_the_new_created_ts() {
+        let (base, seen) = fake_homeserver().await;
+        let config = live_store("rejoin-wire", &base, "AQUA_test", Some("AQUA_test"));
+        let m = live_hold(live_session(config, 3600), "!rejoin-wire:example.org")
+            .await
+            .expect("join");
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        let r = m.rejoin().await.expect("rejoin");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        m.leave().await.expect("leave");
+
+        let seen = seen.lock().unwrap().clone();
+        let bodies: Vec<serde_json::Value> = seen
+            .iter()
+            .filter(|(m, p, _, _)| {
+                m == "PUT"
+                    && p.contains("/state/org.matrix.msc3401.call.member/")
+                    && !p.contains("msc4140.delay")
+            })
+            .map(|(_, _, _, b)| serde_json::from_str(b).unwrap())
+            .collect();
+        assert!(bodies.len() >= 4, "join, refresh, rejoin, refresh: {bodies:?}");
+        let (join, refresh, rejoin, after) = (&bodies[0], &bodies[1], &bodies[2], &bodies[3]);
+        assert!(join.get("created_ts").is_none(), "{join}");
+        assert_eq!(refresh["created_ts"], SERVER_EPOCH_MS, "{refresh}");
+        assert_eq!(rejoin["created_ts"], r.created_ts_ms, "{rejoin}");
+        assert!(r.created_ts_ms > SERVER_EPOCH_MS);
+        assert_eq!(rejoin["expires"], 4000, "a new chain, 4 s fast timing");
+        assert_ne!(rejoin, join, "differs from the first-hour state");
+        assert_ne!(rejoin, refresh, "differs from a refreshed state");
+        assert_eq!(after["created_ts"], r.created_ts_ms, "the refresh adopted it");
+        for b in &bodies {
+            assert!(b.as_object().is_some_and(|o| !o.is_empty()), "never emptied by a PUT: {b}");
+            assert_eq!(b["device_id"], "AQUA_test");
+        }
     }
 }
