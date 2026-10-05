@@ -59,6 +59,8 @@ cargo build
 | `--target` | | | Matrix user ID to message |
 | `--store-dir` | `AGENT_STORE_DIR` | `~/.aqua-matrix-agent` | SQLite session store directory |
 | `--message` | | | Message text to send |
+| `--mention` | | | MXID to @mention in `--message` (`m.mentions.user_ids` + matrix.to pill), so the user is notified even in a mentions-only room |
+| `--mention-name` | | the MXID | Visible text of the `--mention` pill |
 | `--read` | | | Read recent messages from the DM room |
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |

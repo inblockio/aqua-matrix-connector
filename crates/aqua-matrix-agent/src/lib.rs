@@ -1790,6 +1790,23 @@ impl AgentClient {
     }
 
     pub async fn send_dm(&self, target: &str, message: &str) -> Result<String> {
+        // Render the body as Markdown so Element (Web + X) display formatted
+        // text. `text_markdown` attaches an `org.matrix.custom.html`
+        // formatted_body (rendered HTML) and keeps the raw text as the plain
+        // `body` fallback. Sending `text_plain` carries no formatted body, so
+        // clients have nothing to render and show the raw markup verbatim.
+        self.send_dm_content(target, RoomMessageEventContent::text_markdown(message))
+            .await
+    }
+
+    /// [`send_dm`](Self::send_dm) with a prepared `m.room.message` content
+    /// (for example one built by [`dm_content`] with a mention) instead of
+    /// Markdown text. Same DM room resolution, same single attempt.
+    pub async fn send_dm_content(
+        &self,
+        target: &str,
+        content: RoomMessageEventContent,
+    ) -> Result<String> {
         let target: &UserId = target
             .try_into()
             .map_err(|e| anyhow!("invalid target: {e}"))?;
@@ -1797,15 +1814,7 @@ impl AgentClient {
         // chat. Shared with every media send via `ensure_dm_room` (see media.rs)
         // so text and attachments always land in the same Megolm session.
         let room = self.ensure_dm_room(target).await?;
-        // Render the body as Markdown so Element (Web + X) display formatted
-        // text. `text_markdown` attaches an `org.matrix.custom.html`
-        // formatted_body (rendered HTML) and keeps the raw text as the plain
-        // `body` fallback. Sending `text_plain` carries no formatted body, so
-        // clients have nothing to render and show the raw markup verbatim.
-        let resp = room
-            .send(RoomMessageEventContent::text_markdown(message))
-            .await
-            .context("failed to send message")?;
+        let resp = room.send(content).await.context("failed to send message")?;
         Ok(resp.response.event_id.to_string())
     }
 
@@ -2052,6 +2061,19 @@ pub fn mention_content(markdown: &str, mention: &RoomMention<'_>) -> Result<Room
     Ok(RoomMessageEventContent::text_html(body, html).add_mentions(Mentions::with_user_ids([user])))
 }
 
+/// The content of a one-shot DM: plain Markdown (exactly what
+/// [`AgentClient::send_dm`] sends) without a mention, or [`mention_content`]
+/// with one. Errors only on an invalid mention MXID.
+pub fn dm_content(
+    markdown: &str,
+    mention: Option<&RoomMention<'_>>,
+) -> Result<RoomMessageEventContent> {
+    match mention {
+        Some(m) => mention_content(markdown, m),
+        None => Ok(RoomMessageEventContent::text_markdown(markdown)),
+    }
+}
+
 /// Minimal HTML text escaping for [`mention_content`].
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -2066,8 +2088,14 @@ impl AgentClient {
     /// matrix-sdk would otherwise retry internally for minutes can't silently
     /// consume the access token's whole lifetime. A timeout is surfaced as a
     /// normal error so the caller's self-heal logic runs.
-    async fn send_dm_bounded(&self, target: &str, message: &str) -> Result<String> {
-        match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, self.send_dm(target, message)).await {
+    async fn send_dm_bounded(
+        &self,
+        target: &str,
+        content: RoomMessageEventContent,
+    ) -> Result<String> {
+        match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, self.send_dm_content(target, content))
+            .await
+        {
             Ok(res) => res,
             Err(_) => Err(anyhow!(
                 "send timed out after {}s (homeserver not acknowledging the event)",
@@ -2096,6 +2124,24 @@ impl AgentClient {
     ///      immediately with an actionable message. Each attempt is also bounded
     ///      by [`SEND_ATTEMPT_TIMEOUT`] so a wedged send returns in seconds.
     pub async fn send_dm_self_healing(&mut self, target: &str, message: &str) -> Result<String> {
+        self.send_dm_self_healing_with_mention(target, message, None)
+            .await
+    }
+
+    /// [`send_dm_self_healing`](Self::send_dm_self_healing) that can carry a
+    /// real user mention (see [`mention_content`]): with `Some(mention)` the
+    /// DM gets `m.mentions.user_ids = [mxid]` and a `matrix.to` pill, which
+    /// Synapse's `.m.rule.is_user_mention` push rule matches, so the user is
+    /// notified even when the room is set to mentions only. `None` sends
+    /// exactly what `send_dm_self_healing` always sent.
+    pub async fn send_dm_self_healing_with_mention(
+        &mut self,
+        target: &str,
+        message: &str,
+        mention: Option<&RoomMention<'_>>,
+    ) -> Result<String> {
+        let content = dm_content(message, mention)?;
+
         // 1. Proactive refresh: never send on a token that is about to expire.
         if self.token_seconds_left() < TOKEN_REFRESH_MARGIN {
             tracing::info!(
@@ -2113,7 +2159,7 @@ impl AgentClient {
         }
 
         // 2. First send attempt (bounded).
-        match self.send_dm_bounded(target, message).await {
+        match self.send_dm_bounded(target, content.clone()).await {
             Ok(id) => return Ok(id),
             Err(e) if is_server_internal_error(&e) => {
                 return Err(e).context(
@@ -2134,7 +2180,7 @@ impl AgentClient {
         }
 
         // 3. Post-reauth retry (only reached on a token rejection above).
-        match self.send_dm_bounded(target, message).await {
+        match self.send_dm_bounded(target, content).await {
             Ok(id) => Ok(id),
             Err(e) if is_server_internal_error(&e) => Err(e).context(
                 "homeserver still returns a 5xx after re-authentication — server-side send fault",
