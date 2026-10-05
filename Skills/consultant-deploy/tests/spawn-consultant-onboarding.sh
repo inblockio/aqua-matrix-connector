@@ -99,8 +99,18 @@ echo "systemctl $*" >> "@SIDE@"
 [ "${SHIM_MODE:-print}" = spawn ] || { echo "!! shim: systemctl must not be called" >&2; exit 1; }
 exit 0
 EOF
-sed -i "s|@SIDE@|$SIDE_EFFECTS|" "$SHIM_BIN/podman" "$SHIM_BIN/systemctl"
-chmod +x "$SHIM_BIN/podman" "$SHIM_BIN/systemctl"
+# systemd-run (podman-detached.sh's scope): logged; in spawn mode it drops its own options and
+# runs the command after `--`, so the podman shim above still plays the container.
+cat > "$SHIM_BIN/systemd-run" <<'EOF'
+#!/bin/sh
+echo "systemd-run $*" >> "@SIDE@"
+[ "${SHIM_MODE:-print}" = spawn ] || { echo "!! shim: systemd-run must not be called" >&2; exit 1; }
+while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+EOF
+sed -i "s|@SIDE@|$SIDE_EFFECTS|" "$SHIM_BIN/podman" "$SHIM_BIN/systemctl" "$SHIM_BIN/systemd-run"
+chmod +x "$SHIM_BIN/podman" "$SHIM_BIN/systemctl" "$SHIM_BIN/systemd-run"
 
 # Recorder for Tim's notifier: one JSON array of its argv per call.
 cat > "$SB/notify" <<EOF
@@ -384,6 +394,10 @@ O1="$SB/o1.toml"; mk_al "$O1"
 spawn_owner o1 andreas "$O1"
 check "add: spawn exit 0 and launched" bash -c '[ "$(cat "$1")" = 0 ]' _ "$SB/out/o1.rc"
 check "add: podman run happened after the Owner step" podman_ran
+check "add: the launch ran in its own systemd --user scope (podman-detached.sh), never bare" bash -c '
+  grep -qxF "systemd-run --user --scope --quiet --collect -- true" "$1" &&
+  grep -qF "systemd-run --user --scope --quiet --collect --description=podman run aqua-agent-andreas-aqua-consultant-1 (detached from the caller) -- podman run -d --name aqua-agent-andreas-aqua-consultant-1 " "$1" &&
+  [ "$(grep -c "^podman run -d" "$1")" = "$(grep -c "^systemd-run .* -- podman run -d" "$1")" ]' _ "$SIDE_EFFECTS"
 check "add: entry name=label, exact note" [ "$(al_entry "$O1" "$OWNER")" = "andreas|Owner of aqua-agent-andreas-aqua-consultant-1 (Pelagia), auto-added by spawn-consultant.sh $TODAY" ]
 check "add: comments and Tim preserved" bash -c 'grep -q "comments must survive" "$1" && grep -q "name = \"tim\"" "$1"' _ "$O1"
 check "add: file stays mode 600" [ "$(stat -c %a "$O1")" = 600 ]
