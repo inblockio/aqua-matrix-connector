@@ -2814,6 +2814,7 @@ mod tests {
             redirect_uri: None,
             store_dir: store_dir.clone(),
             device_id: Some("AQUA_test".into()),
+            device_role: Default::default(),
         };
         // Near expiry: every request first tries a rotation (which goes to
         // the fake siwx-oidc and fails), exercising the token path too.
@@ -2947,6 +2948,7 @@ mod tests {
             redirect_uri: None,
             store_dir,
             device_id: Some(device.into()),
+            device_role: Default::default(),
         }
     }
 

@@ -167,6 +167,10 @@ So practical operation preserves identity completely, and even multi-day downtim
 
 **Upstream dependency:** this design relies on `siwx-oidc-auth` shipping `AuthTokens.refresh_token` and `siwx_oidc_auth::refresh(...)`. Since commit `ab3ad3f` of the siwx-oidc repo these are available; we depend via `path = "../siwx-oidc/siwx-oidc-auth"` (sibling checkout) rather than a pinned git rev, because the newer commit's workspace also requires the `aqua-auth` crate at `../../aqua-auth` which cargo cannot fetch through a single git dep. To set up a fresh dev host: `git clone https://github.com/inblockio/siwx-oidc.git && git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
 
+### Secondary devices of one identity
+
+One identity can run on a second host as a second DEVICE of the same account (`AgentConfig::device_role = DeviceRole::Secondary`; for the bridge `aqua-system-bridged --secondary --device-id <id>`). It is never a copy of the primary's crypto store: the derived `device_id` is the primary's device, and two stores on one device collide on one-time keys. A secondary therefore needs an explicit `device_id` of its own, the identity's `agent.pem` and the primary's `store/recovery.key`, and starts with an empty store. It takes its cross-signing keys only from that recovery key and refuses to connect otherwise. The fallbacks of a primary would damage the identity from a second host: `bootstrap_cross_signing` mints a new master key (an identity reset every recipient sees), `recovery().enable()` without a persisted key rotates secret storage (orphaning the primary's recovery key), and the post-wipe prune deletes the primary's device. A secondary also never wipes its store. The bridge additionally leaves invites, `m.direct`, the display name and new DM rooms to the primary, so it sends to listed rooms and existing DMs only. One caveat remains on the primary's side: a store wipe there still prunes every other device, the secondary's included.
+
 ## DM rooms as server-side state (`m.direct`)
 
 When the agent sends a DM it also marks the room as direct in the `m.direct`

@@ -81,6 +81,7 @@ fn agent_config(key_file: &str) -> AgentConfig {
         store_dir,
         // None → connect() derives a stable device_id from the DID.
         device_id: None,
+        device_role: Default::default(),
     }
 }
 

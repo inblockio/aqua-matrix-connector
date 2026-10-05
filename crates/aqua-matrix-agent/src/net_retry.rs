@@ -603,6 +603,7 @@ mod tests {
             redirect_uri: Some("http://localhost/cb".into()),
             store_dir: dir,
             device_id: None,
+            device_role: Default::default(),
         }
     }
 

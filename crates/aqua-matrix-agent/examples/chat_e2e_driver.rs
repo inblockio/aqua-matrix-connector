@@ -136,6 +136,7 @@ async fn connect_agent(args: &Args) -> AgentClient {
         store_dir: args.store_dir.clone(),
         // None → connect() derives a stable device_id from the DID.
         device_id: None,
+        device_role: Default::default(),
     })
     .await
     .expect("driver failed to connect");
