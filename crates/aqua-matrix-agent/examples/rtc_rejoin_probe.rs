@@ -159,6 +159,7 @@ async fn main() {
         redirect_uri: None,
         store_dir,
         device_id: Some(device.clone()),
+        device_role: Default::default(),
     };
     let agent = AgentClient::connect(config)
         .await

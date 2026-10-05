@@ -35,6 +35,7 @@ async fn main() {
         store_dir: args.store_dir,
         // None → connect() derives a stable device_id from the DID.
         device_id: None,
+        device_role: Default::default(),
     })
     .await
     .expect("connect failed");

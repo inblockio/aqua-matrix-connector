@@ -289,6 +289,7 @@ async fn connect(id: &Identity) -> Result<AgentClient> {
         store_dir: id.store_dir.clone(),
         // None: connect() derives the stable device id from the DID.
         device_id: None,
+        device_role: Default::default(),
     })
     .await
     .context("connect failed")?;

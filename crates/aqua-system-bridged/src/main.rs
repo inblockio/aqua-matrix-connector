@@ -14,6 +14,13 @@
 //! outbound sends are executed by the cycle loop itself on the current Client
 //! (a send that hits `M_UNKNOWN_TOKEN` is carried into the next cycle rather
 //! than rebuilding a second Client in place). SIGTERM/SIGINT exit cleanly.
+//!
+//! `--secondary` runs the same identity on another host as an additional
+//! device with its own state directory, next to the primary bridge: it needs
+//! `--device-id` and the identity's `agent.pem` and `store/recovery.key`, never
+//! creates or rotates account-wide crypto state (see `aqua_matrix_agent::DeviceRole`),
+//! and leaves invites, `m.direct`, the display name and new DM rooms to the
+//! primary. It sends to rooms and existing DMs only.
 
 #![recursion_limit = "256"]
 
@@ -25,7 +32,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aqua_matrix_agent::AgentConfig;
+use aqua_matrix_agent::{AgentConfig, DeviceRole};
 use clap::Parser;
 use tokio::sync::Notify;
 
@@ -94,6 +101,14 @@ struct Args {
     /// marked processed).
     #[arg(long, env = "AQUA_SYSTEM_BRIDGE_INBOX_TRACK_PROCESSED")]
     inbox_track_processed: bool,
+    /// Explicit Matrix device_id (default: derived from the DID, which is the
+    /// primary's device). Required with --secondary.
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_DEVICE_ID")]
+    device_id: Option<String>,
+    /// Run as a secondary device of an identity whose primary bridge runs on
+    /// another host (see the crate docs).
+    #[arg(long, env = "AQUA_SYSTEM_BRIDGE_SECONDARY", requires = "device_id")]
+    secondary: bool,
     /// Print the identity (DID, and MXID once logged in) and exit.
     #[arg(long)]
     print_identity: bool,
@@ -162,7 +177,12 @@ async fn main() -> anyhow::Result<()> {
         client_id: None,
         redirect_uri: None,
         store_dir: store,
-        device_id: None,
+        device_id: args.device_id.clone(),
+        device_role: if args.secondary {
+            DeviceRole::Secondary
+        } else {
+            DeviceRole::Primary
+        },
     };
 
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);

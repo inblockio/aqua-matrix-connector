@@ -18,6 +18,11 @@ use matrix_sdk::Client;
 
 const KEY_FILE: &str = "recovery.key";
 
+/// Where the persisted recovery key of the store at `store_dir` lives.
+pub(crate) fn key_path(store_dir: &Path) -> std::path::PathBuf {
+    store_dir.join(KEY_FILE)
+}
+
 /// Cold-start restore. If a persisted recovery key exists AND either cross-signing
 /// is NOT complete OR secret storage reports `Incomplete` (we're missing some
 /// secrets — e.g. the megolm backup decryption key, which leaves historical room
@@ -28,7 +33,7 @@ const KEY_FILE: &str = "recovery.key";
 /// the status complete and bootstrap is skipped. The `Incomplete` trigger (R9)
 /// also repopulates the backup key so undecryptable history can be re-fetched.
 pub(crate) async fn restore_if_needed(client: &Client, store_dir: &Path) {
-    let key_path = store_dir.join(KEY_FILE);
+    let key_path = key_path(store_dir);
     if !key_path.exists() {
         // Nothing to restore from; enable_and_persist_if_absent will create one
         // after cross-signing is bootstrapped.
@@ -81,7 +86,7 @@ pub(crate) async fn restore_if_needed(client: &Client, store_dir: &Path) {
 /// Call this AFTER cross-signing keys exist so the secrets being stashed into
 /// SSSS are present.
 pub(crate) async fn enable_and_persist_if_absent(client: &Client, store_dir: &Path) {
-    let key_path = store_dir.join(KEY_FILE);
+    let key_path = key_path(store_dir);
     if key_path.exists() {
         // Already have a recovery key on disk; nothing to do. Log current state
         // for diagnostics.

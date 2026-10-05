@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aqua_matrix_agent::{
     connect_with_outage_retry, is_unknown_token, AgentClient, AgentConfig, ConnectOutcome,
+    DeviceRole,
 };
 use aqua_messenger::allowlist::{invite_action, InviteAction};
 use aqua_messenger::{Dest, ReplyRef, SeenRoom};
@@ -62,6 +63,12 @@ pub async fn run(
     let mut first_cycle = true;
     // A send that hit M_UNKNOWN_TOKEN on the old Client, retried on the next.
     let mut carry: Option<SendCmd> = None;
+    let role = config.device_role;
+    if role == DeviceRole::Secondary {
+        tracing::info!(
+            "secondary device: invites, m.direct, the display name and new DM rooms stay with the primary bridge"
+        );
+    }
     loop {
         let agent = match connect_with_outage_retry(
             &config,
@@ -94,22 +101,28 @@ pub async fn run(
         if let Err(e) = agent.sync_once_nowait().await {
             tracing::warn!("pre-join sync failed: {e:#}");
         }
-        join_allowed_invites(&agent, &shared).await;
+        if role == DeviceRole::Primary {
+            join_allowed_invites(&agent, &shared).await;
+        }
         if let Err(e) = agent.sync_once_nowait().await {
             tracing::warn!("settle sync failed: {e:#}");
         }
-        repair_m_direct(&agent, &shared).await;
+        if role == DeviceRole::Primary {
+            repair_m_direct(&agent, &shared).await;
+        }
         survey_rooms(&agent, &shared, first_cycle).await;
         if first_cycle {
-            match agent.set_display_name(&display_name).await {
-                Ok(()) => tracing::info!("display name set to {display_name:?}"),
-                Err(e) => tracing::warn!("set display name failed: {e:#}"),
+            if role == DeviceRole::Primary {
+                match agent.set_display_name(&display_name).await {
+                    Ok(()) => tracing::info!("display name set to {display_name:?}"),
+                    Err(e) => tracing::warn!("set display name failed: {e:#}"),
+                }
             }
             tracing::info!(did = %agent.did(), mxid = %agent.user_id(), "identity");
             first_cycle = false;
         }
 
-        let exit = run_cycle(&agent, &shared, &mut rx, &mut carry, &shutdown).await;
+        let exit = run_cycle(&agent, &shared, &mut rx, &mut carry, &shutdown, role).await;
         shared.set_status(|st| st.connected = false);
         if exit == "shutdown" {
             // Fail anything still queued so callers are not left hanging.
@@ -128,12 +141,14 @@ async fn run_cycle(
     rx: &mut mpsc::Receiver<SendCmd>,
     carry: &mut Option<SendCmd>,
     shutdown: &Notify,
+    role: DeviceRole,
 ) -> &'static str {
     let own = agent.user_id().to_string();
-    let handles: Vec<EventHandlerHandle> = vec![
-        register_message_handler(agent, shared.clone()),
-        register_invite_handler(agent, shared.clone(), own.clone()),
-    ];
+    let mut handles: Vec<EventHandlerHandle> =
+        vec![register_message_handler(agent, shared.clone())];
+    if role == DeviceRole::Primary {
+        handles.push(register_invite_handler(agent, shared.clone(), own.clone()));
+    }
 
     backfill(agent, shared).await;
 
@@ -153,7 +168,7 @@ async fn run_cycle(
 
     let exit = 'cycle: {
         if let Some(cmd) = carry.take() {
-            if let Some(retry) = execute(agent, shared, cmd).await {
+            if let Some(retry) = execute(agent, shared, cmd, role).await {
                 *carry = Some(retry);
                 break 'cycle "token-rejected";
             }
@@ -173,7 +188,7 @@ async fn run_cycle(
                 }
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break 'cycle "shutdown" };
-                    if let Some(retry) = execute(agent, shared, cmd).await {
+                    if let Some(retry) = execute(agent, shared, cmd, role).await {
                         *carry = Some(retry);
                         break 'cycle "token-rejected";
                     }
@@ -196,7 +211,12 @@ async fn run_cycle(
 
 /// Run one send on the live Client. Returns the command back when the token
 /// was rejected (to retry on the next cycle's fresh Client); otherwise replies.
-async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<SendCmd> {
+async fn execute(
+    agent: &AgentClient,
+    shared: &Shared,
+    cmd: SendCmd,
+    role: DeviceRole,
+) -> Option<SendCmd> {
     if Instant::now() > cmd.deadline {
         let _ = cmd.done.send(Err(
             "the bridge could not reach Matrix before the send deadline (outage?); not sent".into(),
@@ -213,15 +233,27 @@ async fn execute(agent: &AgentClient, shared: &Shared, cmd: SendCmd) -> Option<S
         let reply = cmd.reply.as_ref();
         match &cmd.kind {
             SendKind::Text(md) => {
-                let room_id =
-                    destination_room(agent, shared, &cmd.to, reply, MissingDm::Create).await?;
+                let room_id = destination_room(
+                    agent,
+                    shared,
+                    &cmd.to,
+                    reply,
+                    MissingDm::for_new_message(role),
+                )
+                .await?;
                 aqua_messenger_matrix::outbound::send_text(agent, &room_id, md, reply)
                     .await
                     .map(CmdOk::Sent)
             }
             SendKind::File { path, caption } => {
-                let room_id =
-                    destination_room(agent, shared, &cmd.to, reply, MissingDm::Create).await?;
+                let room_id = destination_room(
+                    agent,
+                    shared,
+                    &cmd.to,
+                    reply,
+                    MissingDm::for_new_message(role),
+                )
+                .await?;
                 aqua_messenger_matrix::outbound::send_file(agent, &room_id, path, caption, reply)
                     .await
                     .map(CmdOk::Sent)
@@ -352,6 +384,18 @@ enum MissingDm {
     Create,
     /// Fail (an edit: without a DM there is nothing to edit).
     Refuse,
+    /// Fail (a secondary device: the primary bridge creates DM rooms).
+    LeaveToPrimary,
+}
+
+impl MissingDm {
+    /// The policy of a new message: only the primary creates DM rooms.
+    fn for_new_message(role: DeviceRole) -> Self {
+        match role {
+            DeviceRole::Primary => MissingDm::Create,
+            DeviceRole::Secondary => MissingDm::LeaveToPrimary,
+        }
+    }
 }
 
 /// The room a send goes to. A listed room must already be joined. A person's
@@ -437,6 +481,11 @@ async fn dm_room_for(
     }
     if let Some((_, id)) = best {
         return Ok(id);
+    }
+    if missing == MissingDm::LeaveToPrimary {
+        anyhow::bail!(
+            "this secondary bridge has no DM with {mxid} and leaves creating one to the primary bridge"
+        );
     }
     if missing == MissingDm::Refuse {
         anyhow::bail!("the bridge has no DM with {mxid}, so there is no message there to edit");
@@ -544,4 +593,21 @@ fn register_invite_handler(
                 handle_invite(&agent, &shared, room, ev.sender.to_string(), is_direct).await;
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_primary_creates_dm_rooms_for_new_messages() {
+        assert_eq!(
+            MissingDm::for_new_message(DeviceRole::Primary),
+            MissingDm::Create
+        );
+        assert_eq!(
+            MissingDm::for_new_message(DeviceRole::Secondary),
+            MissingDm::LeaveToPrimary
+        );
+    }
 }

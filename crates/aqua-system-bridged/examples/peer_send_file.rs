@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         redirect_uri: None,
         store_dir: a.store_dir,
         device_id: None,
+        device_role: Default::default(),
     })
     .await?;
     if a.whoami {

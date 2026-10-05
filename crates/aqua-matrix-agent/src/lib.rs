@@ -5,6 +5,7 @@
 #![recursion_limit = "256"]
 
 mod call;
+mod device_role;
 mod dm;
 mod durable;
 mod media;
@@ -15,6 +16,7 @@ pub mod reply;
 mod rtc_keys;
 mod rtc_member;
 
+pub use device_role::DeviceRole;
 pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
 pub use net_retry::{
@@ -280,6 +282,12 @@ pub struct AgentConfig {
     /// minting a fresh `SIWX_<uuid>` each time. See
     /// docs/ARCHITECTURE.md "Identity and device-id persistence".
     pub device_id: Option<String>,
+    /// Whether this client owns the identity's account-wide crypto state
+    /// ([`DeviceRole::Primary`], the default) or is an additional device of
+    /// an identity whose primary runs elsewhere ([`DeviceRole::Secondary`]:
+    /// needs an explicit `device_id` and the recovery key, never bootstraps,
+    /// rotates, wipes or prunes).
+    pub device_role: DeviceRole,
 }
 
 /// The `body` [`AgentClient::messages`] gives an event it could not decrypt.
@@ -1248,11 +1256,33 @@ async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
     }
 }
 
+/// Sign this device with the identity's self-signing key unless it already is.
+/// Additive only: it vouches for this device and changes nothing else. Never fatal.
+async fn sign_own_device_if_needed(client: &Client) {
+    match client.encryption().get_own_device().await {
+        Ok(Some(device)) if device.is_cross_signed_by_owner() => {
+            tracing::info!("own device is cross-signed by the identity");
+        }
+        Ok(Some(device)) => match device.verify().await {
+            Ok(()) => tracing::info!("signed own device with the identity's self-signing key"),
+            Err(e) => tracing::warn!("could not sign own device: {e:#}"),
+        },
+        Ok(None) => tracing::warn!("own device not found in the crypto store"),
+        Err(e) => tracing::warn!("could not read own device: {e:#}"),
+    }
+}
+
 impl AgentClient {
     pub async fn connect(config: AgentConfig) -> Result<Self> {
         let key = if config.key_file.exists() {
             tracing::info!("loading key from {}", config.key_file.display());
             SiwxKey::from_pem_file(&config.key_file).context("failed to load key")?
+        } else if config.device_role == DeviceRole::Secondary {
+            // A fresh key would be a different identity, not a second device of this one.
+            anyhow::bail!(
+                "a secondary device needs the identity's key at {} (copied from the primary)",
+                config.key_file.display()
+            );
         } else {
             tracing::info!("generating Ed25519 key at {}", config.key_file.display());
             let key = SiwxKey::generate_ed25519();
@@ -1261,6 +1291,14 @@ impl AgentClient {
         };
         let did = key.did();
         tracing::info!("agent DID: {did}");
+        if config.device_role == DeviceRole::Secondary {
+            device_role::check_secondary(
+                config.device_id.as_deref(),
+                &stable_device_id(&did),
+                &recovery::key_path(&config.store_dir),
+            )?;
+            tracing::info!("secondary device: account-wide crypto state stays with the primary");
+        }
 
         // Resolve OIDC client + a usable Matrix session (cached token → refresh
         // grant → fresh did:key auth). Both steps live in standalone helpers so
@@ -1319,6 +1357,11 @@ impl AgentClient {
         .await
         {
             Ok(c) => c,
+            Err(e) if is_store_mismatch(&e) && !config.device_role.may_wipe_store() => {
+                return Err(e.context(
+                    "secondary device: the crypto store belongs to another device; refusing to wipe it",
+                ));
+            }
             Err(e) if is_store_mismatch(&e) => {
                 tracing::warn!(
                     "crypto store device_id mismatch; wiping store and retrying once: {e:#}"
@@ -1355,16 +1398,20 @@ impl AgentClient {
 
         // Verify device via cross-signing
         tracing::info!("checking cross-signing status");
-        match client.encryption().cross_signing_status().await {
-            Some(status) if status.is_complete() => {
-                tracing::info!(
-                    "cross-signing keys already present (master={}, self_signing={}, user_signing={})",
-                    status.has_master,
-                    status.has_self_signing,
-                    status.has_user_signing,
-                );
+        let status = client.encryption().cross_signing_status().await;
+        let complete = status.as_ref().is_some_and(|s| s.is_complete());
+        match device_role::cross_signing_action(config.device_role, complete) {
+            device_role::CrossSigning::Present => {
+                if let Some(status) = status {
+                    tracing::info!(
+                        "cross-signing keys already present (master={}, self_signing={}, user_signing={})",
+                        status.has_master,
+                        status.has_self_signing,
+                        status.has_user_signing,
+                    );
+                }
             }
-            _ => {
+            device_role::CrossSigning::Bootstrap => {
                 tracing::info!("bootstrapping cross-signing keys");
                 match client.encryption().bootstrap_cross_signing(None).await {
                     Ok(()) => {
@@ -1377,12 +1424,22 @@ impl AgentClient {
                     }
                 }
             }
+            device_role::CrossSigning::Refuse => anyhow::bail!(
+                "secondary device: the recovery key did not restore cross-signing; refusing to \
+                 bootstrap it (that would replace the identity's master key for every recipient)"
+            ),
         }
 
-        // After cross-signing keys exist, enable recovery (creates SSSS +
-        // server-side backup) and persist the generated recovery key to disk if
-        // it isn't there yet. Best-effort: never fails connect().
-        recovery::enable_and_persist_if_absent(&client, &config.store_dir).await;
+        if config.device_role.may_manage_secret_storage() {
+            // After cross-signing keys exist, enable recovery (creates SSSS +
+            // server-side backup) and persist the generated recovery key to disk if
+            // it isn't there yet. Best-effort: never fails connect().
+            recovery::enable_and_persist_if_absent(&client, &config.store_dir).await;
+        } else {
+            // The restore signs this device; repeat it if that step failed, so
+            // recipients see a device the identity vouches for.
+            sign_own_device_if_needed(&client).await;
+        }
 
         // If we just re-bootstrapped onto a NEW device_id (store wipe), the peer's
         // client may still be encrypting to our previous, now-dead devices (whose
@@ -1441,6 +1498,11 @@ impl AgentClient {
         .await
         {
             Ok(c) => c,
+            Err(e) if is_store_mismatch(&e) && !self.config.device_role.may_wipe_store() => {
+                return Err(e.context(
+                    "reauth: secondary device: the crypto store belongs to another device; refusing to wipe it",
+                ));
+            }
             Err(e) if is_store_mismatch(&e) => {
                 tracing::warn!(
                     "reauth: crypto store device_id mismatch; wiping and retrying once: {e:#}"
@@ -3965,6 +4027,7 @@ mod stale_client_tests {
             redirect_uri: None,
             store_dir,
             device_id: None,
+            device_role: Default::default(),
         };
         (config, key, config_file, config_path, log)
     }
@@ -4411,6 +4474,7 @@ mod config_concurrency_tests {
             redirect_uri: None,
             store_dir,
             device_id: Some(device.into()),
+            device_role: Default::default(),
         }
     }
 

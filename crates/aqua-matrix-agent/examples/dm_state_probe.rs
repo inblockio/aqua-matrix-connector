@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
             .context("set AGENT_STORE_DIR")?
             .into(),
         device_id: env("AGENT_DEVICE_ID"),
+        device_role: Default::default(),
     };
 
     let agent = AgentClient::connect(config).await?;

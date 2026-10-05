@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
         redirect_uri: args.redirect_uri.clone(),
         store_dir: args.store_dir.clone().unwrap_or_else(default_store_dir),
         device_id: args.device_id.clone(),
+        device_role: Default::default(),
     };
 
     // One-shot CLI: connect once and exit. The long-running daemon modes moved
