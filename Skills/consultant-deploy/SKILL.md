@@ -224,6 +224,14 @@ while everything else (hello, homeserver, DID, memory) is preserved:
 bash ~/roll-consultant-fleet.sh --refresh-prompt
 ```
 
+**Scheduled or scripted rolls are safe to run from a systemd timer.** Every launch goes through
+`podman-detached.sh`, so the containers never live in the cgroup of whatever ran the roll. Before
+2026-10-05 they did: podman leaves conmon in the calling unit's cgroup inside a systemd service
+(`$INVOCATION_ID`), so when the one-off night-roll `Type=oneshot` unit finished at 04:11, systemd
+SIGTERMed all 23 freshly rolled consultants; they exited 0, `--restart on-failure` never fired, and
+the fleet stayed down for 8 h. A new script that starts agent containers must call
+`podman-detached.sh run|start|restart ...` instead of bare `podman`.
+
 ## Refs grounding and freshness (automatic)
 
 The agent's knowledge is the live host checkouts, bind-mounted read-only; a host-side
@@ -332,6 +340,14 @@ durable, writable `<test-dir>/<key>-room-state/` (created if missing, never wipe
   podman inspect aqua-agent-<label>-aqua-consultant-1 \
     --format '{{range .Mounts}}{{.Destination}} rw={{.RW}}{{"\n"}}{{end}}'   # every /refs/* rw=false
   ```
+- **Containers outlive their launcher**: `spawn-consultant.sh` (`podman run -d`),
+  `restore-agent-fleet.sh` (`podman start`) and `scripts/canary-rooms.sh` (`podman restart`) launch
+  through `podman-detached.sh`, which runs podman in a transient `systemd-run --user --scope` of
+  its own and refuses (exit 1, podman not run) when that scope cannot be created. Check where a
+  container's conmon lives:
+  ```bash
+  cat /proc/$(podman inspect <container> --format '{{.State.ConmonPid}}')/cgroup   # a *.scope, never a *.service
+  ```
 - **Single-target binding** — the relay matches one exact target; never widen a consultant to >1 peer.
 - **Guards**: placeholder/non-MXID target rejected; `--display` rejects quote/newline (systemd-unit
   injection); registry parser skips indented comments and rejects non-slug labels; `--fresh` asserts
@@ -369,6 +385,13 @@ bash ~/spawn-consultant.sh --print-run --replace --keep-config --label zdnaez --
 Fleet-wide enablement is a separate decision (third-party processing disclosure to peers).
 
 ### Tests (no live side effects)
+
+`tests/podman-detached.sh` checks the launch wrapper with shims (scope argv, exit status and
+stdout passthrough, fail-closed refusal, plain podman only without systemd-run, the restore script
+starting every container through it). `--live` reproduces the 2026-10-05 failure with throwaway
+containers from a local image: a oneshot unit launches one container bare (its conmon must die
+with the unit) and one through the wrapper (it must survive, conmon outside the unit).
+
 
 `tests/spawn-consultant-args.sh` renders the argument vector with `--print-run` in a sandbox
 (temp HOME, test dir, refs base, token and env files; `podman`/`systemctl` replaced by shims
@@ -442,6 +465,8 @@ never fires on the clean SIGTERM exit a shutdown produces — without help, **ev
   canonical at [`systemd/aqua-agent-fleet-restore.service`](../../systemd/aqua-agent-fleet-restore.service)) runs
   `~/restore-agent-fleet.sh`, which `podman start`s every exited `aqua-agent-*` container.
   Identity/memory live in the persist volumes, so agents come back `store_wiped=false`.
+  Each start goes through `podman-detached.sh`, so the conmons do not stay in this unit's cgroup
+  and stopping or restarting the unit no longer takes the fleet down.
   Caveat: it restarts intentionally-stopped containers too — `podman rm` (or rename away from
   the `aqua-agent-` prefix) anything that must stay down across reboots.
 - **`crashloop-watch.sh`** (host-canonical at `~/.aqua-matrix-notify/`) now re-alerts every

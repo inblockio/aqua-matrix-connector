@@ -397,6 +397,9 @@ fi
 # against the bridge's own rules before an atomic rename. FAIL-CLOSED: a real spawn aborts
 # before any container change when the Owner cannot be ensured. Print modes only preview.
 OWNER_HELPER="$(dirname "$PERSONA_HELPER")/owner-allowlist.py"
+# Launches go through podman-detached.sh so the container outlives whatever runs this script
+# (a systemd timer job ending would otherwise SIGTERM it, see that file).
+PODMAN_DETACHED="$(dirname "$PERSONA_HELPER")/podman-detached.sh"
 ALLOWLIST_FILE="${AQUA_SYSTEM_ALLOWLIST:-$HOME/.aqua-system-bridge/allowlist.toml}"
 ensure_owner_allowlisted() {  # ensure_owner_allowlisted check|apply
   local sel=(--generic)
@@ -1122,7 +1125,7 @@ fi
 
 echo ">> launching $NAME bound single-target to $TARGET"
 set +e
-CID="$(podman run -d "${RUN_ARGS[@]}" 2>&1)"
+CID="$(PODMAN_DETACHED_LABEL="$NAME" "$PODMAN_DETACHED" run -d "${RUN_ARGS[@]}" 2>&1)"
 run_rc=$?
 set -e
 

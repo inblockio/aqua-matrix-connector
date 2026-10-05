@@ -84,7 +84,7 @@ for r in aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compli
   mkdir -p "$REFS_BASE/$r"
 done
 # Shims: any call is a test failure (recorded), and they fail loudly.
-for tool in podman systemctl; do
+for tool in podman systemctl systemd-run; do
   cat > "$SHIM_BIN/$tool" <<EOF
 #!/bin/sh
 echo "SIDE EFFECT: $tool \$*" >> "$SIDE_EFFECTS"

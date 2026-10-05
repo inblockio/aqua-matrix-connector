@@ -341,7 +341,8 @@ cexec() { podman exec "$CONTAINER" "$@"; }
 restart_canary() {  # restart and wait for the relay's "connected" line
   assert_canary
   local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  podman restart "$CONTAINER" >/dev/null || return 1
+  # detached: the restarted canary must not die with this script (Skills/consultant-deploy/podman-detached.sh)
+  PODMAN_DETACHED_LABEL="$CONTAINER" "$REPO/Skills/consultant-deploy/podman-detached.sh" restart "$CONTAINER" >/dev/null || return 1
   local deadline=$(( SECONDS + 240 ))
   while [ "$SECONDS" -lt "$deadline" ]; do
     # Count, never grep -q (nor >/dev/null, which GNU grep treats alike): an early exit SIGPIPEs

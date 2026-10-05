@@ -15,6 +15,10 @@
 # The host runs it via the ~/restore-agent-fleet.sh symlink from
 # aqua-agent-fleet-restore.service (systemd --user oneshot, runs at boot).
 #
+# Each start goes through podman-detached.sh (next to this script), so the containers do not
+# live in this unit's cgroup: stopping or restarting aqua-agent-fleet-restore.service, or a
+# copy of this run from a oneshot job, can no longer take the fleet down (2026-10-05).
+#
 # NOTE: this starts ANY exited aqua-agent-* container, including ones stopped
 # on purpose. `podman rm` a container (or rename it away from the prefix) if
 # it must stay down across reboots.
@@ -39,6 +43,7 @@ while [ $# -gt 0 ]; do
 done
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+PODMAN_DETACHED="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/podman-detached.sh"
 
 mapfile -t stopped < <(podman ps -a --filter "name=$FILTER" --filter status=exited --format '{{.Names}}')
 
@@ -52,7 +57,7 @@ echo "restore-agent-fleet: ${#stopped[@]} exited container(s): ${stopped[*]}"
 
 rc=0
 for c in "${stopped[@]}"; do
-  if podman start "$c" >/dev/null; then
+  if PODMAN_DETACHED_LABEL="$c" "$PODMAN_DETACHED" start "$c" >/dev/null; then
     echo "  started $c"
   else
     echo "  FAILED to start $c" >&2
