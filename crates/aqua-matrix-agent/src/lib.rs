@@ -614,6 +614,59 @@ pub(crate) async fn mint_session_token(
     .context("reauth: could not acquire a fresh session")
 }
 
+/// An access token for one pinned device, minted WITHOUT a matrix-sdk
+/// [`Client`] (see [`mint_access_token`]). `Debug` never prints the token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MintedToken {
+    pub user_id: String,
+    pub device_id: String,
+    pub access_token: String,
+    pub expires_at_unix: u64,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedToken")
+            .field("user_id", &self.user_id)
+            .field("device_id", &self.device_id)
+            .field("access_token", &"<redacted>")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
+}
+
+/// Mint a Matrix access token for `config`'s pinned device (refresh grant
+/// when `config.toml` in `config.store_dir` holds a session for that device,
+/// else a fresh `did:key` login), and NOTHING else: no matrix-sdk [`Client`],
+/// no SQLite state or crypto store, no sync, no device keys. The only file
+/// written is `config.toml` (OIDC client and session) in `config.store_dir`.
+///
+/// For callers that hand the token to ANOTHER Matrix client which owns the
+/// device's crypto identity, e.g. a browser running Element Call in the
+/// hermetic harness (aqua-agents H14). Building an [`AgentClient`] for that
+/// device instead would upload a second, different identity for it.
+///
+/// Give each device its own `store_dir`: a cached session for another device
+/// is discarded (never refreshed) and a token whose device is not the
+/// configured one is refused.
+pub async fn mint_access_token(config: &AgentConfig) -> Result<MintedToken> {
+    let (access_token, user_id, device_id, expires_at_unix) =
+        mint_session_token(config, None).await?;
+    if let Some(want) = config.device_id.as_deref().map(str::trim) {
+        if !want.is_empty() && want != device_id {
+            return Err(anyhow!(
+                "mint_access_token: minted a token for device {device_id}, configured {want}"
+            ));
+        }
+    }
+    Ok(MintedToken {
+        user_id,
+        device_id,
+        access_token,
+        expires_at_unix,
+    })
+}
+
 async fn build_and_restore(
     matrix_url: &str,
     store_dir: &Path,
@@ -4030,6 +4083,114 @@ mod stale_client_tests {
             device_role: Default::default(),
         };
         (config, key, config_file, config_path, log)
+    }
+
+    /// Files in `dir` that are matrix-sdk state (the names `wipe_crypto_store`
+    /// targets: `matrix-sdk-*.sqlite3*`).
+    fn sdk_store_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("matrix-sdk-") && n.contains(".sqlite3"))
+            .collect()
+    }
+
+    fn minted_config(tag: &str, device: &str) -> (AgentConfig, PathBuf) {
+        let key_dir = temp_store(&format!("{tag}-key"));
+        let key_file = key_dir.join("agent.pem");
+        std::fs::write(&key_file, SiwxKey::generate_ed25519().to_pem().unwrap()).unwrap();
+        let config = AgentConfig {
+            key_file,
+            siwx_url: String::new(),
+            matrix_url: String::new(),
+            client_id: None,
+            redirect_uri: None,
+            store_dir: temp_store(tag),
+            device_id: Some(device.to_string()),
+            device_role: Default::default(),
+        };
+        (config, key_dir)
+    }
+
+    #[tokio::test]
+    async fn mint_access_token_mints_for_the_pinned_device_and_creates_no_crypto_store() {
+        let device = "H14ECT1A";
+        let (mut config, key_dir) = minted_config("mint", device);
+        let (url, log) = fake_siwx(device.to_string()).await;
+        config.siwx_url = url.clone();
+        config.matrix_url = url;
+
+        let t = mint_access_token(&config).await.expect("token-only mint");
+        assert_eq!(t.access_token, "at");
+        assert_eq!(t.device_id, device);
+        assert_eq!(t.user_id, "@agent:localhost");
+        assert!(t.expires_at_unix > unix_now(), "expiry lies in the future");
+        assert!(
+            !format!("{t:?}").contains("\"at\""),
+            "Debug must never print the token: {t:?}"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&config.store_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["config.toml".to_string()],
+            "only config.toml is written"
+        );
+        assert!(sdk_store_files(&config.store_dir).is_empty());
+        let persisted = ConfigFile::load(&config.store_dir.join("config.toml")).unwrap();
+        assert_eq!(persisted.session.unwrap().device_id, device);
+        assert_eq!(count(&log, "/token"), 1, "one code exchange");
+
+        // Second mint while the cached token is valid: still no Client, no store.
+        let again = mint_access_token(&config).await.expect("second mint");
+        assert_eq!(again.device_id, device);
+        assert!(sdk_store_files(&config.store_dir).is_empty());
+        let _ = std::fs::remove_dir_all(&config.store_dir);
+        let _ = std::fs::remove_dir_all(&key_dir);
+    }
+
+    /// Negative control for the test above: the probe it relies on does see a
+    /// store when the matrix-sdk Client path (`build_and_restore`, what
+    /// `AgentClient::connect` uses) runs on a directory.
+    #[tokio::test]
+    async fn sdk_store_probe_detects_the_client_path() {
+        let dir = temp_store("probe");
+        assert!(sdk_store_files(&dir).is_empty());
+        let user: OwnedUserId = "@agent:localhost".try_into().unwrap();
+        let device: OwnedDeviceId = "H14ECT1A".into();
+        let _client = build_and_restore("http://127.0.0.1:9", &dir, &user, &device, "at")
+            .await
+            .expect("an offline Client with a restored session");
+        assert!(
+            !sdk_store_files(&dir).is_empty(),
+            "the probe must detect a real matrix-sdk store, else the no-store assertion is blind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mint_access_token_refuses_a_token_for_another_device() {
+        let (mut config, key_dir) = minted_config("other", "H14ECT1A");
+        let (url, _log) = fake_siwx("SOMEONE_ELSE".to_string()).await;
+        config.siwx_url = url.clone();
+        config.matrix_url = url;
+        let err = mint_access_token(&config)
+            .await
+            .expect_err("a token bound to another device must be refused");
+        assert!(sdk_store_files(&config.store_dir).is_empty());
+        // This wrapper's own check is the guard here: the fresh-login path
+        // accepts a whoami for another device (measured 2026-10-08).
+        assert!(
+            format!("{err:#}").contains("configured H14ECT1A"),
+            "refused by the device check: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&config.store_dir);
+        let _ = std::fs::remove_dir_all(&key_dir);
     }
 
     #[tokio::test]
