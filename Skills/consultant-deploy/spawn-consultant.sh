@@ -1280,6 +1280,38 @@ if [ "$PRINT_RUN" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------- container lifecycle
+# The persist dirs are bind-mounted with `:U`, so podman chowns them to the container's mapped
+# UID (not the operator) and a plain host `rm -rf` is denied. --fresh therefore wipes inside the
+# rootless user namespace, where the operator is root over every mapped UID. preflight_fresh
+# probes that namespace BEFORE the --replace removal, so a host where it is broken fails with the
+# old container still in place (2026-10-16: the wipe died after the removal, leaving none).
+preflight_fresh() {
+  if ! podman unshare true; then
+    echo "!! --fresh: 'podman unshare' is not usable here, so the persist dir cannot be wiped;" >&2
+    echo "   nothing changed (no container removed, no wipe, no launch)." >&2
+    return 1
+  fi
+}
+
+wipe_persist() {
+  # PERSIST is STEM-derived and the label half is slug-validated, but assert the expected
+  # shape before any rm -rf so a future refactor can never point this at a stray path.
+  case "$PERSIST" in
+    "$TEST_DIR"/*-aqua-consultant-persist) : ;;
+    "$TEST_DIR"/aqua-consultant-persist) : ;;   # --generic
+    *) echo "!! refusing --fresh: unexpected persist path '$PERSIST'" >&2; return 2 ;;
+  esac
+  echo ">> --fresh: wiping persist dir for a brand-new identity ($PERSIST)"
+  if ! podman unshare rm -rf -- "$STORE" "$MEM"; then
+    echo "!! --fresh: could not wipe $STORE / $MEM inside the podman user namespace;" >&2
+    echo "   no container is running for this consultant now. Fix the cause, then re-run." >&2
+    return 1
+  fi
+  mkdir -p "$STORE" "$MEM"
+}
+
+[ "$FRESH" -eq 1 ] && preflight_fresh
+
 if podman container exists "$NAME"; then
   if [ "$REPLACE" -eq 1 ]; then
     echo ">> --replace: removing existing $NAME (DID preserved via persist volume)"
@@ -1291,18 +1323,7 @@ if podman container exists "$NAME"; then
   fi
 fi
 
-if [ "$FRESH" -eq 1 ]; then
-  # PERSIST is STEM-derived and the label half is slug-validated, but assert the expected
-  # shape before any rm -rf so a future refactor can never point this at a stray path.
-  case "$PERSIST" in
-    "$TEST_DIR"/*-aqua-consultant-persist) : ;;
-    "$TEST_DIR"/aqua-consultant-persist) : ;;   # --generic
-    *) echo "!! refusing --fresh: unexpected persist path '$PERSIST'" >&2; exit 2 ;;
-  esac
-  echo ">> --fresh: wiping persist dir for a brand-new identity ($PERSIST)"
-  rm -rf -- "$STORE" "$MEM"
-  mkdir -p "$STORE" "$MEM"
-fi
+[ "$FRESH" -eq 1 ] && wipe_persist
 
 if [ -s "$STORE/agent.pem" ]; then
   IDENTITY_NOTE="identity PRESERVED (existing DID in persist volume)"
