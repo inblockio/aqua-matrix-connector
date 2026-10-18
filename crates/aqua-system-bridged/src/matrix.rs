@@ -245,6 +245,20 @@ async fn execute(
                     .await
                     .map(CmdOk::Sent)
             }
+            SendKind::Content(content) => {
+                let room_id = destination_room(
+                    agent,
+                    shared,
+                    &cmd.to,
+                    None,
+                    MissingDm::for_new_message(role),
+                )
+                .await?;
+                agent
+                    .send_content_to_room(&room_id, (**content).clone())
+                    .await
+                    .map(|id| CmdOk::Sent(id.into()))
+            }
             SendKind::File { path, caption } => {
                 let room_id = destination_room(
                     agent,

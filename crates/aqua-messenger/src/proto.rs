@@ -27,6 +27,10 @@ pub enum Request {
         /// decimal string) or a Matrix event id (`$...`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        /// @mention this allow-listed person (name or MXID): `m.mentions`
+        /// plus a pill, one event, not combined with `reply_to`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mention: Option<String>,
     },
     /// Replace (`m.replace`) the text of a message the bridge itself sent
     /// earlier in the room `to` resolves to. `markdown` is the full new body;
@@ -38,6 +42,10 @@ pub enum Request {
         event_id: String,
         markdown: String,
         origin: String,
+        /// Keep an @mention of this allow-listed person in the new text; the
+        /// edit does not notify again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mention: Option<String>,
     },
     /// Upload a local file (absolute path, read by the daemon) as an attachment.
     SendFile {
@@ -173,6 +181,7 @@ mod tests {
             markdown: "# hi".into(),
             origin: "x@y".into(),
             reply_to: None,
+            mention: None,
         };
         let line = encode_line(&r);
         assert!(line.contains("\"op\":\"send_message\""));
@@ -194,6 +203,7 @@ mod tests {
                 event_id: "$orig:x".into(),
                 markdown: "# Train Report".into(),
                 origin: "trains@nuc10".into(),
+                mention: None,
             }
         );
         let line = encode_line(&r);

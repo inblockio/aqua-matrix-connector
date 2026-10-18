@@ -52,6 +52,19 @@ pub enum Dest {
     Room(String),
 }
 
+/// An intentional @mention (`m.mentions` + matrix.to pill) of an
+/// allow-listed person, so they are notified even where only mentions notify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mention {
+    pub mxid: String,
+    /// The allow-list name, the pill's visible text.
+    pub display: String,
+}
+
+/// A message with a mention goes out as one event, so it stays below the size
+/// at which `send_message` splits a text into several events.
+pub const MAX_MENTION_BYTES: usize = 6_000;
+
 /// The message a send replies to, as far as the engine knows it. `room_id`,
 /// `sender` and `thread_root` are known when the target is an inbox entry;
 /// for a bare event id they are `None` and the transport loads the event from
@@ -104,12 +117,25 @@ pub trait Transport: Send + Sync + 'static {
     ) -> Result<Sent, String>;
     /// Download, decrypt and verify an inbound attachment.
     async fn fetch(&self, req: FetchRequest) -> Result<Fetched, String>;
+    /// Send `markdown` to `to` as one event that @mentions `mention` (a
+    /// socket field, no MCP parameter). Default: not supported.
+    async fn send_mention(&self, to: &Dest, markdown: &str, mention: &Mention) -> Result<Sent, String> {
+        let _ = (to, markdown, mention);
+        Err("mentions are not supported by this messenger".into())
+    }
     /// Replace (`m.replace`) the text of `event_id`, a message this identity
     /// sent earlier in the room `to` resolves to, with `markdown` (a socket
     /// op, no MCP tool). The transport checks the original may be edited.
-    /// Default: not supported.
-    async fn edit_text(&self, to: &Dest, event_id: &str, markdown: &str) -> Result<Sent, String> {
-        let _ = (to, event_id, markdown);
+    /// With `mention`, the new text keeps the @mention without notifying
+    /// again: it counts as made by the original. Default: not supported.
+    async fn edit_text(
+        &self,
+        to: &Dest,
+        event_id: &str,
+        markdown: &str,
+        mention: Option<&Mention>,
+    ) -> Result<Sent, String> {
+        let _ = (to, event_id, markdown, mention);
         Err("editing messages is not supported by this messenger".into())
     }
 }
@@ -485,6 +511,30 @@ impl<T: Transport> Engine<T> {
     // ---- request side ----------------------------------------------------
 
     /// Resolve a `to` argument to an allow-listed person or listed room.
+    /// Resolve a `mention` argument: an allow-listed person (name or MXID),
+    /// never a room. Empty or absent = no mention.
+    fn mention_for(&self, mention: Option<&str>) -> Result<Option<Mention>, String> {
+        let Some(m) = mention.map(str::trim).filter(|m| !m.is_empty()) else {
+            return Ok(None);
+        };
+        match self.resolve_to(m) {
+            Ok(Resolved {
+                name,
+                id,
+                dest: Dest::Person(_),
+            }) => Ok(Some(Mention {
+                mxid: id,
+                display: name,
+            })),
+            Ok(_) => Err(format!(
+                "mention {m:?} is a room; a mention names an allow-listed person"
+            )),
+            Err(_) => Err(format!(
+                "REFUSED: mention {m:?} is not an allow-listed person (see list_recipients)"
+            )),
+        }
+    }
+
     pub fn resolve_to(&self, to: &str) -> Result<Resolved, String> {
         let mut allow = self.allow.lock().unwrap();
         allow.reload(false);
@@ -623,6 +673,7 @@ impl<T: Transport> Engine<T> {
                 markdown,
                 origin,
                 reply_to,
+                mention,
             } => {
                 if let Err(r) = self.tool_enabled(jsonrpc::T_SEND_MESSAGE) {
                     return r;
@@ -641,20 +692,38 @@ impl<T: Transport> Engine<T> {
                         l.max_message_bytes
                     ));
                 }
+                let mention = match self.mention_for(mention.as_deref()) {
+                    Ok(m) => m,
+                    Err(e) => return Response::err(e),
+                };
+                if mention.is_some() {
+                    if reply_to.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+                        return Response::err("send_message takes `mention` or `reply_to`, not both");
+                    }
+                    if markdown.len() > MAX_MENTION_BYTES {
+                        return Response::err(format!(
+                            "a message with a mention is sent as one event: at most {MAX_MENTION_BYTES} bytes, this one is {}",
+                            markdown.len()
+                        ));
+                    }
+                }
                 let body = if self.profile.tag_origin {
                     format::tag_markdown(&markdown, &origin)
                 } else {
                     markdown.clone()
                 };
-                let bytes = markdown.len();
-                self.send(
-                    &to,
-                    Outgoing::Text(body),
-                    &origin,
-                    reply_to.as_deref(),
-                    json!({"kind": "text", "bytes": bytes}),
-                )
-                .await
+                let mut info = json!({"kind": "text", "bytes": markdown.len()});
+                if let Some(m) = &mention {
+                    info["mention"] = json!(m.display);
+                }
+                let out = match mention {
+                    None => Outgoing::Text(body),
+                    Some(mention) => Outgoing::Mention {
+                        markdown: body,
+                        mention,
+                    },
+                };
+                self.send(&to, out, &origin, reply_to.as_deref(), info).await
             }
             Request::SendFile {
                 to,
@@ -781,6 +850,7 @@ impl<T: Transport> Engine<T> {
                 event_id,
                 markdown,
                 origin,
+                mention,
             } => {
                 let to = match self.to_or_default(&to, "edit_message", "`event_id`") {
                     Ok(t) => t,
@@ -806,12 +876,20 @@ impl<T: Transport> Engine<T> {
                 } else {
                     markdown.clone()
                 };
-                let info = json!({"kind": "edit", "bytes": markdown.len(), "replaces": original});
+                let mention = match self.mention_for(mention.as_deref()) {
+                    Ok(m) => m,
+                    Err(e) => return Response::err(e),
+                };
+                let mut info = json!({"kind": "edit", "bytes": markdown.len(), "replaces": original});
+                if let Some(m) = &mention {
+                    info["mention"] = json!(m.display);
+                }
                 self.send(
                     &to,
                     Outgoing::Edit {
                         event_id: original,
                         markdown: body,
+                        mention,
                     },
                     &origin,
                     None,
@@ -1088,8 +1166,17 @@ impl<T: Transport> Engine<T> {
                     .send_file(&dest, path, caption, reply.as_ref())
                     .await
             }
-            Outgoing::Edit { event_id, markdown } => {
-                self.transport.edit_text(&dest, event_id, markdown).await
+            Outgoing::Mention { markdown, mention } => {
+                self.transport.send_mention(&dest, markdown, mention).await
+            }
+            Outgoing::Edit {
+                event_id,
+                markdown,
+                mention,
+            } => {
+                self.transport
+                    .edit_text(&dest, event_id, markdown, mention.as_ref())
+                    .await
             }
         };
         match outcome {
@@ -1255,6 +1342,11 @@ fn apply_from(q: &mut Query, f: Option<FromFilter>) {
 
 enum Outgoing {
     Text(String),
+    /// One text event that @mentions an allow-listed person.
+    Mention {
+        markdown: String,
+        mention: Mention,
+    },
     File {
         path: PathBuf,
         caption: String,
@@ -1263,6 +1355,7 @@ enum Outgoing {
     Edit {
         event_id: String,
         markdown: String,
+        mention: Option<Mention>,
     },
 }
 

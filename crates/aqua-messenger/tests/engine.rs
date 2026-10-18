@@ -12,7 +12,7 @@ use aqua_messenger::inbox::{InboxPolicy, MediaRef, NewEntry};
 use aqua_messenger::mcp::{call_tool, SocketBackend};
 use aqua_messenger::proto::Request;
 use aqua_messenger::{
-    jsonrpc, server, Dest, Engine, FetchRequest, Fetched, Profile, ReplyRef, Sent, Transport,
+    jsonrpc, server, Dest, Engine, FetchRequest, Fetched, Mention, Profile, ReplyRef, Sent, Transport,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -54,13 +54,24 @@ impl Transport for Mock {
         self.send_text(to, &format!("FILE {} {caption}", path.display()), reply)
             .await
     }
-    async fn edit_text(&self, to: &Dest, event_id: &str, md: &str) -> Result<Sent, String> {
+    async fn send_mention(&self, to: &Dest, md: &str, m: &Mention) -> Result<Sent, String> {
+        self.send_text(to, &format!("MENTION {} {md}", m.mxid), None)
+            .await
+    }
+    async fn edit_text(
+        &self,
+        to: &Dest,
+        event_id: &str,
+        md: &str,
+        mention: Option<&Mention>,
+    ) -> Result<Sent, String> {
         if event_id.starts_with("$foreign") {
             return Err(format!(
                 "REFUSED: event {event_id} was sent by someone else"
             ));
         }
-        self.send_text(to, &format!("EDIT {event_id} {md}"), None)
+        let m = mention.map(|m| format!("MENTION {} ", m.mxid)).unwrap_or_default();
+        self.send_text(to, &format!("EDIT {event_id} {m}{md}"), None)
             .await
     }
     async fn fetch(&self, req: FetchRequest) -> Result<Fetched, String> {
@@ -950,6 +961,7 @@ fn edit(to: &str, event_id: &str, md: &str) -> Request {
         event_id: event_id.into(),
         markdown: md.into(),
         origin: "trains@nuc10".into(),
+        mention: None,
     }
 }
 
@@ -1049,5 +1061,70 @@ async fn edit_is_refused_where_the_transport_cannot_edit() {
     );
     let r = e.handle(edit("owner", "$o:x", "x")).await;
     assert!(r.error.unwrap().contains("not supported"));
+    let r = e.handle(mention_send("owner", "owner", "x")).await;
+    assert!(r.error.unwrap().contains("not supported"));
+    let _ = std::fs::remove_dir_all(d);
+}
+
+fn mention_send(to: &str, mention: &str, md: &str) -> Request {
+    Request::SendMessage {
+        to: to.into(),
+        markdown: md.into(),
+        origin: "trains@nuc10".into(),
+        reply_to: None,
+        mention: Some(mention.into()),
+    }
+}
+
+#[tokio::test]
+async fn mention_names_one_allowlisted_person_and_survives_edits() {
+    let (e, d) = host_with("mention", InboxPolicy::default());
+    let r = e
+        .handle(mention_send("daily-updates", "tim", "Needs you: a go"))
+        .await;
+    assert!(r.ok, "{r:?}");
+    let r = e
+        .handle(Request::EditMessage {
+            to: "daily-updates".into(),
+            event_id: "$orig:x".into(),
+            markdown: "v2".into(),
+            origin: "trains@nuc10".into(),
+            mention: Some("@tim:localhost".into()),
+        })
+        .await;
+    assert!(r.ok, "{r:?}");
+    let sent = e.transport().sent.lock().unwrap().clone();
+    assert_eq!(sent[0].0, Dest::Room("!daily:localhost".into()));
+    assert!(
+        sent[0].1.starts_with("MENTION @tim:localhost Needs you: a go\n\n<sub>via"),
+        "{}",
+        sent[0].1
+    );
+    assert!(
+        sent[1].1.starts_with("EDIT $orig:x MENTION @tim:localhost v2"),
+        "{}",
+        sent[1].1
+    );
+    let audit = std::fs::read_to_string(d.join("audit.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(audit.lines().last().unwrap()).unwrap();
+    assert_eq!(
+        (last["kind"].as_str(), last["mention"].as_str()),
+        (Some("edit"), Some("tim"))
+    );
+
+    // refusals take no rate slot
+    let err = |r: aqua_messenger::proto::Response| r.error.unwrap();
+    assert!(err(e.handle(mention_send("tim", "daily-updates", "x")).await).contains("is a room"));
+    assert!(err(e.handle(mention_send("tim", "mallory", "x")).await).starts_with("REFUSED"));
+    assert!(
+        err(e.handle(mention_send("tim", "tim", &"x".repeat(6_001))).await).contains("one event")
+    );
+    let mut both = mention_send("tim", "tim", "x");
+    if let Request::SendMessage { reply_to, .. } = &mut both {
+        *reply_to = Some("$q:x".into());
+    }
+    assert!(err(e.handle(both).await).contains("not both"));
+    assert_eq!(sends_left(&e, "tim").await, 20);
+    assert_eq!(sends_left(&e, "daily-updates").await, 18);
     let _ = std::fs::remove_dir_all(d);
 }
