@@ -199,6 +199,7 @@ pub fn build_request(
                     markdown: md.into(),
                     origin: origin(args),
                     reply_to: reply_to_arg(args)?,
+                    mention: None,
                 },
                 SEND_TIMEOUT,
             )

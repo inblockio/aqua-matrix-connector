@@ -39,7 +39,7 @@ pub mod ratelimit;
 pub mod server;
 
 pub use engine::{
-    Dest, Engine, FetchRequest, Fetched, ReplyRef, SeenRoom, Sent, Status, Transport,
+    Dest, Engine, FetchRequest, Fetched, Mention, ReplyRef, SeenRoom, Sent, Status, Transport,
 };
 pub use profile::{Limits, Profile};
 

@@ -7,8 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use matrix_sdk::ruma::events::room::message::{
     MessageType, Relation, ReplacementMetadata, RoomMessageEventContent,
 };
-use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent};
-use matrix_sdk::ruma::{EventId, OwnedEventId, RoomId, UserId};
+use aqua_matrix_agent::{mention_content, RoomMention};
+use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::Client;
 
 /// Largest serialized replacement content accepted, in bytes. Matrix caps a
@@ -20,10 +21,26 @@ pub const MAX_EDIT_CONTENT_BYTES: usize = 44_000;
 
 /// The replacement for `original`: `markdown` rendered exactly as
 /// `send_message` renders it, carried in `m.new_content`, with the `* `
-/// fallback body for clients without edit support.
-pub fn replacement(markdown: &str, original: OwnedEventId) -> RoomMessageEventContent {
-    RoomMessageEventContent::text_markdown(markdown)
-        .make_replacement(ReplacementMetadata::new(original, None))
+/// fallback body for clients without edit support. With `mention`, the new
+/// content keeps the mention (pill and `m.mentions`), and the mention is
+/// passed as the original's, so only new mentions would notify: an edit
+/// never pings.
+pub fn replacement(
+    markdown: &str,
+    original: OwnedEventId,
+    mention: Option<&RoomMention<'_>>,
+) -> Result<RoomMessageEventContent, String> {
+    let Some(m) = mention else {
+        return Ok(RoomMessageEventContent::text_markdown(markdown)
+            .make_replacement(ReplacementMetadata::new(original, None)));
+    };
+    let user = OwnedUserId::try_from(m.user_id)
+        .map_err(|e| format!("invalid mention user id {:?}: {e}", m.user_id))?;
+    let content = mention_content(markdown, m).map_err(|e| e.to_string())?;
+    Ok(content.make_replacement(ReplacementMetadata::new(
+        original,
+        Some(Mentions::with_user_ids([user])),
+    )))
 }
 
 /// Refuse a replacement whose encoded content would push the event past the
@@ -139,7 +156,7 @@ mod tests {
     #[test]
     fn replacement_carries_the_new_text_and_a_fallback() {
         let md = "# Train Report\n\n- **green**: 3 trains";
-        let content = replacement(md, OwnedEventId::try_from("$orig:x").unwrap());
+        let content = replacement(md, OwnedEventId::try_from("$orig:x").unwrap(), None).unwrap();
         let v = serde_json::to_value(&content).unwrap();
         assert_eq!(v["m.relates_to"]["rel_type"], "m.replace");
         assert_eq!(v["m.relates_to"]["event_id"], "$orig:x");
@@ -155,10 +172,32 @@ mod tests {
     }
 
     #[test]
+    fn replacement_with_a_mention_keeps_it_without_notifying_again() {
+        let m = RoomMention {
+            user_id: "@tim:x",
+            display: "tim",
+        };
+        let id = OwnedEventId::try_from("$orig:x").unwrap();
+        let v = serde_json::to_value(replacement("Needs you: a go", id.clone(), Some(&m)).unwrap())
+            .unwrap();
+        assert_eq!(v["m.new_content"]["m.mentions"]["user_ids"], json!(["@tim:x"]));
+        let html = v["m.new_content"]["formatted_body"].as_str().unwrap();
+        assert!(html.contains("https://matrix.to/#/@tim:x"), "{html}");
+        // only new mentions notify, and the original already made this one
+        let top = v["m.mentions"]["user_ids"].as_array().map(Vec::len);
+        assert_eq!(top.unwrap_or(0), 0, "{v}");
+        let bad = RoomMention {
+            user_id: "tim",
+            display: "tim",
+        };
+        assert!(replacement("x", id, Some(&bad)).is_err());
+    }
+
+    #[test]
     fn replacement_renders_like_send_message() {
         let md = aqua_system_bridge::format::tag_markdown("| a | b |\n|---|---|\n| 1 | 2 |", "r@h");
         let sent = serde_json::to_value(RoomMessageEventContent::text_markdown(&md)).unwrap();
-        let edit = serde_json::to_value(replacement(&md, OwnedEventId::try_from("$o:x").unwrap()))
+        let edit = serde_json::to_value(replacement(&md, OwnedEventId::try_from("$o:x").unwrap(), None).unwrap())
             .unwrap();
         assert_eq!(edit["m.new_content"]["body"], sent["body"]);
         assert_eq!(
@@ -170,10 +209,10 @@ mod tests {
     #[test]
     fn oversized_edits_are_refused() {
         let id = OwnedEventId::try_from("$o:x").unwrap();
-        assert!(check_size(&replacement("short report", id.clone())).is_ok());
+        assert!(check_size(&replacement("short report", id.clone(), None).unwrap()).is_ok());
         let max = aqua_system_bridge::MAX_MESSAGE_BYTES;
         let table = format!("| c | c |\n|---|---|\n{}", "| a | b |\n".repeat(max / 10));
-        let e = check_size(&replacement(&table[..max], id)).unwrap_err();
+        let e = check_size(&replacement(&table[..max], id, None).unwrap()).unwrap_err();
         assert!(e.contains("cap is"), "{e}");
     }
 

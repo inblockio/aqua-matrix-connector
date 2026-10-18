@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aqua_messenger::inbox::MediaRef;
-use aqua_messenger::{Dest, FetchRequest, Fetched, ReplyRef, Sent, Transport};
+use aqua_matrix_agent::{mention_content, RoomMention};
+use aqua_messenger::{Dest, FetchRequest, Fetched, Mention, ReplyRef, Sent, Transport};
 use async_trait::async_trait;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::OwnedEventId;
@@ -25,6 +26,8 @@ pub const SEND_DEADLINE: Duration = Duration::from_secs(170);
 
 pub enum SendKind {
     Text(String),
+    /// A new message whose content is already built (a mention).
+    Content(Box<RoomMessageEventContent>),
     File {
         path: PathBuf,
         caption: String,
@@ -151,6 +154,24 @@ impl Transport for QueueTransport {
         )
     }
 
+    /// Built with the connector's `mention_content` (the notifier CLI's
+    /// `--mention`), so a bridge mention looks like one from the CLI.
+    async fn send_mention(&self, to: &Dest, markdown: &str, mention: &Mention) -> Result<Sent, String> {
+        let m = RoomMention {
+            user_id: &mention.mxid,
+            display: &mention.display,
+        };
+        let content = mention_content(markdown, &m).map_err(|e| e.to_string())?;
+        want_sent(
+            self.run(
+                Target::Dest(to.clone()),
+                SendKind::Content(Box::new(content)),
+                None,
+            )
+            .await,
+        )
+    }
+
     async fn fetch(&self, req: FetchRequest) -> Result<Fetched, String> {
         let kind = SendKind::Fetch {
             event_id: req.event_id,
@@ -168,10 +189,20 @@ impl Transport for QueueTransport {
     /// Build the `m.replace` content and check its encoded size here, before
     /// anything is queued; whether the original may be edited is checked on
     /// the live Client in the destination room ([`crate::edit::ensure_editable`]).
-    async fn edit_text(&self, to: &Dest, event_id: &str, markdown: &str) -> Result<Sent, String> {
+    async fn edit_text(
+        &self,
+        to: &Dest,
+        event_id: &str,
+        markdown: &str,
+        mention: Option<&Mention>,
+    ) -> Result<Sent, String> {
         let original = OwnedEventId::try_from(event_id.trim())
             .map_err(|e| format!("invalid event id {event_id:?}: {e}"))?;
-        let content = crate::edit::replacement(markdown, original.clone());
+        let mention = mention.map(|m| RoomMention {
+            user_id: &m.mxid,
+            display: &m.display,
+        });
+        let content = crate::edit::replacement(markdown, original.clone(), mention.as_ref())?;
         crate::edit::check_size(&content)?;
         want_sent(
             self.run(
@@ -414,6 +445,7 @@ room_id = "!daily:x"
                 markdown: "answer".into(),
                 origin: "t@h".into(),
                 reply_to: Some(seq.unwrap().to_string()),
+                mention: None,
             })
             .await;
         assert!(r.ok, "{r:?}");
@@ -430,6 +462,7 @@ room_id = "!daily:x"
             event_id: event_id.into(),
             markdown: md.into(),
             origin: "trains@nuc10".into(),
+            mention: None,
         };
         // within the send_message cap, but too large as one edit event: refused
         // before anything reaches the Matrix loop
