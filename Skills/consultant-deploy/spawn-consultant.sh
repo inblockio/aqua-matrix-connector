@@ -288,7 +288,7 @@ PERSONA_HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/consultant-perso
 # Grounding repos, mounted ro at /refs/<name>. This ONE list drives the presence check,
 # the freshness pass, and the podman -v flags, so the three can never drift apart.
 # Keep it in sync with ref_mounts in consultant-config.template.json.
-REFS_REPOS=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
+REFS_REPOS=(aqua-rs-sdk aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
 # Per-consultant extra refs (host.extra_refs): clean clones live under REFS_MIRROR, one
 # dir per repo, cloned from REFS_REMOTE/<repo>.git. Disk only: /tmp is RAM-backed on this host.
 REFS_MIRROR="${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs}"

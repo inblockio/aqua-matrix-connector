@@ -66,7 +66,7 @@ NOGIT_BIN="$SB/nogit-bin"; STUB="$SB/stub/aqua-agent-refs"; STUB_ROOT="$SB/agent
 STUB_LOG="$SB/stub.log"; SIDE_EFFECTS="$SB/side-effects.log"; GIT_LOG="$SB/git.log"; RUNNING="$SB/container.running"
 TOKEN_FILE="$FAKE_HOME/.aqua-matrix-heartbeat/claude-oauth-token"; AL="$SB/allowlist.toml"
 TARGET='@did-key-zfaketestpeer:matrix.inblock.io'
-REFS_LIST=(aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
+REFS_LIST=(aqua-rs-sdk aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
 mkdir -p "$FAKE_HOME/.aqua-matrix-heartbeat" "$TEST_DIR" "$REFS_BASE" "$SHIM_BIN" "$NOGIT_BIN" "$SB/stub" "$STUB_ROOT/agents" "$STUB_ROOT/views" "$SB/out"
 echo fake-token > "$TOKEN_FILE"
 cp "$TEMPLATE" "$TEST_DIR/consultant-config.template.json"
@@ -251,7 +251,7 @@ runp seed_b --label beta --target "$TARGET" --persona Galene --name Other
 RUN_ENV=()
 cp "$SB/out/seed_a.argv" "$SB/legacy_a.argv"
 seed_session alpha
-check "seed: alpha legacy argv has the six fleet mounts" bash -c '[ "$(grep -c ":/refs/[^:]*:ro$" "$1")" -eq 6 ]' _ "$SB/legacy_a.argv"
+check "seed: alpha legacy argv has the five fleet mounts" bash -c '[ "$(grep -c ":/refs/[^:]*:ro$" "$1")" -eq 5 ]' _ "$SB/legacy_a.argv"
 
 echo "== list present: --print-run uses path + check, one view mount in the fleet position"
 make_list "$ALPHA"; VIEW_A="$STUB_ROOT/views/$ALPHA"
@@ -260,7 +260,7 @@ check "exit 0" [ "$rc" -eq 0 ]
 check "tool calls: path then check, nothing else" [ "$(stub_cmds)" = "path check " ]
 check "check argv is exactly: check --agent=<STEM> (equals form)" grep -qxF "check|--agent=$ALPHA|" "$STUB_LOG"
 check "exactly one /refs mount: the view, read-only" [ "$(refs_seq l1)" = "$VIEW_A:/refs:ro" ]
-check "whole argv == legacy argv with the six fleet mounts replaced by the view mount (same position)" \
+check "whole argv == legacy argv with the five fleet mounts replaced by the view mount (same position)" \
   bash -c '[ "$(cat "$1")" = "$2" ]' _ "$SB/out/l1.argv" "$(subst_refs "$SB/legacy_a.argv" "$VIEW_A")"
 check "no fleet mount, no /refs/<repo> mount" bash -c '! grep -q ":/refs/" "$1"' _ "$SB/out/l1.argv"
 check "git never called (no working-checkout freshness pass)" no_git
@@ -323,15 +323,15 @@ echo "== new consultant: add (REFS_REPOS order, --wait 900), then path, then syn
 check "REFS_REPOS in the script matches the order this test expects" \
   bash -c '[ "$(grep -E "^REFS_REPOS=\(" "$1" | sed "s/^REFS_REPOS=(//; s/)\$//")" = "$2" ]' _ "$SPAWN" "${REFS_LIST[*]}"
 NEWSTEM=newbie-aqua-consultant
-add_line() { echo "add|--agent=$1|--wait|900|aqua-rs-sdk|aqua-spec|aqua-governance-corpus|aqua-ecosystem|aqua-compliance|inblockio.github.io|"; }
+add_line() { echo "add|--agent=$1|--wait|900|aqua-rs-sdk|aqua-governance-corpus|aqua-ecosystem|aqua-compliance|inblockio.github.io|"; }
 rm -f "$RUNNING"
 rc=0; runs n1 --label newbie --target "$TARGET" --persona Thalia --name Newbie || rc=$?
 check "exit 0 and launched" bash -c '[ "$1" -eq 0 ]' _ "$rc"
 check "tool call order: path (no list), add, path, sync" [ "$(stub_cmds)" = "path add path sync " ]
-check "add argv: --agent=<STEM> --wait 900 then the six REFS_REPOS in order" grep -qxF "$(add_line "$NEWSTEM")" "$STUB_LOG"
+check "add argv: --agent=<STEM> --wait 900 then the five REFS_REPOS in order" grep -qxF "$(add_line "$NEWSTEM")" "$STUB_LOG"
 check "every call used the equals form (the stub rejects the spaced one with exit 64)" bash -c '! grep -q "^[a-z]*|--agent|" "$1"' _ "$STUB_LOG"
 check "sync argv follows the add" grep -qxF "sync|--agent=$NEWSTEM|--wait|900|" "$STUB_LOG"
-check "list file now holds all six repos (the stub's add)" bash -c '[ "$(sort "$1/agents/$2.json" | tr "\n" " ")" = "$(printf "%s\n" '"${REFS_LIST[*]}"' | sort | tr "\n" " ")" ]' _ "$STUB_ROOT" "$NEWSTEM"
+check "list file now holds all five repos (the stub's add)" bash -c '[ "$(sort "$1/agents/$2.json" | tr "\n" " ")" = "$(printf "%s\n" '"${REFS_LIST[*]}"' | sort | tr "\n" " ")" ]' _ "$STUB_ROOT" "$NEWSTEM"
 check "podman run mounts the new view at /refs:ro, no /refs/<repo>" bash -c 'grep -qF -- "-v $2/views/$3:/refs:ro" "$1" && ! grep "^podman run" "$1" | grep -q ":/refs/"' _ "$SIDE_EFFECTS" "$STUB_ROOT" "$NEWSTEM"
 check "podman was only asked 'container exists' before the launch, never rm" bash -c 'grep -q "^podman container exists" "$1" && ! grep -q "^podman rm" "$1"' _ "$SIDE_EFFECTS"
 check "git never called" no_git
@@ -368,9 +368,9 @@ check "partial add: the list file exists with only two repos" bash -c '[ -e "$1/
 rm -f "$RUNNING"
 rc=0; runs pa2 --label partial --target "$TARGET" --persona Thalia --name Newbie || rc=$?
 check "retry: exit 0, launched" bash -c '[ "$1" -eq 0 ]' _ "$rc"
-check "retry: path now finds a list, but the consultant is still NEW, so add runs again with all six repos" \
+check "retry: path now finds a list, but the consultant is still NEW, so add runs again with all five repos" \
   bash -c '[ "$(cut -d"|" -f1 "$2" | tr "\n" " ")" = "path add path sync " ] && grep -qxF "$3" "$2"' _ "$rc" "$STUB_LOG" "$(add_line "$PSTEM")"
-check "retry: the list now holds all six repos" bash -c '[ "$(wc -l < "$1/agents/$2.json")" -eq 6 ]' _ "$STUB_ROOT" "$PSTEM"
+check "retry: the list now holds all five repos" bash -c '[ "$(wc -l < "$1/agents/$2.json")" -eq 5 ]' _ "$STUB_ROOT" "$PSTEM"
 check "retry: the view is mounted" grep -qF -- "-v $STUB_ROOT/views/$PSTEM:/refs:ro" "$SIDE_EFFECTS"
 rm -f "$RUNNING"
 
@@ -385,7 +385,7 @@ check "argv: exactly one /refs mount, a placeholder naming the stem (path-less)"
   [ "$(refs_seq n3)" = "<view dir of newbie3-aqua-consultant, known only after aqua-agent-refs add creates its list>:/refs:ro" ]
 # the preview rendered newbie3's config; a run with no tool takes the legacy path: its argv is the baseline
 RUN_ENV=( AGENT_REFS_BIN="$SB/none/aqua-agent-refs" ); runp n3b --label newbie3 --target "$TARGET" --persona Thalia --name Newbie; RUN_ENV=()
-check "whole argv == the legacy argv of the same consultant with the six fleet mounts replaced by the placeholder (same position)" \
+check "whole argv == the legacy argv of the same consultant with the five fleet mounts replaced by the placeholder (same position)" \
   bash -c '[ "$(cat "$1")" = "$2" ]' _ "$SB/out/n3.argv" "$(subst_refs "$SB/out/n3b.argv" "<view dir of newbie3-aqua-consultant, known only after aqua-agent-refs add creates its list>")"
 check "no git, no podman (a preview never asks podman)" bash -c '[ ! -e "$1" ] && [ ! -e "$2" ]' _ "$GIT_LOG" "$SIDE_EFFECTS"
 check "no dash characters in the output" no_dashes "$SB/out/n3.out" "$SB/out/n3.err"
@@ -396,7 +396,7 @@ rm -f "$RUNNING"
 rc=0; runs ps1 --label newbie3 --target "$TARGET" --persona Thalia --name Newbie || rc=$?
 check "real spawn after the preview: exit 0" bash -c '[ "$1" -eq 0 ]' _ "$rc"
 check "real spawn after the preview takes the NEW path: path, add, path, sync" [ "$(stub_cmds)" = "path add path sync " ]
-check "the add carries the six fleet repos" grep -qxF "$(add_line newbie3-aqua-consultant)" "$STUB_LOG"
+check "the add carries the five fleet repos" grep -qxF "$(add_line newbie3-aqua-consultant)" "$STUB_LOG"
 check "podman run mounts the view at /refs:ro and no /refs/<repo> (not the dev working trees)" bash -c 'grep -qF -- "-v $2/views/newbie3-aqua-consultant:/refs:ro" "$1" && ! grep "^podman run" "$1" | grep -q ":/refs/"' _ "$SIDE_EFFECTS" "$STUB_ROOT"
 rm -f "$RUNNING"
 
@@ -412,7 +412,7 @@ check "argv identical to the seed run and to the no-binary run" bash -c 'cmp -s 
 check "stdout identical to the no-binary run" cmp -s "$SB/out/e1.out" "$SB/out/e0.out"
 check "stderr identical to the no-binary run, minus its one warning line" \
   bash -c 'diff <(grep -v "^!! agent-refs: " "$1") "$2" >/dev/null' _ "$SB/out/e0.err" "$SB/out/e1.err"
-check "the six fleet mounts are in the argv, in REFS_REPOS order, from the REFS_BASE checkouts" \
+check "the five fleet mounts are in the argv, in REFS_REPOS order, from the REFS_BASE checkouts" \
   bash -c 'exp=""; for r in '"${REFS_LIST[*]}"'; do exp="$exp$2/$r:/refs/$r:ro"$'"'\\n'"'; done; [ "$(awk "prev==\"-v\" && /:\/refs\// {print} {prev=\$0}" "$1")" = "$(printf %s "$exp")" ]' _ "$SB/out/e1.argv" "$REFS_BASE"
 
 # (b) the same against the pre-change script (immutable commit), several shapes.
@@ -421,6 +421,10 @@ ORIG="$SB/orig"
 if [ -n "$REPO_ROOT" ] && git -C "$REPO_ROOT" cat-file -e "$PRE_CHANGE_COMMIT^{commit}" 2>/dev/null \
    && mkdir -p "$ORIG" && git -C "$REPO_ROOT" archive "$PRE_CHANGE_COMMIT" Skills/consultant-deploy | tar -x -C "$ORIG"; then
   ORIG_SPAWN="$ORIG/Skills/consultant-deploy/spawn-consultant.sh"
+  # The fleet list changed after this commit (aqua-spec dropped, 2026-10-20): give the reference script
+  # the current list, so the comparison still isolates the refs-path logic.
+  sed -i "s/^REFS_REPOS=(aqua-rs-sdk aqua-spec /REFS_REPOS=(aqua-rs-sdk /" "$ORIG_SPAWN"
+  grep -qx "$(grep "^REFS_REPOS=(" "$SPAWN")" "$ORIG_SPAWN" || { echo "!! reference script fleet list does not match" >&2; exit 1; }
   # real git for these scenarios (mirrors / follow mirrors must be real clones): PATH without the git shim
   MIRROR="$FAKE_HOME/.local/share/consultant-refs"; FOLLOW="$FAKE_HOME/.local/share/consultant-refs-follow"
   GITC=(git -c user.name=test -c user.email=test@example.invalid)
@@ -469,8 +473,8 @@ fi
 rc=0; runs e2 --replace --keep-config --label alpha --no-refresh-refs || rc=$?
 check "real spawn, no list: exit 0, only path asked" bash -c '[ "$1" -eq 0 ]' _ "$rc"
 check "real spawn, no list: only path asked" [ "$(stub_cmds)" = "path " ]
-check "real spawn, no list: podman run carries the six fleet mounts" \
-  bash -c '[ "$(grep "^podman run" "$1" | grep -o -- "-v [^ ]*:/refs/[^ ]*:ro" | wc -l)" -eq 6 ]' _ "$SIDE_EFFECTS"
+check "real spawn, no list: podman run carries the five fleet mounts" \
+  bash -c '[ "$(grep "^podman run" "$1" | grep -o -- "-v [^ ]*:/refs/[^ ]*:ro" | wc -l)" -eq 5 ]' _ "$SIDE_EFFECTS"
 rm -f "$RUNNING"
 
 echo "== tool not installed: legacy with ONE warning (existing and new), default name on PATH works"
@@ -482,7 +486,7 @@ check "existing consultant: exactly one warning line, naming the tool and the pa
 rc=0; runp m2 --label brandnew --target "$TARGET" --persona Thalia --name Tester || rc=$?
 check "NEW consultant: also legacy (the script stays usable before the install), one warning" \
   bash -c '[ "$1" -eq 0 ] && [ "$(grep -c "^-v$" "$2")" -ge 6 ] && [ "$(grep -c "^!! agent-refs: " "$3")" -eq 1 ] && grep -q "new consultant brandnew-aqua-consultant keeps the legacy refs path" "$3"' _ "$rc" "$SB/out/m2.argv" "$SB/out/m2.err"
-check "NEW consultant: six fleet mounts, no list created anywhere" bash -c '[ "$(grep -c ":/refs/[^:]*:ro$" "$1")" -eq 6 ] && [ ! -e "$2/agents/brandnew-aqua-consultant.json" ]' _ "$SB/out/m2.argv" "$STUB_ROOT"
+check "NEW consultant: five fleet mounts, no list created anywhere" bash -c '[ "$(grep -c ":/refs/[^:]*:ro$" "$1")" -eq 5 ] && [ ! -e "$2/agents/brandnew-aqua-consultant.json" ]' _ "$SB/out/m2.argv" "$STUB_ROOT"
 RUN_ENV=()
 # the default name, found on PATH
 mkdir -p "$SB/pathbin"; cp "$STUB" "$SB/pathbin/aqua-agent-refs"
@@ -511,22 +515,22 @@ echo "== existing vs new is decided by the store identity or the container, neve
 # (a) a store identity but no list stays legacy, with or without a config; print-run and real spawn
 seed_session stored
 rc=0; runp c1 --label stored --target "$TARGET" --persona Thalia --name Tester || rc=$?
-check "persisted session, no list, no config yet (print-run): legacy (six fleet mounts), only path asked" bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/[^:]*:ro$" "$2")" -eq 6 ] && [ "$(cut -d"|" -f1 "$3" | tr "\n" " ")" = "path " ]' _ "$rc" "$SB/out/c1.argv" "$STUB_LOG"
+check "persisted session, no list, no config yet (print-run): legacy (five fleet mounts), only path asked" bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/[^:]*:ro$" "$2")" -eq 5 ] && [ "$(cut -d"|" -f1 "$3" | tr "\n" " ")" = "path " ]' _ "$rc" "$SB/out/c1.argv" "$STUB_LOG"
 rm -f "$RUNNING"
 rc=0; runs c2 --label stored --target "$TARGET" --persona Thalia --name Tester || rc=$?
-check "persisted session, no list (real spawn): legacy, six fleet mounts in podman run, no add, no view" bash -c '[ "$1" -eq 0 ] && [ "$(grep "^podman run" "$2" | grep -o -- "-v [^ ]*:/refs/[^ ]*:ro" | wc -l)" -eq 6 ] && [ "$(cut -d"|" -f1 "$3" | tr "\n" " ")" = "path " ]' _ "$rc" "$SIDE_EFFECTS" "$STUB_LOG"
+check "persisted session, no list (real spawn): legacy, five fleet mounts in podman run, no add, no view" bash -c '[ "$1" -eq 0 ] && [ "$(grep "^podman run" "$2" | grep -o -- "-v [^ ]*:/refs/[^ ]*:ro" | wc -l)" -eq 5 ] && [ "$(cut -d"|" -f1 "$3" | tr "\n" " ")" = "path " ]' _ "$rc" "$SIDE_EFFECTS" "$STUB_LOG"
 rm -f "$RUNNING"
 # (b) agent.pem alone is an identity; an EMPTY agent.pem is not
 mkdir -p "$TEST_DIR/pemonly-aqua-consultant-persist/store"; printf 'key\n' > "$TEST_DIR/pemonly-aqua-consultant-persist/store/agent.pem"
 rc=0; runp c3 --label pemonly --target "$TARGET" --persona Thalia --name Tester || rc=$?
-check "agent.pem in the store (no session yet): existing, legacy" bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/[^:]*:ro$" "$2")" -eq 6 ]' _ "$rc" "$SB/out/c3.argv"
+check "agent.pem in the store (no session yet): existing, legacy" bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/[^:]*:ro$" "$2")" -eq 5 ]' _ "$rc" "$SB/out/c3.argv"
 mkdir -p "$TEST_DIR/emptypem-aqua-consultant-persist/store"; : > "$TEST_DIR/emptypem-aqua-consultant-persist/store/agent.pem"
 rc=0; runp c4 --label emptypem --target "$TARGET" --persona Thalia --name Tester || rc=$?
 check "an empty agent.pem is no identity: new, placeholder view mount" bash -c '[ "$1" -eq 0 ] && grep -q "^<view dir of emptypem-aqua-consultant, known only after" "$2"' _ "$rc" "$SB/out/c4.argv"
 # (c) a container but no store identity and no config: existing (real spawn only asks podman)
 touch "$RUNNING"
 rc=0; runs c5 --replace --label ctronly --target "$TARGET" --persona Thalia --name Tester || rc=$?
-check "container exists, no identity yet: existing, legacy path (six fleet mounts), only path asked" bash -c '[ "$1" -eq 0 ] && [ "$(grep "^podman run" "$2" | grep -o -- "-v [^ ]*:/refs/[^ ]*:ro" | wc -l)" -eq 6 ] && [ "$(cut -d"|" -f1 "$3" | tr "\n" " ")" = "path " ] && grep -q "^podman container exists aqua-agent-ctronly-aqua-consultant-1" "$2"' _ "$rc" "$SIDE_EFFECTS" "$STUB_LOG"
+check "container exists, no identity yet: existing, legacy path (five fleet mounts), only path asked" bash -c '[ "$1" -eq 0 ] && [ "$(grep "^podman run" "$2" | grep -o -- "-v [^ ]*:/refs/[^ ]*:ro" | wc -l)" -eq 5 ] && [ "$(cut -d"|" -f1 "$3" | tr "\n" " ")" = "path " ] && grep -q "^podman container exists aqua-agent-ctronly-aqua-consultant-1" "$2"' _ "$rc" "$SIDE_EFFECTS" "$STUB_LOG"
 rm -f "$RUNNING"
 # (d) neither: a config file alone (left by a preview or a failed first spawn) does NOT make it existing
 rc=0; runp c6 --label cfgonly --target "$TARGET" --persona Thalia --name Tester || rc=$?
