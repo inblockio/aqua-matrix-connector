@@ -68,26 +68,44 @@
 # Per-agent refs lists (aqua-agent-refs; design: inblockio/aqua-agents, docs/plans/2026-10-19-agent-refs.md).
 # The switch is a list file, <AGENT_REFS_ROOT>/agents/<STEM>.json, written only by the aqua-agent-refs
 # tool. Everything above is the LEGACY path. The path is decided right after the host block is validated
-# and before any side effect, by asking the tool: `$AGENT_REFS_BIN path --agent <STEM>`:
-#   exit 0  the agent HAS a list; stdout is its view dir. A real spawn runs `sync --agent <STEM> --wait 900`
-#           (exit 0 or 3 proceed, 3 warns that some repos are stale; anything else aborts before the config
-#           render, the --replace removal or any container change). --print-run / --no-refresh-refs run
-#           `check --agent <STEM>` instead (non-zero aborts). The view is mounted `-v <view>:/refs:ro` as the
-#           ONLY refs mount, where the fleet mounts sat in the argv: no REFS_REPOS checkouts, no
-#           host.extra_refs / host.refs_follow mounts (a config that carries them gets one line saying they
-#           are ignored), no working-checkout freshness pass. Repos change live, no respawn:
-#           `aqua-agent-refs add|remove --agent <STEM> <repo>`.
-#   exit 2  no list. An EXISTING consultant (its config file exists) keeps the legacy path, argv byte for
-#           byte. A NEW consultant gets its list created from REFS_REPOS (`add --agent <STEM>
-#           <REFS_REPOS...>`; a real spawn only, --print-run creates nothing and prints what would be
-#           added), then as for exit 0. A --print-run renders the config, so a real spawn AFTER a preview
-#           sees an existing consultant and stays legacy unless the add was run first.
-#   other   (or an unusable answer): abort, nothing changed (fail closed).
+# and before any side effect, by asking the tool: `$AGENT_REFS_BIN path --agent=<STEM>` (equals form in every
+# call, so a STEM starting with a dash is never parsed as a flag). Exit codes of `path`:
+#   exit 0  the agent HAS a list; stdout is its view dir. The view must be exactly <AGENT_REFS_ROOT>/views/<STEM>
+#           (compared after `realpath -m` on both sides, nothing stripped from the answer: a trailing carriage
+#           return, a second line, a colon or a relative path is refused), and a directory that is not a
+#           symlink. That is checked after the sync / check below and AGAIN right before `podman run`.
+#   exit 5  the agent has NO list file (and only then). The script also requires that neither the list file
+#           exists nor is a symlink: if it does, the tool and the disk disagree and the spawn aborts.
+#   other   (exit 2 = usage / invalid key / settings error, 1, 3, 4, 127, an old tool that answers 2 for
+#           "no list", an unusable answer): abort, nothing changed. Fail closed: an error must never turn into
+#           the legacy path, which could bring a repo back that was removed from the agent's list.
+# Existing or new consultant. A consultant is EXISTING when it already has an identity or a container, NEVER
+# decided by its config file (a --print-run renders the config, and a failed first spawn leaves one too):
+#   - $STORE/agent.pem is non-empty (the DID the agent minted on its first connect; the same check that prints
+#     "identity PRESERVED" at launch), or $STORE/config.toml holds a [session] user_id (what --print-mxid reads), or
+#   - the container $NAME exists (`podman container exists`, REAL spawns only: --print-run never calls podman, so
+#     a preview classifies by the store alone; any answer other than exists / does not exist aborts).
+# Anything else is NEW. --fresh and --replace do not change the class (it is decided before the wipe / removal).
+#   existing + list   exit 0 above. A real spawn runs `sync --agent=<STEM> --wait 900` (exit 0 or 3 proceed, 3 warns
+#                     that some repos are stale; anything else aborts before the config render, the --replace
+#                     removal or any container change). --print-run / --no-refresh-refs run `check --agent=<STEM>`
+#                     instead (non-zero aborts). The view is mounted `-v <view>:/refs:ro` as the ONLY refs mount,
+#                     where the fleet mounts sat in the argv: no REFS_REPOS checkouts, no host.extra_refs /
+#                     host.refs_follow mounts (a config that carries them gets one line saying they are ignored),
+#                     no working-checkout freshness pass. Repos change live, no respawn:
+#                     `aqua-agent-refs add|remove --agent=<STEM> <repo>`.
+#   existing, no list  (exit 5) the legacy path, argv byte for byte.
+#   new               ALWAYS `add --agent=<STEM> --wait 900 <REFS_REPOS...>` first, with or without a list file:
+#                     add is idempotent (listed repos are kept), so a retry after a PARTIAL add (the tool wrote a
+#                     list and exited 1) tops up the missing fleet repos. Exit 0 or 3 proceed (3 warns), anything
+#                     else aborts with a note that a partial list may exist (`aqua-agent-refs list --agent=<STEM>`).
+#                     Then `path`, `sync` and the mount, as for an existing agent with a list. --print-run creates
+#                     nothing: it prints what the add would be and a placeholder as the /refs source.
 # Tool not installed (AGENT_REFS_BIN not found): the legacy path with ONE warning line, for an existing and for
-# a new consultant alike, so this script keeps working on a host before the tool is installed (it stays inert
-# until the tool AND a list file exist). Fail-closed exception: the list file exists but the tool is missing
-# = abort, because the legacy path could bring a removed repo back through host.extra_refs. Rollback for one
-# agent = delete its list file and respawn.
+# a new consultant alike (classified by the store identity only), so this script keeps working on a host before
+# the tool is installed (it stays inert until the tool AND a list file exist). Fail-closed exception: the list
+# file exists (or is a symlink) but the tool is missing = abort, because the legacy path could bring a removed
+# repo back through host.extra_refs. Rollback for one agent = delete its list file and respawn.
 #
 # Rooms (per consultant, opt-in): when the directory <test-dir>/<key>-rooms/ exists it is
 # mounted read-only at /agent/rooms, and <test-dir>/<key>-room-state/ (created when missing,
@@ -191,7 +209,8 @@
 #   CONSULTANT_REFS_REMOTE  clone base of the extra refs, <base>/<repo>.git (default https://github.com/inblockio)
 #   CONSULTANT_REFS_FOLLOW_ROOT  root of the follow mirrors + _developments digests (default
 #                           $HOME/.local/share/consultant-refs-follow; written only by the host timer)
-#   AGENT_REFS_BIN          the aqua-agent-refs binary (default aqua-agent-refs on PATH; tests point it at a stub)
+#   AGENT_REFS_BIN          the aqua-agent-refs binary (default aqua-agent-refs on PATH, else $HOME/.local/bin/aqua-agent-refs
+#                           when executable: a systemd / cron roll has no ~/.local/bin on PATH; tests point it at a stub)
 #   AGENT_REFS_ROOT         the tool's root (default $HOME/.local/share/agent-refs); read here only to find agents/<STEM>.json
 #                           when the binary is missing (the tool itself reads the same variable)
 #   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
@@ -279,7 +298,14 @@ REFS_REMOTE="${CONSULTANT_REFS_REMOTE:-https://github.com/inblockio}"
 FOLLOW_ROOT="${CONSULTANT_REFS_FOLLOW_ROOT:-$HOME/.local/share/consultant-refs-follow}"
 # Per-agent refs lists (aqua-agent-refs): the tool owns agents/<STEM>.json under AGENT_REFS_ROOT and one
 # read-only view dir per agent; this script only asks it (see the header, "Per-agent refs lists").
-AGENT_REFS_BIN="${AGENT_REFS_BIN:-aqua-agent-refs}"
+# AGENT_REFS_BIN: aqua-agent-refs on PATH, else $HOME/.local/bin/aqua-agent-refs when it is an executable file (systemd
+# and cron rolls lack ~/.local/bin on PATH), else the bare name, which the decision block reports as "not installed".
+if [ -z "${AGENT_REFS_BIN:-}" ]; then
+  AGENT_REFS_BIN=aqua-agent-refs
+  if ! command -v aqua-agent-refs >/dev/null 2>&1 && [ -f "$HOME/.local/bin/aqua-agent-refs" ] && [ -x "$HOME/.local/bin/aqua-agent-refs" ]; then
+    AGENT_REFS_BIN="$HOME/.local/bin/aqua-agent-refs"
+  fi
+fi
 AGENT_REFS_ROOT="${AGENT_REFS_ROOT:-$HOME/.local/share/agent-refs}"
 
 # Print the leading comment block (line 2 through the line before `set -euo pipefail`),
@@ -578,48 +604,97 @@ eval "$HOST_ASSIGN"
 
 # ---------------------------------------------------------------- agent-refs: which refs path
 # Decided HERE, read-only, before the Owner step or any other side effect (see the header, "Per-agent
-# refs lists"). REFS_MODE: legacy (today's REFS_REPOS / extra / follow mounts), list (the agent has a
-# list: its view is the only refs mount) or new (no list, and no config yet: a real spawn creates the
-# list from REFS_REPOS first, then it is a list agent). Fail closed on anything unexpected, except a tool
-# that is not installed at all, which keeps the legacy path so this script works before the install.
+# refs lists"). REFS_MODE: legacy (today's REFS_REPOS / extra / follow mounts), list (an existing consultant
+# whose agent has a list: its view is the only refs mount) or new (a NEW consultant: a real spawn runs the
+# idempotent `add` of REFS_REPOS first, then it is a list agent). Fail closed on anything unexpected, except a
+# tool that is not installed at all, which keeps the legacy path so this script works before the install.
 REFS_MODE=legacy
 REFS_VIEW=""
-agent_refs_view() {  # agent_refs_view: sets REFS_VIEW from `path --agent`; exit 0 = list, 2 = no list, else abort
-  local rc=0 out
-  out="$("$AGENT_REFS_BIN" path --agent "$STEM")" || rc=$?
+REFS_LIST_FILE="$AGENT_REFS_ROOT/agents/$STEM.json"
+refs_list_file_present() { [ -e "$REFS_LIST_FILE" ] || [ -L "$REFS_LIST_FILE" ]; }
+store_has_identity() {  # the agent already minted an identity: the same two reads the launch and --print-mxid use
+  [ -s "$STORE/agent.pem" ] || agent_mxid_from_store >/dev/null 2>&1
+}
+# consultant_is_existing: 0 = existing (an identity in the store, or a container), 1 = new. Never the config file.
+consultant_is_existing() {
+  local prc=0
+  store_has_identity && return 0
+  [ "$PRINT_RUN" -eq 0 ] || return 1   # a preview never asks podman
+  XDG_RUNTIME_DIR="/run/user/$(id -u)" podman container exists "$NAME" >/dev/null 2>&1 || prc=$?
+  case "$prc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) echo "!! agent-refs: 'podman container exists $NAME' failed (exit $prc); cannot tell a new consultant from an existing one (nothing was changed)" >&2
+       exit 1 ;;
+  esac
+}
+# agent_refs_view: asks `path --agent=<STEM>`. Returns 0 (a list: REFS_VIEW is set to the one verified view path)
+# or 5 (no list, and no list file on disk either); every other answer aborts here with nothing changed.
+agent_refs_view() {
+  local rc=0 out want want_real out_real
+  out="$("$AGENT_REFS_BIN" path --agent="$STEM"; rc=$?; printf x; exit "$rc")" || rc=$?
+  out="${out%x}"
   case "$rc" in
     0) : ;;
-    2) return 2 ;;
-    *) echo "!! agent-refs: '$AGENT_REFS_BIN path --agent $STEM' failed (exit $rc); refusing to guess the refs source (nothing was changed)" >&2
+    5) if refs_list_file_present; then
+         echo "!! agent-refs: '$AGENT_REFS_BIN path --agent=$STEM' says there is no list (exit 5), but $REFS_LIST_FILE exists; refusing to guess the refs source (nothing was changed)" >&2
+         exit 1
+       fi
+       return 5 ;;
+    2) echo "!! agent-refs: '$AGENT_REFS_BIN path --agent=$STEM' failed (exit 2: usage, invalid key or settings error; a tool older than the exit-5 'no list' contract also answers 2 here, update it); refusing to guess the refs source (nothing was changed)" >&2
+       exit 1 ;;
+    *) echo "!! agent-refs: '$AGENT_REFS_BIN path --agent=$STEM' failed (exit $rc); refusing to guess the refs source (nothing was changed)" >&2
        exit 1 ;;
   esac
-  # The mount source must be one absolute path: a relative name would silently become a podman named
-  # volume, and a colon would corrupt the -v spec.
+  # The answer is one path and a single trailing newline, nothing stripped: a carriage return, a second line or
+  # a colon (it would corrupt the -v spec) is refused, and so is a relative name (it would silently become a
+  # podman named volume). Then it must be exactly <AGENT_REFS_ROOT>/views/<STEM> (realpath -m on both sides).
+  out="${out%$'\n'}"
+  case "$AGENT_REFS_ROOT" in
+    /*) : ;;
+    *) echo "!! agent-refs: AGENT_REFS_ROOT '$AGENT_REFS_ROOT' is not an absolute path; refusing to mount a view from it (nothing was changed)" >&2
+       exit 1 ;;
+  esac
   case "$out" in
     /*) : ;;
-    *) echo "!! agent-refs: '$AGENT_REFS_BIN path --agent $STEM' did not print an absolute path (got '$out'); refusing to mount it (nothing was changed)" >&2
+    *) echo "!! agent-refs: '$AGENT_REFS_BIN path --agent=$STEM' did not print an absolute path (got '$out'); refusing to mount it (nothing was changed)" >&2
        exit 1 ;;
   esac
-  case "$out" in
-    *:*|*$'\n'*) echo "!! agent-refs: the view path '$out' contains a colon or newline; refusing to mount it (nothing was changed)" >&2
+  want="$AGENT_REFS_ROOT/views/$STEM"
+  case "$out$want" in
+    *:*|*$'\n'*) echo "!! agent-refs: the view path '$out' (expected '$want') contains a colon or newline; refusing to mount it (nothing was changed)" >&2
        exit 1 ;;
   esac
-  REFS_VIEW="$out"
+  if ! out_real="$(realpath -m -- "$out")" || ! want_real="$(realpath -m -- "$want")"; then
+    echo "!! agent-refs: cannot resolve the view path '$out'; refusing to mount it (nothing was changed)" >&2
+    exit 1
+  fi
+  if [ "$out_real" != "$want_real" ]; then
+    echo "!! agent-refs: '$AGENT_REFS_BIN path --agent=$STEM' printed '$out', not the agent's view $want; refusing to mount it (nothing was changed)" >&2
+    exit 1
+  fi
+  REFS_VIEW="$want"
+}
+# refs_view_ok <when>: the view is a directory and not a symlink; re-run right before the launch. Aborts otherwise.
+refs_view_ok() {
+  if [ -d "$REFS_VIEW" ] && [ ! -L "$REFS_VIEW" ]; then return 0; fi
+  echo "!! aborting ($1): the refs view '$REFS_VIEW' is not a plain directory (missing, not a directory, or a symlink); refusing to mount it" >&2
+  exit 1
 }
 if ! command -v "$AGENT_REFS_BIN" >/dev/null 2>&1; then
-  if [ -e "$AGENT_REFS_ROOT/agents/$STEM.json" ]; then
-    echo "!! agent-refs: $STEM has a list ($AGENT_REFS_ROOT/agents/$STEM.json) but '$AGENT_REFS_BIN' is not installed;" >&2
+  if refs_list_file_present; then
+    echo "!! agent-refs: $STEM has a list ($REFS_LIST_FILE) but '$AGENT_REFS_BIN' is not installed;" >&2
     echo "   refusing the legacy refs path (it could bring a removed repo back). Install it, or set AGENT_REFS_BIN (nothing was changed)." >&2
     exit 1
   fi
-  if [ -f "$CFG" ]; then WHO_REFS="existing"; else WHO_REFS="new"; fi
+  if store_has_identity; then WHO_REFS="existing"; else WHO_REFS="new"; fi
   echo "!! agent-refs: '$AGENT_REFS_BIN' not found; $WHO_REFS consultant $STEM keeps the legacy refs path (install it to use per-agent refs lists)" >&2
 else
   REFS_PATH_RC=0; agent_refs_view || REFS_PATH_RC=$?
-  if [ "$REFS_PATH_RC" -eq 0 ]; then
-    REFS_MODE=list
-  elif [ ! -f "$CFG" ]; then
+  if ! consultant_is_existing; then
     REFS_MODE=new
+  elif [ "$REFS_PATH_RC" -eq 0 ]; then
+    REFS_MODE=list
   fi
   if [ "$REFS_MODE" != legacy ] && { [ "${#HOST_EXTRA_REFS[@]}" -gt 0 ] || [ "${#HOST_REFS_FOLLOW[@]}" -gt 0 ]; }; then
     echo ">> refs: $STEM has an agent-refs list; host.extra_refs / host.refs_follow in $HOST_SRC are ignored (its repos come from the list only)"
@@ -857,39 +932,46 @@ if [ "$REFS_MODE" = legacy ]; then
   refresh_refs || { echo "!! aborting: missing refs repo(s), see clone hints above" >&2; exit 1; }
 fi
 
-# agent_refs_ground: a NEW consultant gets its list first (add), then the view is synced (real spawn) or
-# only checked (--print-run / --no-refresh-refs). sync: exit 0 and 3 (some repos stale, all present)
-# proceed, anything else aborts. --print-run creates nothing, so the new consultant's mount source is a
-# placeholder naming the add that a real spawn would run.
+# agent_refs_ground: a NEW consultant first runs the idempotent add of REFS_REPOS (creates the list, or tops up
+# a partial one left by an earlier failed add), then the view is synced (real spawn) or only checked
+# (--print-run / --no-refresh-refs). add: exit 0 and 3 proceed, sync: exit 0 and 3 (some repos stale, all
+# present) proceed, anything else aborts. --print-run creates nothing, so the new consultant's mount source is a
+# placeholder naming the add that a real spawn would run. After the sync / check the view must be a plain
+# directory (refs_view_ok), and that is checked once more right before the launch.
 agent_refs_ground() {
   local rc=0
   if [ "$REFS_MODE" = new ]; then
     if [ "$PRINT_RUN" -eq 1 ]; then
       REFS_VIEW="<view dir of $STEM, known only after aqua-agent-refs add creates its list>"
-      echo ">> refs: --print-run: $STEM has no agent-refs list yet; a real spawn would CREATE it first: $AGENT_REFS_BIN add --agent $STEM ${REFS_REPOS[*]} (nothing created; the /refs source in the argv is that list's view dir, known only after the add). This preview renders the config, so a real spawn AFTER it counts $STEM as existing and stays on the legacy path unless you run that add yourself first."
+      echo ">> refs: --print-run: $STEM is a new consultant (no identity in its store, no container); a real spawn would run this first, which CREATES its agent-refs list (or tops up a partial one): $AGENT_REFS_BIN add --agent=$STEM --wait 900 ${REFS_REPOS[*]} (nothing run; the /refs source in the argv is that list's view dir, known only after the add)."
       return 0
     fi
-    echo ">> refs: new consultant $STEM: creating its agent-refs list: $AGENT_REFS_BIN add --agent $STEM ${REFS_REPOS[*]}"
-    "$AGENT_REFS_BIN" add --agent "$STEM" "${REFS_REPOS[@]}" || {
-      echo "!! aborting: '$AGENT_REFS_BIN add --agent $STEM' failed; no list was created and nothing was launched" >&2
-      exit 1
-    }
-    agent_refs_view || { echo "!! aborting: '$AGENT_REFS_BIN path --agent $STEM' found no list right after add (nothing was launched)" >&2; exit 1; }
+    echo ">> refs: new consultant $STEM: creating or topping up its agent-refs list: $AGENT_REFS_BIN add --agent=$STEM --wait 900 ${REFS_REPOS[*]}"
+    "$AGENT_REFS_BIN" add --agent="$STEM" --wait 900 "${REFS_REPOS[@]}" || rc=$?
+    case "$rc" in
+      0) : ;;
+      3) echo "!! refs: add degraded (exit 3): some repos of $STEM could not be fetched and are STALE or missing from the view; launching with the list" >&2 ;;
+      *) echo "!! aborting: '$AGENT_REFS_BIN add --agent=$STEM --wait 900' failed (exit $rc); a partial list may exist (inspect it with: $AGENT_REFS_BIN list --agent=$STEM; re-running this spawn tops it up); nothing was launched" >&2
+         exit 1 ;;
+    esac
+    rc=0
+    agent_refs_view || { echo "!! aborting: '$AGENT_REFS_BIN path --agent=$STEM' found no list right after add (nothing was launched)" >&2; exit 1; }
     REFS_MODE=list
   fi
   if [ "$REFRESH_REFS" -eq 1 ]; then
-    "$AGENT_REFS_BIN" sync --agent "$STEM" --wait 900 || rc=$?
+    "$AGENT_REFS_BIN" sync --agent="$STEM" --wait 900 || rc=$?
     case "$rc" in
       0) echo ">> refs: $STEM view synced: $REFS_VIEW (ro at /refs)" ;;
       3) echo "!! refs: sync degraded (exit 3): some repos of $STEM could not be updated and are STALE; every listed repo is in the view, launching with it" >&2 ;;
-      *) echo "!! aborting: '$AGENT_REFS_BIN sync --agent $STEM --wait 900' failed (exit $rc); nothing was launched" >&2
+      *) echo "!! aborting: '$AGENT_REFS_BIN sync --agent=$STEM --wait 900' failed (exit $rc); nothing was launched" >&2
          exit 1 ;;
     esac
   else
-    "$AGENT_REFS_BIN" check --agent "$STEM" || rc=$?
-    [ "$rc" -eq 0 ] || { echo "!! aborting: '$AGENT_REFS_BIN check --agent $STEM' failed (exit $rc); nothing was launched" >&2; exit 1; }
+    "$AGENT_REFS_BIN" check --agent="$STEM" || rc=$?
+    [ "$rc" -eq 0 ] || { echo "!! aborting: '$AGENT_REFS_BIN check --agent=$STEM' failed (exit $rc); nothing was launched" >&2; exit 1; }
     echo ">> refs: $STEM view checked: $REFS_VIEW (ro at /refs; freshness pass skipped via --no-refresh-refs / --print-run)"
   fi
+  refs_view_ok "after the refs sync / check"
 }
 
 # Legacy: a followed fleet repo is mounted from its follow mirror IN PLACE of the fleet checkout (same
@@ -1190,6 +1272,7 @@ RUN_ARGS=( \
   "$IMAGE" \
 )
 
+if [ "$REFS_MODE" = list ]; then refs_view_ok "before the argv is printed"; fi
 if [ "$PRINT_RUN" -eq 1 ]; then
   echo ">> --print-run: podman run argument vector follows (one per line); no container, no systemd unit, no DM, no --replace/--fresh" >&2
   printf '%s\n' podman run -d "${RUN_ARGS[@]}"
@@ -1253,6 +1336,9 @@ if [ "$ONBOARD" -eq 1 ]; then
 fi
 
 echo ">> launching $NAME bound single-target to $TARGET"
+# The view was verified after the sync; verify it once more right before `podman run` (the last check, after any
+# --replace removal and --fresh wipe above), so a swap in between never reaches the mount.
+if [ "$REFS_MODE" = list ]; then refs_view_ok "right before podman run; with --replace the old container is already removed, fix the view and re-run"; fi
 set +e
 CID="$(PODMAN_DETACHED_LABEL="$NAME" "$PODMAN_DETACHED" run -d "${RUN_ARGS[@]}" 2>&1)"
 run_rc=$?

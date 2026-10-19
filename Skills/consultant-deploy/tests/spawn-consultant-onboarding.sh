@@ -46,6 +46,8 @@ hasnt()  { ! grep -qF -- "$2" "$1"; }
 SB="$(mktemp -d "${TMPDIR:-/tmp}/spawn-onboard-test.XXXXXX")"
 trap 'rm -rf "$SB"' EXIT
 FAKE_HOME="$SB/home"; TEST_DIR="$SB/aqua-matrix-test"; REFS_BASE="$SB/refs"; SHIM_BIN="$SB/bin"
+# Hermetic: the spawn never finds a real aqua-agent-refs, not even one installed system-wide or in ~/.local/bin.
+NO_REFS_BIN="$SB/no-such-dir/aqua-agent-refs"
 SIDE_EFFECTS="$SB/side-effects.log"; NOTIFY_LOG="$SB/notify.jsonl"
 TOKEN_FILE="$FAKE_HOME/.aqua-matrix-heartbeat/claude-oauth-token"
 mkdir -p "$FAKE_HOME/.aqua-matrix-heartbeat" "$TEST_DIR" "$REFS_BASE" "$SHIM_BIN" "$SB/out"
@@ -198,7 +200,7 @@ echo "== render / refresh: voice line follows the final voice.enabled; --keep-co
 # run_print <name> [spawn args...]: --print-run (renders the config, starts nothing)
 run_print() {
   local name="$1"; shift; local rc=0
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     AQUA_SYSTEM_ALLOWLIST="$AL" \
     bash "$SPAWN" --print-run "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
@@ -234,7 +236,7 @@ echo "== --print-onboarding"
 # print_onb <name> [spawn args...]: --print-onboarding in the sandbox (shims in print mode).
 print_onb() {
   local name="$1"; shift; local rc=0
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_SYSTEM_ALLOWLIST="$AL" \
     bash "$SPAWN" --print-onboarding "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
@@ -287,7 +289,7 @@ spawn_onb() {
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
   rm -f "$NOTIFY_LOG"
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" SHIM_MODE=spawn \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$AL" ONBOARD_WAIT=10 "${envs[@]}" \
     bash "$SPAWN" --label "$label" --target "$TARGET" --no-refresh-refs "$@" \
@@ -350,7 +352,7 @@ check "no em/en dash in any spawn output or notice" no_dashes "$SB"/out/f*.out "
 echo "== the Aqua System peer send is gone"
 check "onboard-send.py deleted" [ ! -e "$SKILL_DIR/onboard-send.py" ]
 check "no script references the bridge MCP or the direct send" bash -c '! grep -nE "aqua-system-bridge-mcp|AQUA_SYSTEM_BRIDGE_MCP|onboard-send|ONBOARD_SEND_TIMEOUT|onboard-forward-only|send_message|ONBOARD_DIRECT" "$1"/*.sh "$1"/*.py' _ "$SKILL_DIR"
-check "--onboard-forward-only is now an unknown flag" bash -c '! env -i HOME="$1" PATH=/usr/bin:/bin bash "$2" --print-onboarding --label x --target "$3" --persona P --onboard-forward-only >/dev/null 2>&1' _ "$FAKE_HOME" "$SPAWN" "$TARGET"
+check "--onboard-forward-only is now an unknown flag" bash -c '! env -i HOME="$1" PATH=/usr/bin:/bin AGENT_REFS_BIN="$4" bash "$2" --print-onboarding --label x --target "$3" --persona P --onboard-forward-only >/dev/null 2>&1' _ "$FAKE_HOME" "$SPAWN" "$TARGET" "$NO_REFS_BIN"
 
 echo "== Owner allow-list (owner-allowlist.py; real spawns with podman shimmed)"
 OWNER_HELPER="$SKILL_DIR/owner-allowlist.py"
@@ -369,7 +371,7 @@ spawn_owner() {
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
   rm -f "$SIDE_EFFECTS"
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" SHIM_MODE=spawn \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$al" \
     bash "$SPAWN" --label "$label" --target "$OWNER" --persona Pelagia --name Andreas --no-refresh-refs "$@" \
@@ -450,7 +452,7 @@ check "--replace + bad allow-list: no podman rm (no podman at all)" no_podman
 
 # O7: print modes write nothing, but preview
 O7="$SB/o7.toml"; mk_al "$O7"; cp "$O7" "$SB/o7.before"
-rc=0; env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" \
+rc=0; env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" \
   CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
   AQUA_SYSTEM_ALLOWLIST="$O7" bash "$SPAWN" --print-run --label printrun --target "$OWNER" --persona Pelagia \
   > "$SB/out/o7.out" 2> "$SB/out/o7.err" || rc=$?

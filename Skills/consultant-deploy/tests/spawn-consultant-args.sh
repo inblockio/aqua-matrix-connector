@@ -67,6 +67,8 @@ check() { # check <description> <command...>   (command's exit status decides)
 SB="$(mktemp -d "${TMPDIR:-/tmp}/spawn-args-test.XXXXXX")"
 trap 'rm -rf "$SB"' EXIT
 FAKE_HOME="$SB/home"
+# Hermetic: the spawn never finds a real aqua-agent-refs, not even one installed system-wide or in ~/.local/bin.
+NO_REFS_BIN="$SB/no-such-dir/aqua-agent-refs"
 TEST_DIR="$SB/aqua-matrix-test"
 REFS_BASE="$SB/refs"
 SHIM_BIN="$SB/bin"
@@ -110,6 +112,7 @@ run() {
     CONSULTANT_TEST_DIR="$TEST_DIR" \
     CONSULTANT_REFS_BASE="$REFS_BASE" \
     AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+    AGENT_REFS_BIN="$NO_REFS_BIN" \
     ${RUN_ENV[@]+"${RUN_ENV[@]}"} \
     bash "$SPAWN" --print-run "$@" \
     > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
