@@ -234,7 +234,8 @@ the fleet stayed down for 8 h. A new script that starts agent containers must ca
 
 ## Refs grounding and freshness (automatic)
 
-The agent's knowledge is the live host checkouts, bind-mounted read-only; a host-side
+This is the LEGACY path, used unless the agent has an `aqua-agent-refs` list (see "Per-agent refs lists"
+below). The agent's knowledge is the live host checkouts, bind-mounted read-only; a host-side
 `git pull` is visible to running consultants immediately. On **every** launch (spawn,
 relabel, and each consultant of a fleet roll) the spawner runs a refs check over the
 `REFS_REPOS` list, so a rebuild can never ship stale or missing grounding:
@@ -300,6 +301,49 @@ clean git clone and its digest dir exists. Missing or dirty: exit 1 before anyth
 **Rooms.** A `<test-dir>/<key>-rooms/` dir is mounted `:ro` at `/agent/rooms`, together with a
 durable, writable `<test-dir>/<key>-room-state/` (created if missing, never wiped) at
 `/agent/room-state` with the same `:U` as `/agent/memory`. No rooms dir = no rooms mounts.
+
+**Per-agent refs lists (`aqua-agent-refs`).** An agent can have its own list of repos, mounted
+`:ro` as ONE view at `/refs` and changed live. Design: inblockio/aqua-agents
+`docs/plans/2026-10-19-agent-refs.md`. The switch is the list file
+`~/.local/share/agent-refs/agents/<STEM>.json` (`<STEM>` = `<label>-aqua-consultant`, or
+`aqua-consultant` for `--generic`), written only by the `aqua-agent-refs` tool; the spawn asks
+`aqua-agent-refs path --agent=<STEM>` before any side effect (every call passes the key in the equals
+form, so a STEM starting with `-` is never read as a flag). `AGENT_REFS_BIN` overrides the binary; the
+default is `aqua-agent-refs` on `PATH`, else `~/.local/bin/aqua-agent-refs` when executable (systemd and cron
+rolls have no `~/.local/bin` on `PATH`).
+
+`path` exit codes the spawn relies on: 0 = list, stdout is the view dir; 5 = no list (and only then); every
+other code (2 = usage, invalid key or settings error, also what a tool older than the exit-5 contract
+answers for "no list") aborts with nothing changed. Exit 5 is also refused when the list file exists or is a
+symlink. An error must never turn into the legacy path: it could bring a repo back that was removed from the
+agent's list.
+
+**Existing or new consultant** is decided by the store and the container, never by the config file (a
+`--print-run` renders the config, and a failed first spawn leaves one). Existing = `<persist>/store/agent.pem`
+is non-empty (the same check that prints "identity PRESERVED" at launch), or `<persist>/store/config.toml` holds
+a `[session] user_id` (what `--print-mxid` reads), or the container `aqua-agent-<STEM>-1` exists (real spawns
+only; `--print-run` never calls podman). Anything else is new. `--fresh` and `--replace` do not change the
+class.
+
+| State | What the spawn does |
+|---|---|
+| Existing, list exists | Real spawn: `sync --agent=<STEM> --wait 900` (exit 0 or 3 go on, 3 warns "stale"; anything else aborts before the config render, the `--replace` removal and any container change). `--print-run` / `--no-refresh-refs`: `check --agent=<STEM>` instead. Mounts exactly `-v <view>:/refs:ro`, where the fleet mounts sat in the argv. `REFS_REPOS` checkouts, `host.extra_refs` and `host.refs_follow` are not used (one line says the host entries are ignored). |
+| Existing, no list (exit 5) | Today's behaviour, argv byte for byte. |
+| NEW consultant | A real spawn ALWAYS runs `add --agent=<STEM> --wait 900 <REFS_REPOS in order>` first, with or without a list file: add is idempotent, so a retry after a partial add (list written, exit 1) tops up the missing repos. Exit 0 or 3 go on (3 warns), anything else aborts, naming that a partial list may exist (`aqua-agent-refs list --agent=<STEM>`). Then `path`, `sync` and the mount as above. `--print-run` runs nothing and prints the add it would run; a real spawn after a preview is still new. |
+| `aqua-agent-refs` not installed | Legacy path with one warning line (existing and new consultant alike), so the script works before the install. Exception, fail closed: the list file exists (or is a symlink) but the binary is missing = abort. |
+| `path` answers anything but 0 / 5 | Abort, nothing changed (also exit 2 with the list file present: no podman call at all). |
+| `path` prints anything but the agent's view | Abort. The view must be exactly `<AGENT_REFS_ROOT>/views/<STEM>` (compared with `realpath -m`, nothing stripped: a trailing carriage return, a second line, a colon, a relative or a foreign path are refused) and a plain directory, not a symlink. Checked after the `sync` / `check` and again right before `podman run`. |
+
+Add or remove one repo for ONE consultant, live, no respawn (the mount is the whole view directory):
+
+```bash
+aqua-agent-refs add    --agent zdnaez-aqua-consultant aqua-mail
+aqua-agent-refs remove --agent zdnaez-aqua-consultant aqua-mail
+aqua-agent-refs list   --agent zdnaez-aqua-consultant
+```
+
+Rollback for one agent: delete `~/.local/share/agent-refs/agents/<STEM>.json` and respawn it
+(`--replace --keep-config`); the consultant config was never written by the tool.
 
 ## Identity & lifecycle flags
 
@@ -427,14 +471,36 @@ concurrent applies serialize. No message leaves the machine and the real allow-l
 or written. `spawn-consultant-args.sh` hashes configs with the hello's voice line removed, since
 that line now legitimately follows `--voice`.
 
+`tests/spawn-consultant-agent-refs.sh` covers the `aqua-agent-refs` path with a stub binary
+(`AGENT_REFS_BIN`, recording argv, scripted exit codes, a tiny list store under `AGENT_REFS_ROOT`) in
+the same kind of sandbox: list present (print-run uses `path` + `check`, never `sync`; one view mount
+in the fleet position, whole argv compared; real spawn runs `sync --agent <STEM> --wait 900`; sync exit
+3 proceeds with a stale warning; sync exit 1, 2, 4, 127 abort before the config render and any podman
+call, and on `--replace` the old container is still running; `--no-refresh-refs` runs `check`), existing
+vs new by store identity or container (a preview then a real spawn of a new consultant takes the new
+path; a store identity without a list stays legacy), a new consultant (`add --wait 900` in `REFS_REPOS`
+order every time, a partial add aborts and the retry tops the list up, add exit 3 goes on, 1 / 2 / 4 / 127
+abort, print-run creates nothing), an existing consultant without a list (argv, stdout and stderr
+byte-identical to the script at 8bb03b3, the commit before this feature, for fleet / extra+follow / rooms /
+generic / keep-config), the binary missing (legacy with one warning, list file or symlink present aborts,
+default name found on `PATH`, else in `~/.local/bin`), fail-closed `path` answers (exit 2 with a list
+present aborts with no podman call; a real spawn aborted by `path` leaves the Owner allow-list
+byte-identical), the exact view path and view directory checks (CR, newline, foreign path, symlink, swap
+between the sync and `podman run`), and `host.extra_refs` / `host.refs_follow` ignored when a list exists.
+The other suites set `AGENT_REFS_BIN` to a nonexistent path, so they stay hermetic even when the tool is
+installed system-wide.
+`KEEP_SANDBOX=1` keeps the temp dir for debugging.
+
 ```bash
 bash Skills/consultant-deploy/tests/spawn-consultant-args.sh
 bash Skills/consultant-deploy/tests/spawn-consultant-onboarding.sh
+bash Skills/consultant-deploy/tests/spawn-consultant-agent-refs.sh
+bash Skills/consultant-deploy/tests/podman-detached.sh
 ```
 
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
 avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
-`CONSULTANT_REFS_MIRROR`, `CONSULTANT_REFS_REMOTE`, `CONSULTANT_REFS_FOLLOW_ROOT`, `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
+`CONSULTANT_REFS_MIRROR`, `CONSULTANT_REFS_REMOTE`, `CONSULTANT_REFS_FOLLOW_ROOT`, `AGENT_REFS_BIN`, `AGENT_REFS_ROOT`, `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
 `CONSULTANT_NOTIFY`, `ONBOARD_WAIT` and `AQUA_SYSTEM_ALLOWLIST`.
 
 ## Model pin (`model`)
