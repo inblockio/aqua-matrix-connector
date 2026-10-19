@@ -53,7 +53,7 @@ TOKEN_FILE="$FAKE_HOME/.aqua-matrix-heartbeat/claude-oauth-token"
 mkdir -p "$FAKE_HOME/.aqua-matrix-heartbeat" "$TEST_DIR" "$REFS_BASE" "$SHIM_BIN" "$SB/out"
 echo fake-token > "$TOKEN_FILE"
 cp "$TEMPLATE" "$TEST_DIR/consultant-config.template.json"
-for r in aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io; do
+for r in aqua-rs-sdk aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io; do
   mkdir -p "$REFS_BASE/$r"
 done
 TARGET='@did-key-zfaketestpeer:matrix.inblock.io'

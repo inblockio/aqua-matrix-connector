@@ -16,7 +16,7 @@
 #   - voice on in config, no key -> still renders (launches), loud warning on stderr
 #   - --voice on / off / on again / off on absent block / bogus value
 #   - --replace --keep-config without --voice preserves the voice block
-#   - REFS_REPOS lists inblockio.github.io and the argv mounts it :ro (all six refs :ro)
+#   - REFS_REPOS lists inblockio.github.io and the argv mounts it :ro (all five refs :ro)
 #   - model pin: the template carries model, a fresh render inherits it, a persona re-render and
 #     --refresh-prompt keep an existing config's model and never inject one
 #   - MXID resolution (case H): --target did:... resolves through a mock siwx-oidc /resolve
@@ -82,7 +82,7 @@ printf '%s\n' "$FAKE_TOKEN" > "$TOKEN_FILE"
 cp "$TEMPLATE" "$TEST_DIR/consultant-config.template.json"
 cp "$REGISTRY_EXAMPLE" "$TEST_DIR/consultants.registry"
 # --print-run implies --no-refresh-refs, so presence is all that is checked: empty dirs suffice.
-for r in aqua-rs-sdk aqua-spec aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io; do
+for r in aqua-rs-sdk aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io; do
   mkdir -p "$REFS_BASE/$r"
 done
 # Shims: any call is a test failure (recorded), and they fail loudly.
@@ -168,8 +168,8 @@ check "bash -n roll-consultant-fleet.sh" bash -n "$ROLL"
 echo "== static: REFS_REPOS"
 check "REFS_REPOS lists inblockio.github.io" \
   grep -qE '^REFS_REPOS=\(.*\binblockio\.github\.io\b.*\)' "$SPAWN"
-check "REFS_REPOS lists exactly six repos" \
-  bash -c 'n=$(grep -E "^REFS_REPOS=\(" "$1" | sed "s/^REFS_REPOS=(//; s/)$//" | wc -w); [ "$n" -eq 6 ]' _ "$SPAWN"
+check "REFS_REPOS lists exactly five repos" \
+  bash -c 'n=$(grep -E "^REFS_REPOS=\(" "$1" | sed "s/^REFS_REPOS=(//; s/)$//" | wc -w); [ "$n" -eq 5 ]' _ "$SPAWN"
 
 echo "== case A: no Deepgram env file"
 rc=0; run a --label alpha --target "$TARGET" --persona Thalia --name Tester || rc=$?
@@ -269,7 +269,7 @@ check "voice block survived the model cases" [ "$(cfg_voice alpha)" = '{"enabled
 
 echo "== case E: refs mounts"
 check "argv mounts inblockio.github.io read-only" argv_has_line a "$REFS_BASE/inblockio.github.io:/refs/inblockio.github.io:ro"
-check "all six /refs mounts present and :ro" bash -c '[ "$(grep -c "^$2/[^:]*:/refs/[^:]*:ro$" "$1")" -eq 6 ]' _ "$SB/out/a.argv" "$REFS_BASE"
+check "all five /refs mounts present and :ro" bash -c '[ "$(grep -c "^$2/[^:]*:/refs/[^:]*:ro$" "$1")" -eq 5 ]' _ "$SB/out/a.argv" "$REFS_BASE"
 check "no writable /refs mount" bash -c '! grep -E "^.*:/refs/[^:]*(:rw)?$" "$1" | grep -qv ":ro$"' _ "$SB/out/a.argv"
 
 echo "== case F: --generic"
@@ -473,8 +473,8 @@ rc=0; run i1 --label iota --target "$TARGET" --persona Thalia --name Tester || r
 check "host.extra_refs: exit 0" [ "$rc" -eq 0 ]
 check "host.extra_refs: extra-one mounted :ro from the default mirror root" argv_has_line i1 "$MIRROR/extra-one:/refs/extra-one:ro"
 check "host.extra_refs: extra-two mounted :ro from the default mirror root" argv_has_line i1 "$MIRROR/extra-two:/refs/extra-two:ro"
-check "host.extra_refs: 6 fleet + 2 extra /refs mounts, each right after -v" \
-  bash -c '[ "$(awk "prev==\"-v\" && /:\/refs\/[^:]*:ro\$/ {n++} {prev=\$0} END{print n+0}" "$1")" -eq 8 ]' _ "$SB/out/i1.argv"
+check "host.extra_refs: 5 fleet + 2 extra /refs mounts, each right after -v" \
+  bash -c '[ "$(awk "prev==\"-v\" && /:\/refs\/[^:]*:ro\$/ {n++} {prev=\$0} END{print n+0}" "$1")" -eq 7 ]' _ "$SB/out/i1.argv"
 check "host.extra_refs: fleet repo skipped with a note, mounted once from the fleet checkout" \
   bash -c 'grep -q "aqua-rs-sdk is already fleet-mounted (REFS_REPOS), skipped" "$1" && [ "$(grep -c ":/refs/aqua-rs-sdk:ro$" "$2")" -eq 1 ] && grep -qx "$3/aqua-rs-sdk:/refs/aqua-rs-sdk:ro" "$2"' \
   _ "$SB/out/i1.out" "$SB/out/i1.argv" "$REFS_BASE"
@@ -511,13 +511,13 @@ rm -f "$(cfg_of kappa)"
 # The former <key>-extra-refs.list host file is not read at all any more (no fallback).
 printf 'extra-three\n' > "$TEST_DIR/nu-extra-refs.list"    # extra-three has no mirror: reading it would abort
 rc=0; run i3 --label nu --target "$TARGET" --persona Thalia || rc=$?
-check "list file ignored: exit 0, exactly the six fleet /refs mounts, no extra-refs note" \
-  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 6 ] && ! grep -q "extra refs" "$3" "$4"' \
+check "list file ignored: exit 0, exactly the five fleet /refs mounts, no extra-refs note" \
+  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 5 ] && ! grep -q "extra refs" "$3" "$4"' \
   _ "$rc" "$SB/out/i3.argv" "$SB/out/i3.out" "$SB/out/i3.err"
 put_host nu '{"extra_refs": ["extra-one"]}'
 rc=0; run i3b --label nu --target "$TARGET" --persona Thalia || rc=$?
 check "list file next to host.extra_refs: only the host names are mounted" \
-  bash -c '[ "$1" -eq 0 ] && grep -qx "$2/extra-one:/refs/extra-one:ro" "$3" && ! grep -q extra-three "$3" && [ "$(grep -c ":/refs/" "$3")" -eq 7 ]' \
+  bash -c '[ "$1" -eq 0 ] && grep -qx "$2/extra-one:/refs/extra-one:ro" "$3" && ! grep -q extra-three "$3" && [ "$(grep -c ":/refs/" "$3")" -eq 6 ]' \
   _ "$rc" "$MIRROR" "$SB/out/i3b.argv"
 check "spawn-consultant.sh has no list-file reader left" bash -c '! grep -nE "extra-refs\.list\"|EXTRA_REFS_LIST|read_extra_refs" "$1"' _ "$SPAWN"
 rm -f "$TEST_DIR/nu-extra-refs.list"
@@ -555,8 +555,8 @@ check "generic: the generic config's host block and generic-rooms are used" \
 put_host generic ABSENT; rm -rf "$TEST_DIR/generic-rooms" "$TEST_DIR/generic-room-state"
 
 rc=0; run i8 --label mu --target "$TARGET" --persona Thalia || rc=$?
-check "default (no host, no rooms dir): exactly the six fleet /refs mounts, no rooms, no notes" \
-  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 6 ] && ! grep -q "/agent/room" "$2" && ! grep -q "extra refs\|rooms:" "$3" "$4" && [ ! -e "$5" ]' \
+check "default (no host, no rooms dir): exactly the five fleet /refs mounts, no rooms, no notes" \
+  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 5 ] && ! grep -q "/agent/room" "$2" && ! grep -q "extra refs\|rooms:" "$3" "$4" && [ ! -e "$5" ]' \
   _ "$rc" "$SB/out/i8.argv" "$SB/out/i8.out" "$SB/out/i8.err" "$TEST_DIR/mu-room-state"
 check "mirror root default is on disk (~/.local/share), never /tmp" \
   grep -qF 'REFS_MIRROR="${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs}"' "$SPAWN"
@@ -576,7 +576,6 @@ rc=0; run j1 --label xi --target "$TARGET" --persona Thalia || rc=$?
 check "follow: exit 0" [ "$rc" -eq 0 ]
 J1_WANT="$(printf '%s\n' \
   "$FOLLOW/aqua-rs-sdk:/refs/aqua-rs-sdk:ro" \
-  "$REFS_BASE/aqua-spec:/refs/aqua-spec:ro" \
   "$REFS_BASE/aqua-governance-corpus:/refs/aqua-governance-corpus:ro" \
   "$REFS_BASE/aqua-ecosystem:/refs/aqua-ecosystem:ro" \
   "$REFS_BASE/aqua-compliance:/refs/aqua-compliance:ro" \
@@ -601,8 +600,8 @@ rc=0; run j1b --label xi --target "$TARGET" --persona Thalia || rc=$?
 check "follow: an upstream commit is not pulled (print-run; the static checks below cover real spawns)" \
   bash -c '[ "$1" -eq 0 ] && [ "$(git -C "$2" rev-parse HEAD)" = "$3" ]' _ "$rc" "$FOLLOW/aqua-rs-sdk" "$FHEAD"
 rc=0; run j2 --label omicron --target "$TARGET" --persona Thalia || rc=$?
-check "follow: a consultant without host.refs_follow keeps the six fleet mounts, no digests" \
-  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 6 ] && grep -qx "$3/aqua-rs-sdk:/refs/aqua-rs-sdk:ro" "$2" && ! grep -q "_developments\|$4" "$2"' \
+check "follow: a consultant without host.refs_follow keeps the five fleet mounts, no digests" \
+  bash -c '[ "$1" -eq 0 ] && [ "$(grep -c ":/refs/" "$2")" -eq 5 ] && grep -qx "$3/aqua-rs-sdk:/refs/aqua-rs-sdk:ro" "$2" && ! grep -q "_developments\|$4" "$2"' \
   _ "$rc" "$SB/out/j2.argv" "$REFS_BASE" "$FOLLOW"
 FOLLOW_FN="$(sed -n '/^check_follow_refs() {$/,/^}$/p' "$SPAWN")"
 check "check_follow_refs extracted from the script" grep -q 'status --porcelain --ignored' <(printf '%s\n' "$FOLLOW_FN")
