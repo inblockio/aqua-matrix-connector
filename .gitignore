@@ -16,3 +16,5 @@ target/
 # same way real `.env` is ignored. Only the `*.example` template is tracked.
 instances/*.toml
 !instances/*.toml.example
+__pycache__/
+*.pyc
