@@ -38,6 +38,15 @@ pub struct Config {
     pub rate_window: Duration,
     /// How long an attach waits for login + roster join.
     pub attach_timeout: Duration,
+    /// D9: this daemon is the hub: it creates the roster room, invites into
+    /// it and decides on knocks from other hosts.
+    pub hub: bool,
+    /// This host's public DID (D8).
+    pub host_did: String,
+    /// The hub's allow-list of hosts.
+    pub hosts_file: PathBuf,
+    /// How long a seat waits to be let into the roster room.
+    pub join_wait: Duration,
 }
 
 pub struct SeatEntry {
@@ -233,30 +242,43 @@ impl Daemon {
         }
     }
 
-    /// Ask a roster member to invite `mxid` into the roster room. Any member
-    /// may invite; if none is running, the room's creator is attached first.
+    /// Ask the hub seat (the roster room's creator, the only member who may
+    /// invite) to invite `mxid`. The creator is attached first if needed.
     pub async fn request_roster_invite(self: &Arc<Self>, requester: &str, mxid: &str, rf: &RoomFile) {
-        for e in self.entries() {
-            if e.shared.seat == requester {
-                continue;
-            }
-            if *e.shared.run_state.borrow() != RunState::Ready {
-                continue;
-            }
-            if self.try_invite(&e, mxid).await {
-                return;
-            }
+        if rf.created_by.is_empty() || rf.created_by == requester {
+            return;
         }
-        if rf.created_by != requester {
-            match self.attach(&rf.created_by, true).await {
-                Ok(e) => {
-                    if !self.try_invite(&e, mxid).await {
-                        tracing::warn!(seat = %rf.created_by, "the roster creator could not invite");
-                    }
+        match self.attach(&rf.created_by, true).await {
+            Ok(e) => {
+                if !self.try_invite(&e, mxid).await {
+                    tracing::warn!(seat = %rf.created_by, "the hub seat could not invite");
                 }
-                Err(err) => tracing::warn!("attaching the roster creator {}: {err}", rf.created_by),
             }
+            Err(err) => tracing::warn!("attaching the hub seat {}: {err}", rf.created_by),
         }
+    }
+
+    /// The hub seat: the roster room's creator, on a hub daemon. It stays
+    /// attached (it decides on knocks and invites).
+    pub fn is_hub_seat(&self, seat: &str) -> bool {
+        self.cfg.hub && RoomFile::load(&self.cfg.root).is_some_and(|rf| rf.created_by == seat)
+    }
+
+    /// On a hub daemon, bring the hub seat up at startup (if the room exists).
+    pub fn start_hub_seat(self: &Arc<Self>) {
+        if !self.cfg.hub {
+            return;
+        }
+        let Some(rf) = RoomFile::load(&self.cfg.root).filter(|rf| !rf.created_by.is_empty()) else {
+            return;
+        };
+        let d = self.clone();
+        tokio::spawn(async move {
+            match d.attach(&rf.created_by, false).await {
+                Ok(_) => tracing::info!(seat = %rf.created_by, "hub seat attached"),
+                Err(e) => tracing::warn!("attaching the hub seat {}: {e}", rf.created_by),
+            }
+        });
     }
 
     async fn try_invite(&self, e: &Arc<SeatEntry>, mxid: &str) -> bool {
@@ -277,7 +299,10 @@ impl Daemon {
         let idle = self.cfg.idle_detach.as_millis() as u64;
         for e in self.entries() {
             let running = e.run.lock().await.is_some();
-            if !running || e.shared.waiters.load(Ordering::Relaxed) > 0 {
+            if !running
+                || e.shared.waiters.load(Ordering::Relaxed) > 0
+                || self.is_hub_seat(&e.shared.seat)
+            {
                 continue;
             }
             if now.saturating_sub(e.shared.last_touch.load(Ordering::Relaxed)) > idle {
@@ -404,6 +429,7 @@ impl Daemon {
     fn whoami(&self, e: &Arc<SeatEntry>) -> Value {
         let sh = &e.shared;
         let id = sh.identity.lock().unwrap().clone();
+        let shape = sh.room_shape.lock().unwrap().clone();
         json!({
             "seat": sh.seat,
             "did": sh.did,
@@ -412,6 +438,11 @@ impl Daemon {
             "host": sh.host,
             "display_name": roster::display_name(&sh.seat, &sh.host),
             "roster_room": sh.roster_room_id(),
+            "roster_join_rule": shape.as_ref().map(|s| s.join_rule.clone()),
+            "roster_alias": shape.as_ref().and_then(|s| s.alias.clone()),
+            "roster_alias_resolves_here": shape.as_ref().map(|s| s.alias_resolves_here),
+            "host_did": self.cfg.host_did,
+            "hub": self.cfg.hub,
             "connected": id.connected,
             "homeserver": self.cfg.matrix_url,
         })

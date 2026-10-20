@@ -59,7 +59,6 @@ const ROLE: &str = "claude-seat";
 const REFRESH_GUARD_SECS: u64 = 30;
 const MIN_CYCLE_SECS: u64 = 15;
 const MAX_CONNECT_FAILURES: u32 = 3;
-const ROSTER_JOIN_TIMEOUT: Duration = Duration::from_secs(150);
 const SEND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const DM_JOIN_WAIT: Duration = Duration::from_secs(20);
 const ROSTER_BACKFILL_LIMIT: u32 = 100;
@@ -159,6 +158,7 @@ pub struct SeatShared {
     pub run_state: watch::Sender<RunState>,
     pub roster: Mutex<RosterCache>,
     pub roster_room: Mutex<Option<String>>,
+    pub room_shape: Mutex<Option<RoomShape>>,
     pub rate: Mutex<RateLimiter>,
     pub counters: Counters,
     /// Event ids that arrived undecryptable and are not in the inbox yet.
@@ -195,6 +195,7 @@ impl SeatShared {
             run_state: tx,
             roster: Mutex::new(RosterCache::default()),
             roster_room: Mutex::new(None),
+            room_shape: Mutex::new(None),
             rate: Mutex::new(RateLimiter::new(rate.0, rate.1)),
             counters: Counters::default(),
             utd_open: Mutex::new(HashSet::new()),
@@ -330,8 +331,22 @@ async fn run_seat(
             }
         };
         *shared.roster_room.lock().unwrap() = Some(room_id.clone());
+        if let Ok(rid) = <&matrix_sdk::ruma::RoomId>::try_from(room_id.as_str()) {
+            if let Some(room) = agent.client().get_room(rid) {
+                let is_hub_seat = d.cfg.hub
+                    && RoomFile::load(&d.cfg.root).is_some_and(|rf| rf.created_by == shared.seat);
+                if is_hub_seat {
+                    upgrade_room_shape(&agent, &shared, &room).await;
+                }
+            }
+        }
         if let Err(e) = agent.sync_once_nowait().await {
             tracing::warn!(seat = %shared.seat, "settle sync failed: {e:#}");
+        }
+        if let Ok(rid) = <&matrix_sdk::ruma::RoomId>::try_from(room_id.as_str()) {
+            if let Some(room) = agent.client().get_room(rid) {
+                *shared.room_shape.lock().unwrap() = Some(check_room_shape(&agent, &room).await);
+            }
         }
         if first_cycle {
             let name = roster::display_name(&shared.seat, &shared.host);
@@ -407,19 +422,37 @@ impl RoomFile {
     }
 }
 
-/// Make this seat a joined member of the roster room, creating the room if no
-/// seat has yet. `Ok(None)` when stopped meanwhile.
+/// The local part of the roster room's alias (`#claude-seats:<server>`).
+pub const ROSTER_ALIAS_LOCALPART: &str = "claude-seats";
+/// Room version of the roster room: 7 or later is needed for knock rooms.
+const ROSTER_ROOM_VERSION: matrix_sdk::ruma::RoomVersionId = matrix_sdk::ruma::RoomVersionId::V10;
+/// Power level needed to invite into the roster room: only the hub seat
+/// (creator, level 100) invites, so every new member passed the hub's checks.
+const INVITE_LEVEL: u32 = 50;
+
+/// What the roster room looks like to its members.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoomShape {
+    pub join_rule: String,
+    pub alias: Option<String>,
+    pub alias_resolves_here: bool,
+}
+
+/// Make this seat a joined member of the roster room. The hub creates the
+/// room (a knock room, D9) when no seat has; a seat on another host finds it
+/// by alias and knocks with its host's endorsement (D10); seats on the hub host
+/// are invited by the hub seat. `Ok(None)` when stopped meanwhile.
 async fn ensure_roster(
     d: &Arc<Daemon>,
     shared: &Arc<SeatShared>,
     agent: &AgentClient,
     stop: &Notify,
 ) -> Result<Option<String>> {
-    let deadline = Instant::now() + ROSTER_JOIN_TIMEOUT;
-    let mut invited_at: Option<Instant> = None;
+    let deadline = Instant::now() + d.cfg.join_wait;
+    let mut asked_at: Option<Instant> = None;
     loop {
-        match RoomFile::load(&d.cfg.root) {
-            None => {
+        let Some(rf) = RoomFile::load(&d.cfg.root) else {
+            if d.cfg.hub {
                 let _g = d.roster_create.lock().await;
                 if RoomFile::load(&d.cfg.root).is_some() {
                     continue;
@@ -431,46 +464,84 @@ async fn ensure_roster(
                     created_ms: unix_ms(),
                 }
                 .save(&d.cfg.root)?;
-                tracing::info!(seat = %shared.seat, %room_id, "created the roster room");
+                tracing::info!(seat = %shared.seat, %room_id, "created the roster room (knock, alias #{ROSTER_ALIAS_LOCALPART})");
                 return Ok(Some(room_id));
             }
-            Some(rf) => {
-                if let Ok(rid) = <&matrix_sdk::ruma::RoomId>::try_from(rf.room_id.as_str()) {
-                    if let Some(room) = agent.client().get_room(rid) {
-                        match room.state() {
-                            RoomState::Joined => return Ok(Some(rf.room_id)),
-                            RoomState::Invited => {
-                                room.join().await.context("joining the roster room")?;
-                                tracing::info!(seat = %shared.seat, "joined the roster room");
-                                return Ok(Some(rf.room_id));
-                            }
-                            _ => {}
-                        }
+            // A seat on a host without the room: find it by its alias.
+            let room_id = resolve_roster_alias(agent)
+                .await
+                .context("this host has no roster room yet and the alias does not resolve (has the hub created it?)")?;
+            RoomFile {
+                room_id,
+                created_by: String::new(),
+                created_ms: unix_ms(),
+            }
+            .save(&d.cfg.root)?;
+            continue;
+        };
+        if let Ok(rid) = <&matrix_sdk::ruma::RoomId>::try_from(rf.room_id.as_str()) {
+            if let Some(room) = agent.client().get_room(rid) {
+                match room.state() {
+                    RoomState::Joined => return Ok(Some(rf.room_id)),
+                    RoomState::Invited => {
+                        room.join().await.context("joining the roster room")?;
+                        tracing::info!(seat = %shared.seat, "joined the roster room");
+                        return Ok(Some(rf.room_id));
                     }
-                }
-                // Not a member yet: ask a member (any member may invite) to
-                // invite us, then look for the invite.
-                let me = agent.user_id().to_string();
-                if invited_at.is_none_or(|t| t.elapsed() > Duration::from_secs(25)) {
-                    invited_at = Some(Instant::now());
-                    d.request_roster_invite(&shared.seat, &me, &rf).await;
-                }
-                if Instant::now() > deadline {
-                    bail!("not invited to the roster room within {}s", ROSTER_JOIN_TIMEOUT.as_secs());
-                }
-                tokio::select! {
-                    _ = stop.notified() => return Ok(None),
-                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-                }
-                if let Err(e) = agent.sync_once_nowait().await {
-                    tracing::debug!(seat = %shared.seat, "sync while waiting for the invite: {e:#}");
+                    _ => {}
                 }
             }
+        }
+        // Not a member yet.
+        if asked_at.is_none_or(|t| t.elapsed() > Duration::from_secs(25)) {
+            asked_at = Some(Instant::now());
+            if d.cfg.hub {
+                // Seats on the hub host: the hub seat invites.
+                d.request_roster_invite(&shared.seat, agent.user_id(), &rf).await;
+            } else {
+                crate::knock::knock_for_roster(d, shared, agent, &rf).await?;
+            }
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "not invited to the roster room within {}s{}",
+                d.cfg.join_wait.as_secs(),
+                if d.cfg.hub { "" } else { " (is the hub online and is this host in its hosts.toml?)" }
+            );
+        }
+        tokio::select! {
+            _ = stop.notified() => return Ok(None),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+        if let Err(e) = agent.sync_once_nowait().await {
+            tracing::debug!(seat = %shared.seat, "sync while waiting for the invite: {e:#}");
         }
     }
 }
 
+/// The room id the roster alias points at.
+pub async fn resolve_roster_alias(agent: &AgentClient) -> Result<String> {
+    let alias = roster_alias(agent)?;
+    let r = agent
+        .client()
+        .resolve_room_alias(&alias)
+        .await
+        .with_context(|| format!("resolving {alias}"))?;
+    Ok(r.room_id.to_string())
+}
+
+fn roster_alias(agent: &AgentClient) -> Result<matrix_sdk::ruma::OwnedRoomAliasId> {
+    let server = agent
+        .user_id()
+        .split_once(':')
+        .map(|(_, s)| s)
+        .ok_or_else(|| anyhow!("malformed own user id"))?;
+    let alias = format!("#{ROSTER_ALIAS_LOCALPART}:{server}");
+    alias.as_str().try_into().map_err(|e| anyhow!("bad alias {alias}: {e}"))
+}
+
 async fn create_roster_room(agent: &AgentClient) -> Result<String> {
+    use matrix_sdk::ruma::events::room::join_rules::{JoinRule, RoomJoinRulesEventContent};
     let mut req = CreateRoomRequest::new();
     req.name = Some(ROSTER_ROOM_NAME.to_string());
     req.topic = Some(
@@ -479,11 +550,17 @@ async fn create_roster_room(agent: &AgentClient) -> Result<String> {
     );
     req.preset = Some(RoomPreset::PrivateChat);
     req.visibility = Visibility::Private;
+    req.room_version = Some(ROSTER_ROOM_VERSION);
+    req.room_alias_name = Some(ROSTER_ALIAS_LOCALPART.to_string());
     let enc = InitialStateEvent::with_empty_state_key(RoomEncryptionEventContent::with_recommended_defaults());
-    req.initial_state = vec![enc.to_raw_any()];
-    // Members may set their own claim. `events` replaces the server default map,
-    // so the defaults are restated.
+    // D9: a knock room, so a seat on a new host asks to join instead of
+    // needing a live invite. The initial state overrides the preset's rule.
+    let knock = InitialStateEvent::with_empty_state_key(RoomJoinRulesEventContent::new(JoinRule::Knock));
+    req.initial_state = vec![enc.to_raw_any(), knock.to_raw_any()];
+    // Members may set their own claim; only the hub seat invites. `events`
+    // replaces the server default map, so the defaults are restated.
     let pl = json!({
+        "invite": INVITE_LEVEL,
         "events": {
             "m.room.name": 50, "m.room.power_levels": 100, "m.room.history_visibility": 100,
             "m.room.canonical_alias": 50, "m.room.avatar": 50, "m.room.tombstone": 100,
@@ -498,6 +575,86 @@ async fn create_roster_room(agent: &AgentClient) -> Result<String> {
         .await
         .context("create_room failed")?;
     Ok(room.room_id().to_string())
+}
+
+/// Hub seat only: bring a roster room created by an earlier version (invite
+/// only, any member may invite, no alias) up to the D9 shape. Idempotent; a
+/// step that fails is logged and the next one still runs.
+async fn upgrade_room_shape(agent: &AgentClient, shared: &SeatShared, room: &Room) {
+    // join rule: knock
+    if room.join_rule().map(|j| j.as_str().to_string()).as_deref() != Some("knock") {
+        match room
+            .send_state_event_raw("m.room.join_rules", "", json!({"join_rule": "knock"}))
+            .await
+        {
+            Ok(_) => tracing::info!(seat = %shared.seat, "roster room join rule set to knock"),
+            Err(e) => tracing::warn!(seat = %shared.seat, "setting join rule knock failed: {e:#}"),
+        }
+    }
+    // only the hub seat invites
+    match room.get_state_event(StateEventType::RoomPowerLevels, "").await {
+        Ok(Some(raw)) => {
+            let json: Option<Value> = match &raw {
+                matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Sync(r) => {
+                    serde_json::from_str(r.json().get()).ok()
+                }
+                matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Stripped(r) => {
+                    serde_json::from_str(r.json().get()).ok()
+                }
+            };
+            if let Some(mut content) = json.and_then(|j| j.get("content").cloned()) {
+                if content["invite"].as_u64() != Some(u64::from(INVITE_LEVEL)) {
+                    content["invite"] = json!(INVITE_LEVEL);
+                    match room.send_state_event_raw("m.room.power_levels", "", content).await {
+                        Ok(_) => tracing::info!(seat = %shared.seat, "roster room: only level {INVITE_LEVEL}+ may invite now"),
+                        Err(e) => tracing::warn!(seat = %shared.seat, "raising the invite level failed: {e:#}"),
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(seat = %shared.seat, "reading power levels failed: {e:#}"),
+    }
+    // alias
+    if let Ok(alias) = roster_alias(agent) {
+        match agent.client().resolve_room_alias(&alias).await {
+            Ok(r) if r.room_id == room.room_id() => {}
+            Ok(r) => tracing::warn!(seat = %shared.seat, "alias {alias} points at another room ({})", r.room_id),
+            Err(_) => {
+                let req = matrix_sdk::ruma::api::client::alias::create_alias::v3::Request::new(
+                    alias.clone(),
+                    room.room_id().to_owned(),
+                );
+                match agent.client().send(req).await {
+                    Ok(_) => tracing::info!(seat = %shared.seat, "roster alias {alias} created"),
+                    Err(e) => tracing::warn!(seat = %shared.seat, "creating alias {alias} failed: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
+/// What the roster room looks like right now (for `whoami` and the e2e).
+async fn check_room_shape(agent: &AgentClient, room: &Room) -> RoomShape {
+    let join_rule = room
+        .join_rule()
+        .map(|j| j.as_str().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let alias = roster_alias(agent).ok();
+    let alias_resolves_here = match &alias {
+        Some(a) => agent
+            .client()
+            .resolve_room_alias(a)
+            .await
+            .map(|r| r.room_id == room.room_id())
+            .unwrap_or(false),
+        None => false,
+    };
+    RoomShape {
+        join_rule,
+        alias: alias.map(|a| a.to_string()),
+        alias_resolves_here,
+    }
 }
 
 async fn publish_claim(agent: &AgentClient, shared: &SeatShared, room_id: &str) -> Result<()> {

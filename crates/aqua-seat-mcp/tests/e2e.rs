@@ -22,6 +22,7 @@ const B: &str = "seat-test-b";
 const C: &str = "seat-test-c";
 
 struct Daemon {
+    stopped: bool,
     child: Child,
     client: SeatClient,
     sock: PathBuf,
@@ -47,6 +48,11 @@ impl Daemon {
         assert!(bin.exists(), "build the workspace first: {} is missing", bin.display());
         let sock = Self::sock_path();
         paths::ensure_private_dir(sock.parent().unwrap()).unwrap();
+        assert!(
+            SeatClient::new(sock.clone()).call(&Request::Ping, Duration::from_secs(2)).await.is_err(),
+            "a daemon is already answering on {}; stop it first",
+            sock.display()
+        );
         let root = paths::state_root();
         paths::ensure_private_dir(&root).unwrap();
         let log = std::fs::OpenOptions::new()
@@ -57,6 +63,7 @@ impl Daemon {
         let child = Command::new(bin)
             .env(paths::SOCK_ENV, &sock)
             .env("CLAUDE_SEATS_RATE_COUNT", "8")
+            .env("CLAUDE_SEATS_HUB", "1")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -65,7 +72,7 @@ impl Daemon {
         let client = SeatClient::new(sock.clone());
         for _ in 0..100 {
             if client.call(&Request::Ping, Duration::from_secs(2)).await.is_ok() {
-                return Daemon { child, client, sock };
+                return Daemon { stopped: false, child, client, sock };
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -84,6 +91,7 @@ impl Daemon {
     }
 
     async fn stop(mut self) {
+        self.stopped = true;
         let _ = self.client.call(&Request::Shutdown, Duration::from_secs(10)).await;
         for _ in 0..100 {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -94,6 +102,17 @@ impl Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // A failing test must not leave a daemon (and its seats' Clients) running.
+        if !self.stopped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.sock);
+        }
     }
 }
 
@@ -177,6 +196,12 @@ async fn e2_three_seats_on_dev() {
         assert!(did.starts_with("did:key:z6Mk"), "{s}: {did}");
         assert!(mxid.ends_with(":dev.matrix.inblock.io"), "{s}: {mxid}");
         assert_eq!(w["connected"], true);
+        // D9: the roster room is a knock room with the alias, on a hub daemon
+        assert_eq!(w["roster_join_rule"], "knock", "{s}: {w}");
+        assert_eq!(w["roster_alias_resolves_here"], true, "{s}: {w}");
+        assert_eq!(w["roster_alias"], "#claude-seats:dev.matrix.inblock.io");
+        assert_eq!(w["hub"], true);
+        assert!(w["host_did"].as_str().unwrap().starts_with("did:key:z6Mk"));
         ident.push((s, did, mxid, w["roster_room"].as_str().unwrap().to_string()));
     }
     assert!(ident.iter().all(|i| i.3 == ident[0].3), "all seats share one roster room");

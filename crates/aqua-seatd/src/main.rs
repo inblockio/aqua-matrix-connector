@@ -15,7 +15,7 @@ use aqua_seatd::daemon::{Config, Daemon};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "aqua-seatd", about = "Claude seats daemon (dev-only spike)")]
+#[command(name = "aqua-seatd", version, about = "Claude seats daemon (dev-only spike)")]
 struct Args {
     /// siwx-oidc provider (dev only).
     #[arg(long, env = "CLAUDE_SEATS_SIWX_URL", default_value = devguard::DEFAULT_SIWX_URL)]
@@ -40,6 +40,19 @@ struct Args {
     rate_count: usize,
     #[arg(long, env = "CLAUDE_SEATS_RATE_WINDOW_SECS", default_value_t = aqua_seat::proto::RATE_LIMIT_WINDOW_SECS)]
     rate_window_secs: u64,
+    /// Run as the hub (D9): create the roster room, invite into it, decide on
+    /// knocks from other hosts (hosts.toml). Exactly one daemon is the hub.
+    #[arg(long, env = "CLAUDE_SEATS_HUB", value_parser = clap::builder::BoolishValueParser::new())]
+    hub: bool,
+    /// The hub's host allow-list (default <state dir>/hosts.toml).
+    #[arg(long, env = "CLAUDE_SEATS_HOSTS_FILE")]
+    hosts_file: Option<PathBuf>,
+    /// Print this host's public DID (minting host.pem if needed) and exit.
+    #[arg(long)]
+    print_host_did: bool,
+    /// How long a seat waits to be let into the roster room.
+    #[arg(long, env = "CLAUDE_SEATS_JOIN_WAIT_SECS", default_value_t = 150)]
+    join_wait_secs: u64,
     /// How long an attach waits for login and the roster join.
     #[arg(long, env = "CLAUDE_SEATS_ATTACH_TIMEOUT_SECS", default_value_t = 180)]
     attach_timeout_secs: u64,
@@ -61,6 +74,11 @@ async fn main() -> Result<()> {
     let root = args.state_dir.unwrap_or_else(paths::state_root);
     let sock = args.sock.unwrap_or_else(paths::sock_path);
     paths::ensure_private_dir(&root)?;
+    let host = aqua_seatd::hostkey::ensure_host_key(&root)?;
+    if args.print_host_did {
+        println!("{}", host.did);
+        return Ok(());
+    }
     if let Some(dir) = sock.parent() {
         paths::ensure_private_dir(dir)?;
     }
@@ -92,13 +110,19 @@ async fn main() -> Result<()> {
         rate_count: args.rate_count,
         rate_window: Duration::from_secs(args.rate_window_secs),
         attach_timeout: Duration::from_secs(args.attach_timeout_secs),
+        hub: args.hub,
+        host_did: host.did.clone(),
+        hosts_file: args.hosts_file.unwrap_or_else(|| root.join("hosts.toml")),
+        join_wait: Duration::from_secs(args.join_wait_secs),
     };
     tracing::info!(
         state = %root.display(), sock = %sock.display(), host = %cfg.host,
         siwx = %cfg.siwx_url, matrix = %cfg.matrix_url,
+        hub = cfg.hub, host_did = %cfg.host_did,
         "aqua-seatd starting (dev only)"
     );
     let d = Daemon::new(cfg);
+    d.start_hub_seat();
     let server = tokio::spawn(aqua_seatd::server::serve(listener, d.clone()));
     let idle = tokio::spawn(d.clone().idle_loop());
 
