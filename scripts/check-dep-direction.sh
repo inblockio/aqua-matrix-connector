@@ -43,6 +43,8 @@ CONNECTOR_CRATES=(
   aqua-system-bridged
   aqua-messenger
   aqua-messenger-matrix
+  aqua-seat-mcp
+  aqua-seatd
 )
 
 # Anchored dependency-line regex (backend crate names only).

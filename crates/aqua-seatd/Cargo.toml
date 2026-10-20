@@ -1,0 +1,33 @@
+[package]
+name = "aqua-seatd"
+version.workspace = true
+edition.workspace = true
+description = "The Claude seats daemon (dev-only spike): one per host, owns one matrix-sdk Client and crypto store per seat (a did:key identity with a presence in the `claude-seats` roster room on dev.matrix.inblock.io), classifies direct addresses, keeps a durable inbox per seat and serves the thin MCP / listen front ends over a unix socket."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_seatd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aqua-seatd"
+path = "src/main.rs"
+
+[dependencies]
+aqua-matrix-agent.workspace = true
+aqua-seat-mcp.workspace = true
+aqua-messenger.workspace = true
+siwx-oidc-auth.workspace = true
+matrix-sdk.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

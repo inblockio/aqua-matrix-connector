@@ -1,0 +1,38 @@
+[package]
+name = "aqua-seat-mcp"
+version.workspace = true
+edition.workspace = true
+description = "Host front end of the Claude seats spike (dev only): the stdio MCP server `aqua-seat-mcp` (tools seat_whoami, seat_roster, seat_send, seat_inbox, seat_wait, seat_mark_processed), the push adapter `aqua-seat-listen`, the stress harness `aqua-seat-stress`, and the matrix-free shared library (seat naming, paths, socket protocol, untrusted-data wrapping). Never opens a Matrix client or crypto store; every call is one JSON line to `aqua-seatd`."
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "aqua_seat"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aqua-seat-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "aqua-seat-listen"
+path = "src/bin/listen.rs"
+
+[[bin]]
+name = "aqua-seat-stress"
+path = "src/bin/stress.rs"
+
+[dependencies]
+aqua-messenger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

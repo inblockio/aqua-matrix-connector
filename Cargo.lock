@@ -271,6 +271,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "aqua-seat-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-messenger",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "aqua-seatd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aqua-matrix-agent",
+ "aqua-messenger",
+ "aqua-seat-mcp",
+ "clap",
+ "matrix-sdk",
+ "serde",
+ "serde_json",
+ "siwx-oidc-auth",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aqua-system-bridge"
 version = "0.1.0"
 dependencies = [
@@ -4043,6 +4080,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

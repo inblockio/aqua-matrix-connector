@@ -12,6 +12,8 @@ members = [
     "crates/aqua-system-bridged",
     "crates/aqua-messenger",
     "crates/aqua-messenger-matrix",
+    "crates/aqua-seat-mcp",
+    "crates/aqua-seatd",
 ]
 
 # Shared metadata for every crate in the workspace. Members opt in with
@@ -35,6 +37,7 @@ aqua-matrix-orchestrator = { path = "crates/aqua-matrix-orchestrator" }
 aqua-system-bridge = { path = "crates/aqua-system-bridge" }
 aqua-messenger = { path = "crates/aqua-messenger" }
 aqua-messenger-matrix = { path = "crates/aqua-messenger-matrix" }
+aqua-seat-mcp = { path = "crates/aqua-seat-mcp" }
 
 siwx-oidc-auth = { path = "../siwx-oidc/siwx-oidc-auth" }
 # `experimental-send-custom-to-device` gates `Encryption::encrypt_and_send_raw_to_device`,
@@ -66,6 +69,7 @@ clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
+tempfile = "3"
 schemars = "1"
 # Rich-media support (attachments/voice). `mime` matches matrix-sdk's re-exported
 # version (its `send_attachment` takes a `&mime::Mime`); `mime_guess` maps a
