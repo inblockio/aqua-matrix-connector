@@ -74,25 +74,37 @@ mod tests {
     #[test]
     fn a_room_mention_of_me_is_a_direct_address_case_insensitively() {
         let m = vec!["@ME:dev.matrix.inblock.io".to_string()];
-        assert_eq!(classify(&facts(true, false, &m)), Verdict::Accept(Via::Mention));
+        assert_eq!(
+            classify(&facts(true, false, &m)),
+            Verdict::Accept(Via::Mention)
+        );
     }
 
     #[test]
     fn plain_room_chatter_is_never_direct() {
-        assert_eq!(classify(&facts(true, false, &[])), Verdict::Accept(Via::Room));
+        assert_eq!(
+            classify(&facts(true, false, &[])),
+            Verdict::Accept(Via::Room)
+        );
         assert!(!Via::Room.is_direct());
     }
 
     #[test]
     fn a_mention_of_someone_else_is_chatter_for_me() {
         let m = vec!["@other:dev.matrix.inblock.io".to_string()];
-        assert_eq!(classify(&facts(true, false, &m)), Verdict::Accept(Via::Room));
+        assert_eq!(
+            classify(&facts(true, false, &m)),
+            Verdict::Accept(Via::Room)
+        );
     }
 
     #[test]
     fn a_two_member_roster_room_is_still_the_roster_not_a_dm() {
         // The first two seats make a roster room with exactly two members.
-        assert_eq!(classify(&facts(true, true, &[])), Verdict::Accept(Via::Room));
+        assert_eq!(
+            classify(&facts(true, true, &[])),
+            Verdict::Accept(Via::Room)
+        );
     }
 
     #[test]
@@ -104,7 +116,10 @@ mod tests {
     #[test]
     fn other_group_rooms_and_own_echoes_are_ignored() {
         let m = vec![OWN.to_string()];
-        assert_eq!(classify(&facts(false, false, &m)), Verdict::Ignore(Ignore::OtherRoom));
+        assert_eq!(
+            classify(&facts(false, false, &m)),
+            Verdict::Ignore(Ignore::OtherRoom)
+        );
         let own = Facts {
             sender: "@Me:dev.matrix.inblock.io",
             ..facts(true, false, &m)

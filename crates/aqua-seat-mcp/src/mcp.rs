@@ -268,9 +268,14 @@ pub async fn call_tool(
 }
 
 /// Serve MCP over stdin/stdout until stdin closes. Logs go to stderr.
-pub async fn run_stdio(client: &SeatClient, seat: &str, by: &str, session: Option<&str>) -> anyhow::Result<()> {
-    use std::io::Write as _;
+pub async fn run_stdio(
+    client: &SeatClient,
+    seat: &str,
+    by: &str,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
     use aqua_messenger::jsonrpc::{self, Action};
+    use std::io::Write as _;
     let desc = json!({
         "server_name": SERVER_NAME,
         "instructions": instructions(seat),
@@ -314,11 +319,13 @@ mod tests {
     #[test]
     fn six_tools_all_annotated_and_named_seat_something() {
         let t = tools();
-        let names: Vec<&str> = t.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
-        assert_eq!(
-            names,
-            [T_WHOAMI, T_ROSTER, T_SEND, T_INBOX, T_WAIT, T_MARK]
-        );
+        let names: Vec<&str> = t
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, [T_WHOAMI, T_ROSTER, T_SEND, T_INBOX, T_WAIT, T_MARK]);
         for tool in t.as_array().unwrap() {
             assert!(tool["annotations"]["readOnlyHint"].is_boolean());
             assert_eq!(tool["annotations"]["destructiveHint"], false);
@@ -342,7 +349,13 @@ mod tests {
         )
         .unwrap();
         match r {
-            Request::Send { seat, to, mention, reply_to, .. } => {
+            Request::Send {
+                seat,
+                to,
+                mention,
+                reply_to,
+                ..
+            } => {
                 assert_eq!((seat.as_str(), to.as_str()), ("a", "b"));
                 assert_eq!(mention, Some(json!(true)));
                 assert_eq!(reply_to.as_deref(), Some("5"));
@@ -354,18 +367,32 @@ mod tests {
     #[test]
     fn wait_is_capped_and_mark_needs_a_note() {
         let (r, t) = build_request("a", "x", None, T_WAIT, &json!({"timeout_secs": 9999})).unwrap();
-        assert!(matches!(r, Request::Wait { timeout_secs: 300, .. }));
+        assert!(matches!(
+            r,
+            Request::Wait {
+                timeout_secs: 300,
+                ..
+            }
+        ));
         assert_eq!(t, Duration::from_secs(330));
         assert!(build_request("a", "x", None, T_WAIT, &json!({})).is_err());
         assert!(build_request("a", "x", None, T_MARK, &json!({"seq": 3})).is_err());
         assert!(build_request("a", "x", None, T_MARK, &json!({"note": "done"})).is_err());
-        let (r, _) = build_request("a", "x", None, T_MARK, &json!({"seq": 3, "seqs": [1, 2], "note": "done"})).unwrap();
+        let (r, _) = build_request(
+            "a",
+            "x",
+            None,
+            T_MARK,
+            &json!({"seq": 3, "seqs": [1, 2], "note": "done"}),
+        )
+        .unwrap();
         assert!(matches!(r, Request::MarkProcessed { ref seqs, .. } if seqs == &[1, 2, 3]));
     }
 
     #[test]
     fn the_seat_comes_from_the_server_not_from_the_model() {
-        let (r, _) = build_request("mine", "x", None, T_INBOX, &json!({"seat": "someone-else"})).unwrap();
+        let (r, _) =
+            build_request("mine", "x", None, T_INBOX, &json!({"seat": "someone-else"})).unwrap();
         assert!(matches!(r, Request::Inbox { ref seat, .. } if seat == "mine"));
     }
 

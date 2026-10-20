@@ -191,7 +191,10 @@ mod tests {
         let root = Path::new("/state/root");
         let p = SeatPaths::new(root, "seat-test-a").unwrap();
         assert_eq!(p.dir, Path::new("/state/root/seats/seat-test-a"));
-        assert_eq!(p.key(), Path::new("/state/root/seats/seat-test-a/agent.pem"));
+        assert_eq!(
+            p.key(),
+            Path::new("/state/root/seats/seat-test-a/agent.pem")
+        );
         assert!(p.store().starts_with(&p.dir));
         assert!(p.meta().starts_with(&p.dir));
     }
@@ -215,7 +218,10 @@ mod tests {
             "a b",
             &"a".repeat(41),
         ] {
-            assert!(SeatPaths::new(root, bad).is_err(), "{bad:?} must be refused");
+            assert!(
+                SeatPaths::new(root, bad).is_err(),
+                "{bad:?} must be refused"
+            );
         }
     }
 
@@ -258,7 +264,10 @@ mod tests {
         assert_eq!(sock_path(), Path::new("/some/where/s.sock"));
         std::env::remove_var(SOCK_ENV);
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/9");
-        assert_eq!(sock_path(), Path::new("/run/user/9/claude-seats/seatd.sock"));
+        assert_eq!(
+            sock_path(),
+            Path::new("/run/user/9/claude-seats/seatd.sock")
+        );
         std::env::remove_var(STATE_ENV);
         std::env::remove_var("XDG_RUNTIME_DIR");
         assert!(state_root().ends_with(".local/state/claude-seats"));

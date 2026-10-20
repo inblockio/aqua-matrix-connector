@@ -28,11 +28,19 @@ pub enum Request {
     /// Daemon-wide numbers: pid, RSS, seats and their counters.
     Stats,
     /// Make sure the seat is provisioned and syncing (mints its key if new).
-    Attach { seat: String },
+    Attach {
+        seat: String,
+    },
     /// Stop the seat syncing and drop its Client. State stays on disk.
-    Detach { seat: String },
-    Whoami { seat: String },
-    Roster { seat: String },
+    Detach {
+        seat: String,
+    },
+    Whoami {
+        seat: String,
+    },
+    Roster {
+        seat: String,
+    },
     Send {
         seat: String,
         /// A seat name (`alpha` or `alpha@host`), a DID, an MXID, or `room`
@@ -87,9 +95,19 @@ pub enum Request {
     /// The push adapter's long poll: block until a direct-address message that
     /// is unread and was not yet announced to a listener exists, return it
     /// (without marking it read) and advance the seat's listen cursor.
-    Listen { seat: String, timeout_secs: u64 },
+    Listen {
+        seat: String,
+        timeout_secs: u64,
+    },
     /// How many direct-address messages are unread (for `--nudge`).
-    Unread { seat: String },
+    Unread {
+        seat: String,
+    },
+    /// Leave the roster room and detach (admin / tests: lets a seat re-join
+    /// through the invite or knock path).
+    Leave {
+        seat: String,
+    },
     /// Stop the daemon (tests, stress harness).
     Shutdown,
 }
@@ -154,7 +172,8 @@ mod tests {
 
     #[test]
     fn requests_roundtrip_with_defaults() {
-        let r: Request = serde_json::from_str(r#"{"op":"wait","seat":"a","timeout_secs":5}"#).unwrap();
+        let r: Request =
+            serde_json::from_str(r#"{"op":"wait","seat":"a","timeout_secs":5}"#).unwrap();
         assert_eq!(
             r,
             Request::Wait {

@@ -74,8 +74,14 @@ pub fn is_valid(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_SEAT_LEN
         && name.chars().all(is_name_char)
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && name.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         && !RESERVED.contains(&name)
 }
 
@@ -98,7 +104,10 @@ pub struct Inputs {
 /// else the session part of its `tmux` field (`name:@win.%pane`).
 pub fn seat_from_session_json(text: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let named = v.get("name").and_then(|n| n.as_str()).filter(|n| !n.trim().is_empty());
+    let named = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.trim().is_empty());
     let source = v.get("nameSource").and_then(|n| n.as_str()).unwrap_or("");
     if let Some(n) = named {
         if source != "derived" {
@@ -129,7 +138,9 @@ fn session_file_seat() -> Option<String> {
 /// The tmux session of `$TMUX_PANE`. `tmux` is looked up on PATH first, then
 /// in `~/.local/bin` (not on the PATH of non-interactive shells on some hosts).
 fn tmux_session() -> Option<String> {
-    let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.trim().is_empty())?;
+    let pane = std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|p| !p.trim().is_empty())?;
     let mut candidates = vec![std::path::PathBuf::from("tmux")];
     if let Some(h) = std::env::var_os("HOME") {
         candidates.push(std::path::PathBuf::from(h).join(".local/bin/tmux"));
@@ -213,7 +224,10 @@ mod tests {
 
     #[test]
     fn sanitize_maps_to_the_charset() {
-        assert_eq!(sanitize("Claude Id Comms").as_deref(), Some("claude-id-comms"));
+        assert_eq!(
+            sanitize("Claude Id Comms").as_deref(),
+            Some("claude-id-comms")
+        );
         assert_eq!(sanitize("  Foo.Bar/baz  ").as_deref(), Some("foo-bar-baz"));
         assert_eq!(sanitize("a__b--c").as_deref(), Some("a__b-c"));
         assert_eq!(sanitize("seat-test-a").as_deref(), Some("seat-test-a"));
@@ -290,20 +304,35 @@ mod tests {
     #[test]
     fn session_file_name_wins_unless_derived_then_the_tmux_part() {
         assert_eq!(
-            seat_from_session_json(r#"{"name":"Fix The Build","nameSource":"user","tmux":"lane:@1.%2"}"#).as_deref(),
+            seat_from_session_json(
+                r#"{"name":"Fix The Build","nameSource":"user","tmux":"lane:@1.%2"}"#
+            )
+            .as_deref(),
             Some("fix-the-build")
         );
         assert_eq!(
-            seat_from_session_json(r#"{"name":"auto title","nameSource":"derived","tmux":"claude_id_comms:@3.%12"}"#).as_deref(),
+            seat_from_session_json(
+                r#"{"name":"auto title","nameSource":"derived","tmux":"claude_id_comms:@3.%12"}"#
+            )
+            .as_deref(),
             Some("claude_id_comms")
         );
         // no nameSource at all counts as not derived
-        assert_eq!(seat_from_session_json(r#"{"name":"lane-a"}"#).as_deref(), Some("lane-a"));
+        assert_eq!(
+            seat_from_session_json(r#"{"name":"lane-a"}"#).as_deref(),
+            Some("lane-a")
+        );
         // derived name and no tmux field: nothing usable
-        assert_eq!(seat_from_session_json(r#"{"name":"auto","nameSource":"derived"}"#), None);
+        assert_eq!(
+            seat_from_session_json(r#"{"name":"auto","nameSource":"derived"}"#),
+            None
+        );
         assert_eq!(seat_from_session_json(r#"{"tmux":"::"}"#), None);
         assert_eq!(seat_from_session_json("not json"), None);
-        assert_eq!(seat_from_session_json(r#"{"name":"../../etc","nameSource":"user"}"#).as_deref(), Some("etc"));
+        assert_eq!(
+            seat_from_session_json(r#"{"name":"../../etc","nameSource":"user"}"#).as_deref(),
+            Some("etc")
+        );
     }
 
     #[test]
@@ -360,7 +389,11 @@ mod tests {
     fn adhoc_without_a_session_id_is_still_valid() {
         let d = derive(&Inputs::default());
         assert_eq!(d.source, Source::Adhoc);
-        assert!(d.name.starts_with("adhoc-") && d.name.len() == 14, "{}", d.name);
+        assert!(
+            d.name.starts_with("adhoc-") && d.name.len() == 14,
+            "{}",
+            d.name
+        );
         assert!(is_valid(&d.name));
         let d = derive(&Inputs {
             session_id: Some("zz-not-hex".into()),

@@ -29,9 +29,15 @@ fn print_host_did_prints_only_the_public_did_and_is_stable() {
     assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
     let did = String::from_utf8(a.stdout).unwrap();
     let did = did.trim();
-    assert!(did.starts_with("did:key:z6Mk") && !did.contains(char::is_whitespace), "{did}");
+    assert!(
+        did.starts_with("did:key:z6Mk") && !did.contains(char::is_whitespace),
+        "{did}"
+    );
     let pem = t.path().join("host.pem");
-    assert_eq!(std::fs::metadata(&pem).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&pem).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let b = String::from_utf8(run().stdout).unwrap();
     assert_eq!(b.trim(), did, "the host DID never changes");
     // nothing else was started or created: no socket, no seats, no lock
@@ -72,6 +78,10 @@ fn hub_flag_accepts_one_from_the_environment() {
             .env("CLAUDE_SEATS_STATE", t.path())
             .output()
             .unwrap();
-        assert!(out.status.success(), "CLAUDE_SEATS_HUB={v}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "CLAUDE_SEATS_HUB={v}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -179,9 +179,10 @@ impl SeatStore {
     pub fn advance_listen_cursor(&mut self, seq: u64) {
         if seq > self.cursor {
             self.cursor = seq;
-            if let Err(e) =
-                aqua_seat::paths::write_private_atomic(&self.cursor_path, seq.to_string().as_bytes())
-            {
+            if let Err(e) = aqua_seat::paths::write_private_atomic(
+                &self.cursor_path,
+                seq.to_string().as_bytes(),
+            ) {
                 tracing::error!("listen.cursor write failed: {e:#}");
             }
         }
@@ -205,7 +206,9 @@ impl SeatStore {
             .iter()
             .map(|e| {
                 let via = self.via_of(e);
-                let peer = peers.iter().find(|p| p.mxid.eq_ignore_ascii_case(&e.sender));
+                let peer = peers
+                    .iter()
+                    .find(|p| p.mxid.eq_ignore_ascii_case(&e.sender));
                 Item {
                     seq: e.seq,
                     event_id: e.event_id.clone(),
@@ -271,7 +274,9 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut s = open(&t);
         let dm = s.ingest(entry("$1", "@a:x", "dm"), Via::Dm).unwrap();
-        let men = s.ingest(entry("$2", "@a:x", "mention"), Via::Mention).unwrap();
+        let men = s
+            .ingest(entry("$2", "@a:x", "mention"), Via::Mention)
+            .unwrap();
         let room = s.ingest(entry("$3", "@a:x", "chatter"), Via::Room).unwrap();
         assert_eq!((dm, men, room), (1, 2, 3));
         let direct: Vec<u64> = s.read(None, true, 100).iter().map(|e| e.seq).collect();

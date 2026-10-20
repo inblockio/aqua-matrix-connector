@@ -76,7 +76,10 @@ pub fn resolve<'a>(peers: &'a [Peer], query: &str) -> Result<&'a Peer, String> {
         return Err("empty recipient".into());
     }
     let known = || {
-        let mut names: Vec<String> = peers.iter().map(|p| format!("{}@{}", p.seat, p.host)).collect();
+        let mut names: Vec<String> = peers
+            .iter()
+            .map(|p| format!("{}@{}", p.seat, p.host))
+            .collect();
         names.sort();
         if names.is_empty() {
             "the roster is empty".to_string()
@@ -143,7 +146,12 @@ mod tests {
         let c = claim_content("alpha", "did:key:z6MkAbc", "hostA", Some("AQUA_x"));
         let p = parse_claim(&ev("@u:x", "@u:x", c), &joined(&["@u:x"])).unwrap();
         assert_eq!(
-            (p.seat.as_str(), p.did.as_str(), p.host.as_str(), p.mxid.as_str()),
+            (
+                p.seat.as_str(),
+                p.did.as_str(),
+                p.host.as_str(),
+                p.mxid.as_str()
+            ),
             ("alpha", "did:key:z6MkAbc", "hostA", "@u:x")
         );
     }
@@ -167,27 +175,50 @@ mod tests {
             claim_content("alpha", "did:key:z6MkAbc", "ho st", None),
             claim_content("alpha", "did:key:z6MkAbc", "", None),
         ] {
-            assert!(parse_claim(&ev("@u:x", "@u:x", bad.clone()), &joined(&["@u:x"])).is_none(), "{bad}");
+            assert!(
+                parse_claim(&ev("@u:x", "@u:x", bad.clone()), &joined(&["@u:x"])).is_none(),
+                "{bad}"
+            );
         }
-        let wrong_type = json!({"type": "m.room.name", "sender": "@u:x", "state_key": "@u:x", "content": ok});
+        let wrong_type =
+            json!({"type": "m.room.name", "sender": "@u:x", "state_key": "@u:x", "content": ok});
         assert!(parse_claim(&wrong_type, &joined(&["@u:x"])).is_none());
     }
 
     #[test]
     fn resolve_by_name_host_did_and_mxid() {
-        let peers = vec![peer("alpha", "hostA", 1), peer("beta", "hostA", 2), peer("alpha", "hostB", 3)];
-        assert_eq!(resolve(&peers, "beta").unwrap().mxid, "@u2:dev.matrix.inblock.io");
-        assert_eq!(resolve(&peers, "alpha@hostB").unwrap().mxid, "@u3:dev.matrix.inblock.io");
-        assert_eq!(resolve(&peers, "alpha@HOSTA").unwrap().mxid, "@u1:dev.matrix.inblock.io");
+        let peers = vec![
+            peer("alpha", "hostA", 1),
+            peer("beta", "hostA", 2),
+            peer("alpha", "hostB", 3),
+        ];
+        assert_eq!(
+            resolve(&peers, "beta").unwrap().mxid,
+            "@u2:dev.matrix.inblock.io"
+        );
+        assert_eq!(
+            resolve(&peers, "alpha@hostB").unwrap().mxid,
+            "@u3:dev.matrix.inblock.io"
+        );
+        assert_eq!(
+            resolve(&peers, "alpha@HOSTA").unwrap().mxid,
+            "@u1:dev.matrix.inblock.io"
+        );
         assert_eq!(resolve(&peers, "did:key:z6MkTest2").unwrap().seat, "beta");
-        assert_eq!(resolve(&peers, "@U2:dev.matrix.inblock.io").unwrap().seat, "beta");
+        assert_eq!(
+            resolve(&peers, "@U2:dev.matrix.inblock.io").unwrap().seat,
+            "beta"
+        );
     }
 
     #[test]
     fn resolve_refuses_ambiguous_and_unknown_with_a_useful_error() {
         let peers = vec![peer("alpha", "hostA", 1), peer("alpha", "hostB", 3)];
         let e = resolve(&peers, "alpha").unwrap_err();
-        assert!(e.contains("ambiguous") && e.contains("alpha@hostA") && e.contains("alpha@hostB"), "{e}");
+        assert!(
+            e.contains("ambiguous") && e.contains("alpha@hostA") && e.contains("alpha@hostB"),
+            "{e}"
+        );
         let e = resolve(&peers, "nobody").unwrap_err();
         assert!(e.contains("known seats"), "{e}");
         assert!(resolve(&[], "x").unwrap_err().contains("empty"));

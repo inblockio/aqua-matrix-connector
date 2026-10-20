@@ -10,8 +10,10 @@
 
 pub mod classify;
 pub mod daemon;
+pub mod endorse;
 pub mod hostkey;
 pub mod hosts;
+pub mod hub;
 pub mod keys;
 pub mod knock;
 pub mod meta;

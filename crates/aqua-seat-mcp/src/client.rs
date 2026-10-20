@@ -88,7 +88,10 @@ impl SeatClient {
                     return Err(self.unreachable(&first));
                 }
                 spawn_daemon(&self.sock).map_err(|e| {
-                    format!("{}; starting aqua-seatd failed too: {e}", self.unreachable(&first))
+                    format!(
+                        "{}; starting aqua-seatd failed too: {e}",
+                        self.unreachable(&first)
+                    )
                 })?;
                 for _ in 0..100 {
                     tokio::time::sleep(Duration::from_millis(150)).await;

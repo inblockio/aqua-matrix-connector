@@ -15,7 +15,11 @@ use aqua_seatd::daemon::{Config, Daemon};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "aqua-seatd", version, about = "Claude seats daemon (dev-only spike)")]
+#[command(
+    name = "aqua-seatd",
+    version,
+    about = "Claude seats daemon (dev-only spike)"
+)]
 struct Args {
     /// siwx-oidc provider (dev only).
     #[arg(long, env = "CLAUDE_SEATS_SIWX_URL", default_value = devguard::DEFAULT_SIWX_URL)]

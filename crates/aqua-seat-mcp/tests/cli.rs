@@ -30,7 +30,12 @@ fn listen_exits_1_when_the_daemon_is_unreachable_and_nudge_stays_silent() {
     c.args(["--seat", "seat-cli-test", "--timeout", "5"]);
     env(&mut c);
     let out = c.output().unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot reach aqua-seatd"));
 
@@ -39,7 +44,10 @@ fn listen_exits_1_when_the_daemon_is_unreachable_and_nudge_stays_silent() {
     env(&mut c);
     let out = c.output().unwrap();
     assert_eq!(out.status.code(), Some(0));
-    assert!(out.stdout.is_empty(), "nudge prints nothing when nothing is unread");
+    assert!(
+        out.stdout.is_empty(),
+        "nudge prints nothing when nothing is unread"
+    );
 }
 
 #[test]

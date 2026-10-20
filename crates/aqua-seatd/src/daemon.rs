@@ -61,6 +61,8 @@ pub struct Daemon {
     pub roster_create: tokio::sync::Mutex<()>,
     pub shutdown: Notify,
     started: Instant,
+    /// The hub's host allow-list (hot-reloaded `hosts.toml`).
+    pub hosts: Mutex<crate::hosts::HostList>,
 }
 
 fn rss_kb() -> u64 {
@@ -94,12 +96,14 @@ fn actor(by: Option<&str>, session: Option<&str>) -> Actor {
 
 impl Daemon {
     pub fn new(cfg: Config) -> Arc<Self> {
+        let cfg_hosts = cfg.hosts_file.clone();
         Arc::new(Self {
             cfg,
             seats: Mutex::new(HashMap::new()),
             roster_create: tokio::sync::Mutex::new(()),
             shutdown: Notify::new(),
             started: Instant::now(),
+            hosts: Mutex::new(crate::hosts::HostList::new(cfg_hosts)),
         })
     }
 
@@ -134,7 +138,11 @@ impl Daemon {
     }
 
     /// Make sure the seat's runner is going; optionally wait until it is ready.
-    pub async fn attach(self: &Arc<Self>, seat: &str, wait: bool) -> Result<Arc<SeatEntry>, String> {
+    pub async fn attach(
+        self: &Arc<Self>,
+        seat: &str,
+        wait: bool,
+    ) -> Result<Arc<SeatEntry>, String> {
         let e = self.entry(seat)?;
         e.shared.touch();
         {
@@ -173,7 +181,8 @@ impl Daemon {
                     "seat {} is not ready after {}s{}",
                     e.shared.seat,
                     self.cfg.attach_timeout.as_secs(),
-                    last.map(|l| format!(" (last error: {l})")).unwrap_or_default()
+                    last.map(|l| format!(" (last error: {l})"))
+                        .unwrap_or_default()
                 ))
             }
         }
@@ -187,7 +196,10 @@ impl Daemon {
         };
         h.stop.notify_one();
         let mut join = h.join;
-        if tokio::time::timeout(Duration::from_secs(30), &mut join).await.is_err() {
+        if tokio::time::timeout(Duration::from_secs(30), &mut join)
+            .await
+            .is_err()
+        {
             join.abort();
             let _ = join.await;
         }
@@ -226,7 +238,8 @@ impl Daemon {
             }
         }
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(e, SeatCmd::RefreshRoster { done: tx }).await?;
+        self.send_cmd(e, SeatCmd::RefreshRoster { done: tx })
+            .await?;
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err("the seat stopped while reading the roster".into()),
@@ -244,7 +257,12 @@ impl Daemon {
 
     /// Ask the hub seat (the roster room's creator, the only member who may
     /// invite) to invite `mxid`. The creator is attached first if needed.
-    pub async fn request_roster_invite(self: &Arc<Self>, requester: &str, mxid: &str, rf: &RoomFile) {
+    pub async fn request_roster_invite(
+        self: &Arc<Self>,
+        requester: &str,
+        mxid: &str,
+        rf: &RoomFile,
+    ) {
         if rf.created_by.is_empty() || rf.created_by == requester {
             return;
         }
@@ -284,13 +302,22 @@ impl Daemon {
     async fn try_invite(&self, e: &Arc<SeatEntry>, mxid: &str) -> bool {
         let (tx, rx) = oneshot::channel();
         if self
-            .send_cmd(e, SeatCmd::Invite { mxid: mxid.to_string(), done: tx })
+            .send_cmd(
+                e,
+                SeatCmd::Invite {
+                    mxid: mxid.to_string(),
+                    done: tx,
+                },
+            )
             .await
             .is_err()
         {
             return false;
         }
-        matches!(tokio::time::timeout(Duration::from_secs(30), rx).await, Ok(Ok(Ok(()))))
+        matches!(
+            tokio::time::timeout(Duration::from_secs(30), rx).await,
+            Ok(Ok(Ok(())))
+        )
     }
 
     /// Detach seats nobody has touched for `idle_detach`.
@@ -313,7 +340,8 @@ impl Daemon {
     }
 
     pub async fn idle_loop(self: Arc<Self>) {
-        let period = (self.cfg.idle_detach / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let period =
+            (self.cfg.idle_detach / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
         let mut t = tokio::time::interval(period);
         loop {
             t.tick().await;
@@ -346,6 +374,21 @@ impl Daemon {
                 let was = self.detach(&seat).await?;
                 Ok(json!({"seat": seat, "was_attached": was}))
             }
+            Request::Leave { seat } => {
+                let e = self.attach(&seat, true).await?;
+                let (tx, rx) = oneshot::channel();
+                self.send_cmd(&e, SeatCmd::LeaveRoster { done: tx }).await?;
+                let r = match tokio::time::timeout(Duration::from_secs(60), rx).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(_)) => Err("the seat stopped".to_string()),
+                    Err(_) => Err("leaving timed out".to_string()),
+                };
+                r?;
+                *e.shared.roster_room.lock().unwrap() = None;
+                *e.shared.room_shape.lock().unwrap() = None;
+                self.detach(&seat).await?;
+                Ok(json!({"seat": seat, "left_roster": true}))
+            }
             Request::Whoami { seat } => {
                 let e = self.attach(&seat, true).await?;
                 Ok(self.whoami(&e))
@@ -355,16 +398,31 @@ impl Daemon {
                 let peers = self.roster_for(&e, Duration::from_secs(5)).await?;
                 Ok(self.roster_json(&e, &peers))
             }
-            Request::Send { seat, to, text, reply_to, mention } => {
-                self.op_send(&seat, &to, &text, reply_to.as_deref(), mention.as_ref()).await
+            Request::Send {
+                seat,
+                to,
+                text,
+                reply_to,
+                mention,
+            } => {
+                self.op_send(&seat, &to, &text, reply_to.as_deref(), mention.as_ref())
+                    .await
             }
-            Request::Inbox { seat, since, addressed_only, limit, by, session } => {
+            Request::Inbox {
+                seat,
+                since,
+                addressed_only,
+                limit,
+                by,
+                session,
+            } => {
                 let e = self.attach(&seat, true).await?;
                 let a = actor(by.as_deref(), session.as_deref());
                 let peers = self.peers_best_effort(&e, Duration::from_secs(30)).await;
                 let items = {
                     let mut st = e.shared.store.lock().unwrap();
-                    let entries = st.read(since, addressed_only, limit.unwrap_or(100).clamp(1, 500));
+                    let entries =
+                        st.read(since, addressed_only, limit.unwrap_or(100).clamp(1, 500));
                     // Shown with the state they had before this read: `new`
                     // means this is the first time any session sees it.
                     let items = st.items(&entries, &peers);
@@ -374,11 +432,23 @@ impl Daemon {
                 };
                 Ok(items_json(&items, "inbox"))
             }
-            Request::Wait { seat, timeout_secs, after_seq, addressed_only, by, session } => {
+            Request::Wait {
+                seat,
+                timeout_secs,
+                after_seq,
+                addressed_only,
+                by,
+                session,
+            } => {
                 let e = self.attach(&seat, true).await?;
                 let a = actor(by.as_deref(), session.as_deref());
                 let entries = self
-                    .wait_new(&e, timeout_secs.clamp(1, MAX_WAIT_SECS), after_seq, addressed_only)
+                    .wait_new(
+                        &e,
+                        timeout_secs.clamp(1, MAX_WAIT_SECS),
+                        after_seq,
+                        addressed_only,
+                    )
                     .await;
                 let peers = if entries.is_empty() {
                     Vec::new()
@@ -400,13 +470,32 @@ impl Daemon {
                     st.mark_seen(&seqs, &a);
                     items
                 };
-                Ok(items_json(&items, if items.is_empty() { "timed out" } else { "wait" }))
+                Ok(items_json(
+                    &items,
+                    if items.is_empty() {
+                        "timed out"
+                    } else {
+                        "wait"
+                    },
+                ))
             }
-            Request::MarkProcessed { seat, seqs, note, by, session } => {
+            Request::MarkProcessed {
+                seat,
+                seqs,
+                note,
+                by,
+                session,
+            } => {
                 let e = self.attach(&seat, false).await?;
-                let note = format::sanitize_note(&note).ok_or("a note saying what was done is required")?;
+                let note = format::sanitize_note(&note)
+                    .ok_or("a note saying what was done is required")?;
                 let a = actor(by.as_deref(), session.as_deref());
-                let r = e.shared.store.lock().unwrap().mark_processed(&seqs, &a, &note);
+                let r = e
+                    .shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .mark_processed(&seqs, &a, &note);
                 Ok(json!({
                     "marked": r.marked,
                     "already_processed": r.already.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
@@ -415,7 +504,8 @@ impl Daemon {
             }
             Request::Listen { seat, timeout_secs } => {
                 let e = self.attach(&seat, true).await?;
-                self.op_listen(&e, timeout_secs.clamp(1, MAX_WAIT_SECS)).await
+                self.op_listen(&e, timeout_secs.clamp(1, MAX_WAIT_SECS))
+                    .await
             }
             Request::Unread { seat } => {
                 // Non-blocking: start syncing in the background, answer from disk.
@@ -454,9 +544,12 @@ impl Daemon {
             .entries()
             .iter()
             .filter_map(|x| {
-                x.shared
-                    .mxid()
-                    .map(|m| (m.to_ascii_lowercase(), *x.shared.run_state.borrow() == RunState::Ready))
+                x.shared.mxid().map(|m| {
+                    (
+                        m.to_ascii_lowercase(),
+                        *x.shared.run_state.borrow() == RunState::Ready,
+                    )
+                })
             })
             .collect();
         let list: Vec<Value> = peers
@@ -500,7 +593,12 @@ impl Daemon {
             tokio::pin!(notified);
             notified.as_mut().enable();
             e.shared.touch();
-            let found = e.shared.store.lock().unwrap().new_entries(after_seq, addressed_only);
+            let found = e
+                .shared
+                .store
+                .lock()
+                .unwrap()
+                .new_entries(after_seq, addressed_only);
             if !found.is_empty() {
                 return found;
             }
@@ -566,10 +664,15 @@ impl Daemon {
         let sh = &e.shared;
         let own = sh.mxid().ok_or("the seat has no Matrix identity yet")?;
         let peers = self.roster_for(&e, Duration::from_secs(5)).await?;
-        let room_id = sh.roster_room_id().ok_or("the seat has no roster room yet")?;
+        let room_id = sh
+            .roster_room_id()
+            .ok_or("the seat has no roster room yet")?;
 
         let to_trim = to.trim();
-        let to_room = matches!(to_trim.to_ascii_lowercase().as_str(), "room" | "roster" | "claude-seats");
+        let to_room = matches!(
+            to_trim.to_ascii_lowercase().as_str(),
+            "room" | "roster" | "claude-seats"
+        );
         let mention_flag = match mention {
             None | Some(Value::Null) | Some(Value::Bool(false)) => None,
             Some(Value::Bool(true)) => Some(None),
@@ -593,9 +696,10 @@ impl Daemon {
                     target = Some(p);
                     via = "mention";
                 }
-                Some(None) => {
-                    return Err("`mention: true` needs a seat in `to`; for the room, name the seat to mention".into())
-                }
+                Some(None) => return Err(
+                    "`mention: true` needs a seat in `to`; for the room, name the seat to mention"
+                        .into(),
+                ),
             }
         } else {
             let p = roster::resolve(&peers, to_trim)?.clone();
@@ -620,7 +724,10 @@ impl Daemon {
         let mut content = match (&target, via) {
             (Some(p), "mention") => aqua_matrix_agent::mention_content(
                 text,
-                &RoomMention { user_id: &p.mxid, display: &p.seat },
+                &RoomMention {
+                    user_id: &p.mxid,
+                    display: &p.seat,
+                },
             )
             .map_err(|e| format!("{e:#}"))?,
             _ => RoomMessageEventContent::text_markdown(text),
@@ -632,13 +739,24 @@ impl Daemon {
                     .unwrap()
                     .event_id_of_seq(seq)
                     .ok_or_else(|| format!("no inbox entry with seq {seq}"))?
-            } else if r.starts_with('$') && r.len() > 1 && r.len() <= 255 && !r.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            } else if r.starts_with('$')
+                && r.len() > 1
+                && r.len() <= 255
+                && !r.chars().any(|c| c.is_whitespace() || c.is_control())
+            {
                 r.to_string()
             } else {
-                return Err(format!("reply_to {r:?} is neither an inbox seq nor a Matrix event id"));
+                return Err(format!(
+                    "reply_to {r:?} is neither an inbox seq nor a Matrix event id"
+                ));
             };
-            let id: matrix_sdk::ruma::OwnedEventId = event_id.as_str().try_into().map_err(|e| format!("bad event id: {e}"))?;
-            content.relates_to = Some(Relation::Reply(matrix_sdk::ruma::events::relation::Reply::with_event_id(id)));
+            let id: matrix_sdk::ruma::OwnedEventId = event_id
+                .as_str()
+                .try_into()
+                .map_err(|e| format!("bad event id: {e}"))?;
+            content.relates_to = Some(Relation::Reply(
+                matrix_sdk::ruma::events::relation::Reply::with_event_id(id),
+            ));
         }
 
         // Per-recipient budget: the recipient's MXID, or the room.
@@ -768,15 +886,22 @@ mod tests {
 
     #[test]
     fn twenty_sends_per_ten_minutes_per_recipient_then_refused() {
-        let (count, window) = (aqua_seat::proto::RATE_LIMIT_COUNT, Duration::from_secs(aqua_seat::proto::RATE_LIMIT_WINDOW_SECS));
+        let (count, window) = (
+            aqua_seat::proto::RATE_LIMIT_COUNT,
+            Duration::from_secs(aqua_seat::proto::RATE_LIMIT_WINDOW_SECS),
+        );
         assert_eq!((count, window.as_secs()), (20, 600));
         let mut rl = RateLimiter::new(count, window);
         let t0 = Instant::now();
         for i in 0..20 {
-            acquire_budget(&mut rl, "@b:x", t0, count, window).unwrap_or_else(|e| panic!("send {i}: {e}"));
+            acquire_budget(&mut rl, "@b:x", t0, count, window)
+                .unwrap_or_else(|e| panic!("send {i}: {e}"));
         }
         let e = acquire_budget(&mut rl, "@b:x", t0, count, window).unwrap_err();
-        assert!(e.contains("rate limit") && e.contains("20 sends per 600"), "{e}");
+        assert!(
+            e.contains("rate limit") && e.contains("20 sends per 600"),
+            "{e}"
+        );
         // another recipient has its own budget
         acquire_budget(&mut rl, "@c:x", t0, count, window).unwrap();
         // and the window recovers

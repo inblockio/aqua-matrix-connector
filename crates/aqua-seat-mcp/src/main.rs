@@ -5,7 +5,11 @@ use aqua_seat::{client::SeatClient, mcp, seatname};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "aqua-seat-mcp", version, about = "stdio MCP server `seat` for Claude seats (dev-only spike)")]
+#[command(
+    name = "aqua-seat-mcp",
+    version,
+    about = "stdio MCP server `seat` for Claude seats (dev-only spike)"
+)]
 struct Args {
     /// Seat name; default: CLAUDE_SEAT, else the tmux session name, else ad hoc.
     #[arg(long)]

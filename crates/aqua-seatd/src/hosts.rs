@@ -47,7 +47,10 @@ pub fn parse(text: &str) -> Result<Vec<HostEntry>, String> {
             return Err(format!("hosts.toml: {:?} is not an Ed25519 did:key", h.did));
         }
         if !valid_host_name(&h.name) {
-            return Err(format!("hosts.toml: {:?} is not a usable host name", h.name));
+            return Err(format!(
+                "hosts.toml: {:?} is not a usable host name",
+                h.name
+            ));
         }
         if !seen.insert(h.did.clone()) {
             return Err(format!("hosts.toml: {} is listed twice", h.did));
@@ -78,7 +81,9 @@ impl HostList {
     /// Re-read the file if it changed. A file that fails to parse keeps the
     /// previous list out of service: the list becomes empty (fail closed).
     pub fn reload(&mut self) {
-        let mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
         if mtime == self.mtime && (self.mtime.is_some() || self.entries.is_empty()) {
             return;
         }
@@ -158,7 +163,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&p, "[[hosts]]\ndid = \"nope\"\nname = \"x\"\n").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::open(&p).unwrap().set_modified(later).unwrap();
+        std::fs::File::open(&p)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
         assert!(l.lookup(D1).is_none());
     }
 }

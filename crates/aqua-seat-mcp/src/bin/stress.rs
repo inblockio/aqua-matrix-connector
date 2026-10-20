@@ -32,7 +32,11 @@ use tokio::sync::Semaphore;
 const DEV_SSH: [&str; 2] = ["-p 8022", "dev@207.154.209.103"];
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "aqua-seat-stress", version, about = "Claude seats stress harness (dev only)")]
+#[command(
+    name = "aqua-seat-stress",
+    version,
+    about = "Claude seats stress harness (dev only)"
+)]
 struct Args {
     /// Number of seats (seat-stress-00 .. K-1).
     #[arg(long, default_value_t = 3)]
@@ -90,9 +94,13 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.min(sorted.len()) - 1]
 }
 
-fn stats_line(v: &mut Vec<f64>) -> (f64, f64, f64) {
+fn stats_line(v: &mut [f64]) -> (f64, f64, f64) {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (pct(v, 50.0), pct(v, 95.0), v.last().copied().unwrap_or(f64::NAN))
+    (
+        pct(v, 50.0),
+        pct(v, 95.0),
+        v.last().copied().unwrap_or(f64::NAN),
+    )
 }
 
 // ---- dev box (read-only) --------------------------------------------------
@@ -114,7 +122,8 @@ async fn dev_sample(label: &str) -> DevSample {
         ..Default::default()
     };
     // Exactly the three read-only commands the plan allows.
-    let remote = "free -m; uptime; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}'";
+    let remote =
+        "free -m; uptime; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}'";
     let out = tokio::time::timeout(
         Duration::from_secs(90),
         Command::new("ssh")
@@ -166,8 +175,12 @@ fn dev_line(s: &DevSample) -> String {
         "{:<7} load {} | mem available {} MB, swap used {} MB | synapse {} | siwx-oidc {}",
         s.label,
         s.load,
-        s.mem_available_mb.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
-        s.swap_used_mb.map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+        s.mem_available_mb
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
+        s.swap_used_mb
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into()),
         s.synapse,
         s.siwx
     )
@@ -197,8 +210,15 @@ fn seatd_binary(args: &Args) -> PathBuf {
 
 async fn start_daemon(args: &Args, sock: &PathBuf) -> Result<Daemon> {
     let client = SeatClient::new(sock.clone());
-    if client.call(&Request::Ping, Duration::from_secs(2)).await.is_ok() {
-        bail!("a daemon already answers on {}; stop it first", sock.display());
+    if client
+        .call(&Request::Ping, Duration::from_secs(2))
+        .await
+        .is_ok()
+    {
+        bail!(
+            "a daemon already answers on {}; stop it first",
+            sock.display()
+        );
     }
     paths::ensure_private_dir(sock.parent().context("socket path has no parent")?)?;
     let root = paths::state_root();
@@ -220,7 +240,11 @@ async fn start_daemon(args: &Args, sock: &PathBuf) -> Result<Daemon> {
         .spawn()
         .context("starting aqua-seatd")?;
     for _ in 0..200 {
-        if client.call(&Request::Ping, Duration::from_secs(2)).await.is_ok() {
+        if client
+            .call(&Request::Ping, Duration::from_secs(2))
+            .await
+            .is_ok()
+        {
             return Ok(Daemon {
                 child: Some(child),
                 client,
@@ -228,11 +252,17 @@ async fn start_daemon(args: &Args, sock: &PathBuf) -> Result<Daemon> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    bail!("aqua-seatd did not answer on {} (see {}/seatd-stress.log)", sock.display(), root.display())
+    bail!(
+        "aqua-seatd did not answer on {} (see {}/seatd-stress.log)",
+        sock.display(),
+        root.display()
+    )
 }
 
 async fn daemon_stats(c: &SeatClient) -> Result<Value> {
-    c.call(&Request::Stats, Duration::from_secs(30)).await.map_err(anyhow::Error::msg)
+    c.call(&Request::Stats, Duration::from_secs(30))
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 fn cpu_ticks(pid: u64) -> Option<u64> {
@@ -271,7 +301,11 @@ fn parse_body(run: &str, body: &str) -> Option<(usize, u64, u64)> {
     if it.next()? != "stress" || it.next()? != run {
         return None;
     }
-    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    Some((
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+    ))
 }
 
 #[derive(Default)]
@@ -309,7 +343,10 @@ async fn sender(c: SeatClient, seat: String, idx: usize, args: Args, run: String
         match r {
             Ok(_) => {
                 sh.sent.fetch_add(1, Ordering::Relaxed);
-                sh.send_ms.lock().unwrap().push(t0.elapsed().as_secs_f64() * 1000.0);
+                sh.send_ms
+                    .lock()
+                    .unwrap()
+                    .push(t0.elapsed().as_secs_f64() * 1000.0);
             }
             Err(e) => {
                 sh.send_errors.fetch_add(1, Ordering::Relaxed);
@@ -404,9 +441,14 @@ async fn main() -> Result<()> {
             .join("claude-seats/stress.sock")
     });
     let run = format!("{}", now_ms());
-    let names: Vec<String> = (0..args.seats).map(|i| format!("{}-{i:02}", args.prefix)).collect();
+    let names: Vec<String> = (0..args.seats)
+        .map(|i| format!("{}-{i:02}", args.prefix))
+        .collect();
     let root = paths::state_root();
-    let preexisting = names.iter().filter(|n| root.join("seats").join(n).exists()).count();
+    let preexisting = names
+        .iter()
+        .filter(|n| root.join("seats").join(n).exists())
+        .count();
     println!(
         "aqua-seat-stress run {run}: K={} rate={}/min/seat duration={}s drain={}s payload={}B (dev only)",
         args.seats, args.rate, args.duration, args.drain, args.payload
@@ -454,7 +496,13 @@ async fn main() -> Result<()> {
             let t0 = Instant::now();
             let mut last = String::new();
             for _ in 0..2 {
-                match c.call(&Request::Attach { seat: name.clone() }, Duration::from_secs(450)).await {
+                match c
+                    .call(
+                        &Request::Attach { seat: name.clone() },
+                        Duration::from_secs(450),
+                    )
+                    .await
+                {
                     Ok(_) => return (name, Ok(t0.elapsed().as_secs_f64())),
                     Err(e) => last = e,
                 }
@@ -489,7 +537,11 @@ async fn main() -> Result<()> {
     let live: Vec<(usize, String)> = names
         .iter()
         .enumerate()
-        .filter(|(_, n)| !attach_failed.iter().any(|f| f.starts_with(&format!("{n}:"))))
+        .filter(|(_, n)| {
+            !attach_failed
+                .iter()
+                .any(|f| f.starts_with(&format!("{n}:")))
+        })
         .map(|(i, n)| (i, n.clone()))
         .collect();
 
@@ -498,10 +550,22 @@ async fn main() -> Result<()> {
     let mut roster_ok = false;
     while t0.elapsed() < Duration::from_secs(120) {
         if let Some((_, first)) = live.first() {
-            if let Ok(r) = c.call(&Request::Roster { seat: first.clone() }, Duration::from_secs(60)).await {
+            if let Ok(r) = c
+                .call(
+                    &Request::Roster {
+                        seat: first.clone(),
+                    },
+                    Duration::from_secs(60),
+                )
+                .await
+            {
                 let have: Vec<String> = r["peers"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|p| p["seat"].as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p["seat"].as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if live.iter().all(|(_, n)| have.contains(n)) {
                     roster_ok = true;
@@ -511,36 +575,68 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
-    println!("roster lists all {} seats: {} ({:.0}s)", live.len(), roster_ok, t0.elapsed().as_secs_f64());
+    println!(
+        "roster lists all {} seats: {} ({:.0}s)",
+        live.len(),
+        roster_ok,
+        t0.elapsed().as_secs_f64()
+    );
 
     // -- load ------------------------------------------------------------------------
     let sh = Arc::new(Shared::default());
     let mut recv_tasks = Vec::new();
     for (i, n) in &live {
-        recv_tasks.push(tokio::spawn(receiver(c.clone(), n.clone(), *i, run.clone(), sh.clone())));
+        recv_tasks.push(tokio::spawn(receiver(
+            c.clone(),
+            n.clone(),
+            *i,
+            run.clone(),
+            sh.clone(),
+        )));
     }
     let tck = clk_tck();
     let cpu0 = cpu_ticks(pid);
     let load_start = Instant::now();
     let mut send_tasks = Vec::new();
     for (i, n) in &live {
-        send_tasks.push(tokio::spawn(sender(c.clone(), n.clone(), *i, args.clone(), run.clone(), sh.clone())));
+        send_tasks.push(tokio::spawn(sender(
+            c.clone(),
+            n.clone(),
+            *i,
+            args.clone(),
+            run.clone(),
+            sh.clone(),
+        )));
     }
     // sampler: RSS every 10 s, one dev sample mid-load
     let mut rss_samples: Vec<u64> = vec![rss_attached];
     let mut aborted: Option<String> = None;
     let mut mid_taken = false;
     while load_start.elapsed() < Duration::from_secs(args.duration) {
-        tokio::time::sleep(Duration::from_secs(10).min(Duration::from_secs(args.duration).saturating_sub(load_start.elapsed()).max(Duration::from_millis(100)))).await;
+        tokio::time::sleep(
+            Duration::from_secs(10).min(
+                Duration::from_secs(args.duration)
+                    .saturating_sub(load_start.elapsed())
+                    .max(Duration::from_millis(100)),
+            ),
+        )
+        .await;
         if let Ok(s) = daemon_stats(&c).await {
             rss_samples.push(s["rss_kb"].as_u64().unwrap_or(0));
         }
-        if args.dev_metrics && !mid_taken && load_start.elapsed() >= Duration::from_secs(args.duration / 2) {
+        if args.dev_metrics
+            && !mid_taken
+            && load_start.elapsed() >= Duration::from_secs(args.duration / 2)
+        {
             mid_taken = true;
             let s = dev_sample("during").await;
             println!("dev box {}", dev_line(&s));
             if s.mem_available_mb.is_some_and(|m| m < args.abort_below_mb) {
-                aborted = Some(format!("dev box memory available {} MB < {}", s.mem_available_mb.unwrap(), args.abort_below_mb));
+                aborted = Some(format!(
+                    "dev box memory available {} MB < {}",
+                    s.mem_available_mb.unwrap(),
+                    args.abort_below_mb
+                ));
                 dev_samples.push(s);
                 break;
             }
@@ -581,21 +677,37 @@ async fn main() -> Result<()> {
     let (s50, s95, _) = stats_line(&mut sm);
     let fin = daemon_stats(&c).await?;
     let rss_final = fin["rss_kb"].as_u64().unwrap_or(0);
-    let rss_peak = rss_samples.iter().copied().max().unwrap_or(0).max(rss_final);
+    let rss_peak = rss_samples
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(rss_final);
     let seats_json = fin["seats"].as_array().cloned().unwrap_or_default();
     let sum = |k: &str| -> u64 {
         seats_json
             .iter()
-            .filter(|s| s["seat"].as_str().is_some_and(|n| n.starts_with(&args.prefix)))
+            .filter(|s| {
+                s["seat"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with(&args.prefix))
+            })
             .filter_map(|s| s[k].as_u64())
             .sum()
     };
-    let (utd_seen, utd_rec, utd_unres, backfilled) = (sum("utd_seen"), sum("utd_recovered"), sum("utd_unresolved"), sum("backfilled"));
+    let (utd_seen, utd_rec, utd_unres, backfilled) = (
+        sum("utd_seen"),
+        sum("utd_recovered"),
+        sum("utd_unresolved"),
+        sum("backfilled"),
+    );
     let attached_n = attach_s.len().max(1) as f64;
     let per_seat_mb = (rss_attached.saturating_sub(rss_base)) as f64 / 1024.0 / attached_n;
     let per_seat_peak_mb = (rss_peak.saturating_sub(rss_base)) as f64 / 1024.0 / attached_n;
     let cpu_pct = match (cpu0, cpu1) {
-        (Some(a), Some(b)) if load_secs > 0.0 => (b.saturating_sub(a)) as f64 / tck / load_secs * 100.0,
+        (Some(a), Some(b)) if load_secs > 0.0 => {
+            (b.saturating_sub(a)) as f64 / tck / load_secs * 100.0
+        }
         _ => f64::NAN,
     };
     let mut at = attach_s.clone();
@@ -603,10 +715,20 @@ async fn main() -> Result<()> {
 
     println!("\n=== K={} (run {run}) ===", args.seats);
     println!("| item | value |\n|---|---|");
-    println!("| seats attached | {}/{} ({} fresh identities minted, {} reused) |", attach_s.len(), names.len(), names.len() - preexisting, preexisting);
+    println!(
+        "| seats attached | {}/{} ({} fresh identities minted, {} reused) |",
+        attach_s.len(),
+        names.len(),
+        names.len() - preexisting,
+        preexisting
+    );
     println!("| attach time p50 / p95 / total | {a50:.1} s / {a95:.1} s / {attach_total:.0} s |");
     println!("| roster converged | {roster_ok} |");
-    println!("| load | {sent} msgs sent ({} errors) over {load_secs:.0} s, {} expected deliveries |", sh.send_errors.load(Ordering::Relaxed), expected);
+    println!(
+        "| load | {sent} msgs sent ({} errors) over {load_secs:.0} s, {} expected deliveries |",
+        sh.send_errors.load(Ordering::Relaxed),
+        expected
+    );
     println!("| delivered | {delivered} of {expected} (inbox reconcile {by_inbox}, wait path {by_wait}); missing {} |", expected.saturating_sub(delivered));
     println!("| delivery latency p50 / p95 / max | {l50:.0} ms / {l95:.0} ms / {lmax:.0} ms ({n_lat} samples) |");
     println!("| send call p50 / p95 | {s50:.0} ms / {s95:.0} ms |");
@@ -621,7 +743,15 @@ async fn main() -> Result<()> {
         println!("| send error sample | {e} |");
     }
     for s in &dev_samples {
-        println!("| dev box {} | {} |", s.label, dev_line(s).splitn(2, ' ').nth(1).unwrap_or("").trim());
+        println!(
+            "| dev box {} | {} |",
+            s.label,
+            dev_line(s)
+                .split_once(' ')
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+        );
     }
 
     let result = json!({
@@ -638,7 +768,10 @@ async fn main() -> Result<()> {
         "dev": dev_samples.iter().map(|s| json!({"label": s.label, "load": s.load, "mem_available_mb": s.mem_available_mb, "swap_used_mb": s.swap_used_mb, "synapse": s.synapse, "siwx": s.siwx, "error": s.error})).collect::<Vec<_>>(),
     });
     let out_dir = args.out.clone().unwrap_or_else(|| {
-        std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".cache/claude-seats-dev")
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".cache/claude-seats-dev")
     });
     std::fs::create_dir_all(&out_dir).ok();
     let out_file = out_dir.join(format!("stress-k{}-{run}.json", args.seats));
@@ -651,7 +784,11 @@ async fn main() -> Result<()> {
             let _ = tokio::time::timeout(Duration::from_secs(60), ch.wait()).await;
         }
     }
-    if aborted.is_some() || !attach_failed.is_empty() || delivered < expected || sh.send_errors.load(Ordering::Relaxed) > 0 {
+    if aborted.is_some()
+        || !attach_failed.is_empty()
+        || delivered < expected
+        || sh.send_errors.load(Ordering::Relaxed) > 0
+    {
         std::process::exit(1);
     }
     Ok(())

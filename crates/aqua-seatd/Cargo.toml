@@ -14,6 +14,15 @@ path = "src/lib.rs"
 name = "aqua-seatd"
 path = "src/main.rs"
 
+[features]
+# Live cross-host e2e (simulated hosts) against dev.matrix.inblock.io.
+e2e = []
+
+[[test]]
+name = "xhost"
+path = "tests/xhost.rs"
+required-features = ["e2e"]
+
 [dependencies]
 aqua-matrix-agent.workspace = true
 aqua-seat-mcp.workspace = true
@@ -28,9 +37,11 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
-ed25519-dalek = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 bs58 = "0.5"
 base64 = "0.22"
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rand = "0.8"

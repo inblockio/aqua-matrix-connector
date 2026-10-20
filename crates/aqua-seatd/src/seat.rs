@@ -129,6 +129,10 @@ pub enum SeatCmd {
     RefreshRoster {
         done: oneshot::Sender<Result<Vec<Peer>, String>>,
     },
+    /// Leave the roster room (admin / tests).
+    LeaveRoster {
+        done: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// What a delivered send reports back.
@@ -270,20 +274,21 @@ async fn run_seat(
     let mut first_cycle = true;
     let mut carry: Option<SeatCmd> = None;
     loop {
-        let agent = match connect_with_outage_retry(&config, ROLE, MAX_CONNECT_FAILURES, stop.notified())
-            .await
-        {
-            ConnectOutcome::Connected(a) => a,
-            ConnectOutcome::Shutdown => {
-                tracing::info!(seat = %shared.seat, "stopped while connecting");
-                shared.run_state.send_replace(RunState::Stopped);
-                return;
-            }
-            ConnectOutcome::Fatal(e) => {
-                fail(&shared, format!("login failed: {e:#}"));
-                return;
-            }
-        };
+        let agent =
+            match connect_with_outage_retry(&config, ROLE, MAX_CONNECT_FAILURES, stop.notified())
+                .await
+            {
+                ConnectOutcome::Connected(a) => a,
+                ConnectOutcome::Shutdown => {
+                    tracing::info!(seat = %shared.seat, "stopped while connecting");
+                    shared.run_state.send_replace(RunState::Stopped);
+                    return;
+                }
+                ConnectOutcome::Fatal(e) => {
+                    fail(&shared, format!("login failed: {e:#}"));
+                    return;
+                }
+            };
         {
             let mut id = shared.identity.lock().unwrap();
             id.mxid = Some(agent.user_id().to_string());
@@ -363,7 +368,7 @@ async fn run_seat(
         }
 
         shared.run_state.send_replace(RunState::Ready);
-        let exit = run_cycle(&agent, &shared, &mut rx, &mut carry, &stop).await;
+        let exit = run_cycle(&d, &agent, &shared, &mut rx, &mut carry, &stop).await;
         shared.identity.lock().unwrap().connected = false;
         shared.counters.cycles.fetch_add(1, Ordering::Relaxed);
         if exit == "shutdown" {
@@ -393,6 +398,9 @@ fn fail_cmd(c: SeatCmd, why: &str) {
             let _ = done.send(Err(why.into()));
         }
         SeatCmd::RefreshRoster { done } => {
+            let _ = done.send(Err(why.into()));
+        }
+        SeatCmd::LeaveRoster { done } => {
             let _ = done.send(Err(why.into()));
         }
     }
@@ -450,6 +458,7 @@ async fn ensure_roster(
 ) -> Result<Option<String>> {
     let deadline = Instant::now() + d.cfg.join_wait;
     let mut asked_at: Option<Instant> = None;
+    let mut knocked_at: Option<Instant> = None;
     loop {
         let Some(rf) = RoomFile::load(&d.cfg.root) else {
             if d.cfg.hub {
@@ -457,7 +466,9 @@ async fn ensure_roster(
                 if RoomFile::load(&d.cfg.root).is_some() {
                     continue;
                 }
-                let room_id = create_roster_room(agent).await.context("creating the roster room")?;
+                let room_id = create_roster_room(agent)
+                    .await
+                    .context("creating the roster room")?;
                 RoomFile {
                     room_id: room_id.clone(),
                     created_by: shared.seat.clone(),
@@ -479,8 +490,10 @@ async fn ensure_roster(
             .save(&d.cfg.root)?;
             continue;
         };
+        let mut room_state = None;
         if let Ok(rid) = <&matrix_sdk::ruma::RoomId>::try_from(rf.room_id.as_str()) {
             if let Some(room) = agent.client().get_room(rid) {
+                room_state = Some(room.state());
                 match room.state() {
                     RoomState::Joined => return Ok(Some(rf.room_id)),
                     RoomState::Invited => {
@@ -492,21 +505,38 @@ async fn ensure_roster(
                 }
             }
         }
+        // We knocked and are back to "left": the hub declined (see its audit log).
+        if knocked_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5))
+            && room_state == Some(RoomState::Left)
+        {
+            bail!("the hub declined this seat's knock (see hub-audit.jsonl on the hub for the reason)");
+        }
         // Not a member yet.
-        if asked_at.is_none_or(|t| t.elapsed() > Duration::from_secs(25)) {
+        let again = if d.cfg.hub {
+            Duration::from_secs(25)
+        } else {
+            Duration::from_secs(60)
+        };
+        if asked_at.is_none_or(|t| t.elapsed() > again) {
             asked_at = Some(Instant::now());
             if d.cfg.hub {
                 // Seats on the hub host: the hub seat invites.
-                d.request_roster_invite(&shared.seat, agent.user_id(), &rf).await;
+                d.request_roster_invite(&shared.seat, agent.user_id(), &rf)
+                    .await;
             } else {
                 crate::knock::knock_for_roster(d, shared, agent, &rf).await?;
+                knocked_at = Some(Instant::now());
             }
         }
         if Instant::now() > deadline {
             bail!(
                 "not invited to the roster room within {}s{}",
                 d.cfg.join_wait.as_secs(),
-                if d.cfg.hub { "" } else { " (is the hub online and is this host in its hosts.toml?)" }
+                if d.cfg.hub {
+                    ""
+                } else {
+                    " (is the hub online and is this host in its hosts.toml?)"
+                }
             );
         }
         tokio::select! {
@@ -537,7 +567,10 @@ fn roster_alias(agent: &AgentClient) -> Result<matrix_sdk::ruma::OwnedRoomAliasI
         .map(|(_, s)| s)
         .ok_or_else(|| anyhow!("malformed own user id"))?;
     let alias = format!("#{ROSTER_ALIAS_LOCALPART}:{server}");
-    alias.as_str().try_into().map_err(|e| anyhow!("bad alias {alias}: {e}"))
+    alias
+        .as_str()
+        .try_into()
+        .map_err(|e| anyhow!("bad alias {alias}: {e}"))
 }
 
 async fn create_roster_room(agent: &AgentClient) -> Result<String> {
@@ -552,10 +585,13 @@ async fn create_roster_room(agent: &AgentClient) -> Result<String> {
     req.visibility = Visibility::Private;
     req.room_version = Some(ROSTER_ROOM_VERSION);
     req.room_alias_name = Some(ROSTER_ALIAS_LOCALPART.to_string());
-    let enc = InitialStateEvent::with_empty_state_key(RoomEncryptionEventContent::with_recommended_defaults());
+    let enc = InitialStateEvent::with_empty_state_key(
+        RoomEncryptionEventContent::with_recommended_defaults(),
+    );
     // D9: a knock room, so a seat on a new host asks to join instead of
     // needing a live invite. The initial state overrides the preset's rule.
-    let knock = InitialStateEvent::with_empty_state_key(RoomJoinRulesEventContent::new(JoinRule::Knock));
+    let knock =
+        InitialStateEvent::with_empty_state_key(RoomJoinRulesEventContent::new(JoinRule::Knock));
     req.initial_state = vec![enc.to_raw_any(), knock.to_raw_any()];
     // Members may set their own claim; only the hub seat invites. `events`
     // replaces the server default map, so the defaults are restated.
@@ -592,7 +628,10 @@ async fn upgrade_room_shape(agent: &AgentClient, shared: &SeatShared, room: &Roo
         }
     }
     // only the hub seat invites
-    match room.get_state_event(StateEventType::RoomPowerLevels, "").await {
+    match room
+        .get_state_event(StateEventType::RoomPowerLevels, "")
+        .await
+    {
         Ok(Some(raw)) => {
             let json: Option<Value> = match &raw {
                 matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Sync(r) => {
@@ -605,9 +644,16 @@ async fn upgrade_room_shape(agent: &AgentClient, shared: &SeatShared, room: &Roo
             if let Some(mut content) = json.and_then(|j| j.get("content").cloned()) {
                 if content["invite"].as_u64() != Some(u64::from(INVITE_LEVEL)) {
                     content["invite"] = json!(INVITE_LEVEL);
-                    match room.send_state_event_raw("m.room.power_levels", "", content).await {
-                        Ok(_) => tracing::info!(seat = %shared.seat, "roster room: only level {INVITE_LEVEL}+ may invite now"),
-                        Err(e) => tracing::warn!(seat = %shared.seat, "raising the invite level failed: {e:#}"),
+                    match room
+                        .send_state_event_raw("m.room.power_levels", "", content)
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(seat = %shared.seat, "roster room: only level {INVITE_LEVEL}+ may invite now")
+                        }
+                        Err(e) => {
+                            tracing::warn!(seat = %shared.seat, "raising the invite level failed: {e:#}")
+                        }
                     }
                 }
             }
@@ -619,7 +665,9 @@ async fn upgrade_room_shape(agent: &AgentClient, shared: &SeatShared, room: &Roo
     if let Ok(alias) = roster_alias(agent) {
         match agent.client().resolve_room_alias(&alias).await {
             Ok(r) if r.room_id == room.room_id() => {}
-            Ok(r) => tracing::warn!(seat = %shared.seat, "alias {alias} points at another room ({})", r.room_id),
+            Ok(r) => {
+                tracing::warn!(seat = %shared.seat, "alias {alias} points at another room ({})", r.room_id)
+            }
             Err(_) => {
                 let req = matrix_sdk::ruma::api::client::alias::create_alias::v3::Request::new(
                     alias.clone(),
@@ -627,7 +675,9 @@ async fn upgrade_room_shape(agent: &AgentClient, shared: &SeatShared, room: &Roo
                 );
                 match agent.client().send(req).await {
                     Ok(_) => tracing::info!(seat = %shared.seat, "roster alias {alias} created"),
-                    Err(e) => tracing::warn!(seat = %shared.seat, "creating alias {alias} failed: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!(seat = %shared.seat, "creating alias {alias} failed: {e:#}")
+                    }
                 }
             }
         }
@@ -686,7 +736,10 @@ pub async fn refresh_roster(agent: &AgentClient, shared: &SeatShared) -> Result<
         .client()
         .get_room(rid)
         .ok_or_else(|| anyhow!("roster room not known to the client"))?;
-    let members = room.members(RoomMemberships::JOIN).await.context("reading the member list")?;
+    let members = room
+        .members(RoomMemberships::JOIN)
+        .await
+        .context("reading the member list")?;
     let joined: HashSet<String> = members
         .iter()
         .map(|m| m.user_id().as_str().to_ascii_lowercase())
@@ -709,7 +762,9 @@ pub async fn refresh_roster(agent: &AgentClient, shared: &SeatShared) -> Result<
             peers.push(p);
         }
     }
-    peers.sort_by(|a, b| (a.seat.as_str(), a.host.as_str()).cmp(&(b.seat.as_str(), b.host.as_str())));
+    peers.sort_by(|a, b| {
+        (a.seat.as_str(), a.host.as_str()).cmp(&(b.seat.as_str(), b.host.as_str()))
+    });
     let mut c = shared.roster.lock().unwrap();
     c.peers = peers.clone();
     c.fetched = Some(Instant::now());
@@ -719,6 +774,7 @@ pub async fn refresh_roster(agent: &AgentClient, shared: &SeatShared) -> Result<
 // ---- one cycle ------------------------------------------------------------
 
 async fn run_cycle(
+    d: &Arc<Daemon>,
     agent: &AgentClient,
     shared: &Arc<SeatShared>,
     rx: &mut mpsc::Receiver<SeatCmd>,
@@ -727,18 +783,28 @@ async fn run_cycle(
 ) -> &'static str {
     let own = agent.user_id().to_string();
     let invite_wake = Arc::new(Notify::new());
-    let handles: Vec<EventHandlerHandle> = vec![
+    let knock_wake = Arc::new(Notify::new());
+    let is_hub_seat = d.is_hub_seat(&shared.seat);
+    let mut handles: Vec<EventHandlerHandle> = vec![
         register_message_handler(agent, shared.clone(), own.clone()),
         register_utd_handler(agent, shared.clone()),
         register_invite_handler(agent, invite_wake.clone(), own.clone()),
     ];
 
+    if is_hub_seat {
+        handles.push(register_knock_handler(agent, knock_wake.clone()));
+    }
+
     backfill(agent, shared, ROSTER_BACKFILL_LIMIT).await;
     process_invites(agent, shared).await;
+    if is_hub_seat {
+        hub_process_knocks(d, agent, shared).await;
+    }
 
     let sync_client = agent.client().clone();
     aqua_matrix_agent::reload_olm_if_store_changed(&sync_client).await;
-    let mut sync_task = tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
+    let mut sync_task =
+        tokio::spawn(async move { sync_client.sync(SyncSettings::default()).await });
 
     let ttl = agent
         .expires_at_unix()
@@ -748,6 +814,8 @@ async fn run_cycle(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(ttl);
     tracing::info!(seat = %shared.seat, "cycle starting (rotating in {ttl}s)");
 
+    let mut knock_tick = tokio::time::interval(Duration::from_secs(20));
+    knock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut utd_tick = tokio::time::interval(UTD_RETRY);
     utd_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -780,6 +848,12 @@ async fn run_cycle(
                 }
                 _ = invite_wake.notified() => {
                     process_invites(agent, shared).await;
+                }
+                _ = knock_wake.notified(), if is_hub_seat => {
+                    hub_process_knocks(d, agent, shared).await;
+                }
+                _ = knock_tick.tick(), if is_hub_seat => {
+                    hub_process_knocks(d, agent, shared).await;
                 }
                 _ = utd_tick.tick() => {
                     let open = shared.utd_open.lock().unwrap().len();
@@ -840,11 +914,32 @@ async fn execute(agent: &AgentClient, shared: &Arc<SeatShared>, cmd: SeatCmd) ->
             let _ = done.send(r.map_err(|e| format!("{e:#}")));
             None
         }
+        SeatCmd::LeaveRoster { done } => {
+            let r = leave_roster(agent, shared).await;
+            let _ = done.send(r.map_err(|e| format!("{e:#}")));
+            None
+        }
     }
 }
 
+async fn leave_roster(agent: &AgentClient, shared: &SeatShared) -> Result<()> {
+    let room_id = shared
+        .roster_room_id()
+        .ok_or_else(|| anyhow!("no roster room"))?;
+    let rid = <&matrix_sdk::ruma::RoomId>::try_from(room_id.as_str())?;
+    let room = agent
+        .client()
+        .get_room(rid)
+        .ok_or_else(|| anyhow!("roster room not known to the client"))?;
+    room.leave().await.context("leaving the roster room")?;
+    tracing::info!(seat = %shared.seat, "left the roster room");
+    Ok(())
+}
+
 async fn invite_to_roster(agent: &AgentClient, shared: &SeatShared, mxid: &str) -> Result<()> {
-    let room_id = shared.roster_room_id().ok_or_else(|| anyhow!("no roster room"))?;
+    let room_id = shared
+        .roster_room_id()
+        .ok_or_else(|| anyhow!("no roster room"))?;
     let rid = <&matrix_sdk::ruma::RoomId>::try_from(room_id.as_str())?;
     let room = agent
         .client()
@@ -853,12 +948,19 @@ async fn invite_to_roster(agent: &AgentClient, shared: &SeatShared, mxid: &str) 
         .ok_or_else(|| anyhow!("not joined to the roster room"))?;
     let user: OwnedUserId = mxid.try_into().map_err(|e| anyhow!("invalid mxid: {e}"))?;
     match room.get_member(&user).await {
-        Ok(Some(m)) if matches!(m.membership(), MembershipState::Join | MembershipState::Invite) => {
+        Ok(Some(m))
+            if matches!(
+                m.membership(),
+                MembershipState::Join | MembershipState::Invite
+            ) =>
+        {
             return Ok(())
         }
         _ => {}
     }
-    room.invite_user_by_id(&user).await.context("inviting to the roster room")?;
+    room.invite_user_by_id(&user)
+        .await
+        .context("inviting to the roster room")?;
     tracing::info!(seat = %shared.seat, "invited a seat to the roster room");
     Ok(())
 }
@@ -891,7 +993,10 @@ async fn send_one(
             .unwrap_or(false),
         None => false,
     };
-    Ok(SentInfo { event_id, encrypted })
+    Ok(SentInfo {
+        event_id,
+        encrypted,
+    })
 }
 
 /// Create the DM with `mxid` if there is none and wait (bounded) for the peer
@@ -901,7 +1006,11 @@ async fn ensure_dm_ready(agent: &AgentClient, mxid: &str) -> Result<()> {
         return Ok(());
     }
     let user: OwnedUserId = mxid.try_into().map_err(|e| anyhow!("invalid mxid: {e}"))?;
-    let room = agent.client().create_dm(&user).await.context("create_dm failed")?;
+    let room = agent
+        .client()
+        .create_dm(&user)
+        .await
+        .context("create_dm failed")?;
     match room.latest_encryption_state().await {
         Ok(s) if s.is_encrypted() => {}
         _ => {
@@ -912,7 +1021,10 @@ async fn ensure_dm_ready(agent: &AgentClient, mxid: &str) -> Result<()> {
     }
     let t0 = Instant::now();
     while t0.elapsed() < DM_JOIN_WAIT {
-        let joined = room.members(RoomMemberships::JOIN).await.unwrap_or_default();
+        let joined = room
+            .members(RoomMemberships::JOIN)
+            .await
+            .unwrap_or_default();
         if joined.iter().any(|m| m.user_id() == user) {
             break;
         }
@@ -921,16 +1033,51 @@ async fn ensure_dm_ready(agent: &AgentClient, mxid: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- knocks (hub seat) ---------------------------------------------------
+
+fn register_knock_handler(agent: &AgentClient, wake: Arc<Notify>) -> EventHandlerHandle {
+    agent.client().add_event_handler(
+        move |ev: matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent| {
+            let wake = wake.clone();
+            async move {
+                if ev.content.membership == MembershipState::Knock {
+                    wake.notify_one();
+                }
+            }
+        },
+    )
+}
+
+async fn hub_process_knocks(d: &Arc<Daemon>, agent: &AgentClient, shared: &Arc<SeatShared>) {
+    let Some(room_id) = shared.roster_room_id() else {
+        return;
+    };
+    let Some(room) = <&matrix_sdk::ruma::RoomId>::try_from(room_id.as_str())
+        .ok()
+        .and_then(|rid| agent.client().get_room(rid))
+    else {
+        return;
+    };
+    if let Err(e) = crate::hub::process_knocks(d, shared, agent, &room).await {
+        tracing::warn!(seat = %shared.seat, "processing knocks failed: {e:#}");
+    }
+}
+
 // ---- invites ----------------------------------------------------------------
 
-fn register_invite_handler(agent: &AgentClient, wake: Arc<Notify>, own: String) -> EventHandlerHandle {
+fn register_invite_handler(
+    agent: &AgentClient,
+    wake: Arc<Notify>,
+    own: String,
+) -> EventHandlerHandle {
     agent
         .client()
         .add_event_handler(move |ev: StrippedRoomMemberEvent| {
             let wake = wake.clone();
             let own = own.clone();
             async move {
-                if ev.state_key.as_str() == own && ev.content.membership == MembershipState::Invite {
+                if ev.state_key.as_str() == own && ev.content.membership == MembershipState::Invite
+                {
                     wake.notify_one();
                 }
             }
@@ -956,14 +1103,25 @@ async fn process_invites(agent: &AgentClient, shared: &Arc<SeatShared>) {
         let Some(inviter) = inv.inviter.clone() else {
             continue;
         };
-        let mut known = shared.peers().iter().any(|p| p.mxid.eq_ignore_ascii_case(&inviter));
+        let mut known = shared
+            .peers()
+            .iter()
+            .any(|p| p.mxid.eq_ignore_ascii_case(&inviter));
         if !known && !refreshed {
             refreshed = true;
             let _ = refresh_roster(agent, shared).await;
-            known = shared.peers().iter().any(|p| p.mxid.eq_ignore_ascii_case(&inviter));
+            known = shared
+                .peers()
+                .iter()
+                .any(|p| p.mxid.eq_ignore_ascii_case(&inviter));
         }
         if !known {
-            if shared.other_rooms_logged.lock().unwrap().insert(inv.room_id.clone()) {
+            if shared
+                .other_rooms_logged
+                .lock()
+                .unwrap()
+                .insert(inv.room_id.clone())
+            {
                 tracing::info!(seat = %shared.seat, room = %inv.room_id, %inviter, "ignoring an invite from someone not on the roster");
             }
             continue;
@@ -1030,12 +1188,19 @@ async fn is_one_to_one(shared: &SeatShared, room: &Room, own: &str, sender: &str
             return *v;
         }
     }
-    let members = room.members(RoomMemberships::ACTIVE).await.unwrap_or_default();
+    let members = room
+        .members(RoomMemberships::ACTIVE)
+        .await
+        .unwrap_or_default();
     let ids: Vec<&str> = members.iter().map(|m| m.user_id().as_str()).collect();
     let v = ids.len() == 2
         && ids.iter().any(|m| m.eq_ignore_ascii_case(own))
         && ids.iter().any(|m| m.eq_ignore_ascii_case(sender));
-    shared.one_to_one.lock().unwrap().insert(key, (Instant::now(), v));
+    shared
+        .one_to_one
+        .lock()
+        .unwrap()
+        .insert(key, (Instant::now(), v));
     v
 }
 
@@ -1083,13 +1248,19 @@ async fn ingest_event(
         Verdict::Accept(v) => v,
         Verdict::Ignore(crate::classify::Ignore::Own) => return false,
         Verdict::Ignore(crate::classify::Ignore::OtherRoom) => {
-            if shared.other_rooms_logged.lock().unwrap().insert(room_id.to_string()) {
+            if shared
+                .other_rooms_logged
+                .lock()
+                .unwrap()
+                .insert(room_id.to_string())
+            {
                 tracing::info!(seat = %shared.seat, room = %room_id, "ignoring messages in a room that is neither the roster nor a DM");
             }
             return false;
         }
     };
-    let (in_reply_to, thread_root) = aqua_matrix_agent::reply::reply_fields(ev.content.relates_to.as_ref());
+    let (in_reply_to, thread_root) =
+        aqua_matrix_agent::reply::reply_fields(ev.content.relates_to.as_ref());
     let sender_name = shared
         .peers()
         .iter()
@@ -1114,7 +1285,10 @@ async fn ingest_event(
     if added {
         shared.counters.ingested.fetch_add(1, Ordering::Relaxed);
         if shared.utd_open.lock().unwrap().remove(&event_id) {
-            shared.counters.utd_recovered.fetch_add(1, Ordering::Relaxed);
+            shared
+                .counters
+                .utd_recovered
+                .fetch_add(1, Ordering::Relaxed);
         }
         shared.changed.notify_waiters();
     }
@@ -1153,13 +1327,18 @@ async fn backfill(agent: &AgentClient, shared: &Arc<SeatShared>, roster_limit: u
                     }
                     continue;
                 }
-                let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(msg))) =
-                    event.raw().deserialize()
+                let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    msg,
+                ))) = event.raw().deserialize()
                 else {
                     continue;
                 };
                 if let Some(orig) = msg.as_original() {
-                    found.push((u64::from(orig.origin_server_ts.0), room.clone(), orig.clone()));
+                    found.push((
+                        u64::from(orig.origin_server_ts.0),
+                        room.clone(),
+                        orig.clone(),
+                    ));
                 }
             }
         }
@@ -1186,7 +1365,10 @@ async fn backfill(agent: &AgentClient, shared: &Arc<SeatShared>, roster_limit: u
         }
     }
     if added > 0 {
-        shared.counters.backfilled.fetch_add(added as u64, Ordering::Relaxed);
+        shared
+            .counters
+            .backfilled
+            .fetch_add(added as u64, Ordering::Relaxed);
         tracing::info!(seat = %shared.seat, added, "backfill added message(s) to the inbox");
     }
     added
