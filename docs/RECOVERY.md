@@ -1,6 +1,6 @@
 # Recovery Behavior
 
-How the agent infrastructure on this host survives crashes, restarts, network blips, server outages, and identity drift. Read this when something is broken or before changing recovery-critical config. For the *design* (why three daemons, why stream sync, identity model) see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+How the agent infrastructure on this host survives crashes, restarts, network blips, server outages, and identity drift. Read this when something is broken or before changing recovery-critical config. For the *design* (why one identity per surface, why stream sync, identity model) see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## At a glance — what recovers without human intervention
 
@@ -16,7 +16,7 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 | Network / DNS / upstream-proxy outage (DNS failure, refused or timed-out connect, TLS handshake, 502/503/504) during connect or token rotation | The process waits in-process (`net_retry::connect_with_outage_retry`, 2 s..60 s backoff) and never exits for it; the refresh token is kept, no fresh did:key login. Logs `network outage: waiting for connectivity` then `network restored after <N>s (<M> attempts)` | ≤60s after the network is back |
 | Fresh login with an expired auto-registered OIDC client (`/authorize returned 401`) | `acquire_session` re-registers once, persists the new `client_id` to `config.toml` and retries; an operator-set `OIDC_CLIENT_ID` is never replaced | same connect attempt |
 | Access token nears expiry while daemon is running | daemon proactively rotates the matrix-sdk Client `REFRESH_GUARD_SECS` (30s) before `expires_at_unix`. Tier-2 refresh-grant in `AgentClient::connect` mints a new access token, `device_id` preserved, crypto store untouched. No 401 reaches the server | TTL − 30s, no operator-visible disruption |
-| WSL reboots | wsl.conf `systemd=true` + linger + units `enabled` brings all three up | seconds after WSL itself starts |
+| WSL reboots | wsl.conf `systemd=true` + linger + units `enabled` brings them up | seconds after WSL itself starts |
 | WSL reboots — **podman container fleet** (`aqua-agent-*` consultants + tim-channel) | `aqua-agent-fleet-restore.service` (oneshot, at boot) runs `~/restore-agent-fleet.sh`, which `podman start`s every exited `aqua-agent-*` container. Needed because podman restart policies don't survive a VM reboot and the fleet's `--restart on-failure` never fires on a clean shutdown SIGTERM (exit 0). DIDs/crypto stores live in the persist volumes, so agents come back `store_wiped=false`. Every start goes through `podman-detached.sh` (own `systemd-run --user --scope`), so no container is tied to the lifetime of the unit or script that started it (2026-10-05: a finished oneshot roll unit took the whole fleet down). | seconds after boot |
 | An `aqua-agent-*` container stays down anyway | `crashloop-watch.sh` DMs Tim a CRITICAL "agent DOWN" when a container leaves `running`, then **re-alerts every hour while it stays down** ("agent STILL down", with downtime duration). Alerts are delivery-confirmed: a DM that fails (e.g. network still coming up at boot) is retried every 15s poll until one lands. | first DM ≤15s after the down transition |
 | Crypto store wiped but `recovery.key` present | Cold start restores cross-signing/secrets from the persisted recovery key via SSSS — no new identity, no fresh cross-signing bootstrap | next start |
@@ -34,25 +34,21 @@ How the agent infrastructure on this host survives crashes, restarts, network bl
 
 ## Component-by-component
 
-### `aqua-matrix-heartbeat.service`
+### `aqua-matrix-claude-channel.service`
 
 - `Restart=always` with progressive backoff `RestartSec=5s` → `RestartMaxDelaySec=60s` over `RestartSteps=8`; start limit disabled (`StartLimitIntervalSec=0` in `[Unit]`)
 - **Outer loop owns AgentClient lifecycle.** Each iteration:
   1. `AgentClient::connect()` runs the three-tier session resolution (see below)
-  2. Inner cycle (`run_cycle`) registers the message handler, spawns `client.sync()`, runs heartbeat ticks. Returns when **either** the refresh deadline (`expires_at_unix − REFRESH_GUARD_SECS`) is reached **or** the sync future ends (network blip, fatal error)
+  2. Inner cycle (`run_cycle`) registers the message handler and spawns `client.sync()`; there is no periodic tick of its own, so it parks on `select!`. Returns when **either** the refresh deadline (`expires_at_unix − REFRESH_GUARD_SECS`) is reached **or** the sync future ends (network blip, fatal error)
   3. Outer loop drops the AgentClient and reconnects. matrix-sdk has no public API to swap an access token in place, so we rotate the whole Client instead — `device_id` is preserved through the rebuild via tier-2.
 - Three-tier session resolution inside `connect()`:
   1. cached access token still valid → reuse (one `/whoami` call, ~50 ms)
   2. cached refresh_token + did → `siwx_oidc_auth::refresh()` → new access token, **same `device_id`**, crypto store untouched (one `/token` call)
   3. neither → fresh OAuth code flow → **new `device_id`**, store-mismatch handler wipes `matrix-sdk-*.sqlite3*` and retries `restore_session` once, cross-signing re-bootstraps
 - Steady state on a 300 s siwx-oidc token TTL: tier-2 refresh-grant fires roughly every 270 s, no `M_UNKNOWN_TOKEN` ever reaches the server.
-- Heartbeat stats (`sent`, `commands_handled`, `start`) survive rotations — they live outside `run_cycle`. Watermark is reset per cycle because event handlers are re-registered on the new Client; the matrix-sdk initial sync after each reconnect fetches anything missed.
+- Watermark is reset per cycle because event handlers are re-registered on the new Client; the matrix-sdk initial sync after each reconnect fetches anything missed.
 
-### `aqua-matrix-claude-channel.service`
-
-Identical recovery profile to heartbeat — same outer-loop rotation, same three-tier auth, same `Restart=always`. No periodic tick of its own; the inner cycle parks on `select!` until refresh deadline or sync exit.
-
-Differences in failure modes specific to claude-channel:
+Failure modes specific to claude-channel:
 - Per-message `claude -p` invocation has **no total-runtime cap** (long tasks run to completion). An *inactivity* watchdog stops it only if `claude` emits no output for 600s; the daemon then replies with `[claude-channel error] no output for 600s — assumed stalled and stopped` and stays running.
 - Sessions are continuous: each DM resumes the user's prior `claude` session (`--resume`). Session ids are held **in memory** per target — restart the service to start a fresh conversation. A stale/invalid session id self-heals: a failed resume clears the stored id and retries the turn cold once.
 - The final reply transmission is retried (up to 5 attempts, linear backoff) until the homeserver acknowledges the event, so a transient send failure can't leave a half-streamed message. If it still can't land after retries, the daemon logs `failed to finalize ... after retries` and stays running.
@@ -104,7 +100,7 @@ The per-consultant `aqua-activity-watch-<label>.service` units rendered by
 To skip the remaining backoff after fixing a root cause:
 
 ```bash
-systemctl --user restart aqua-matrix-heartbeat
+systemctl --user restart <unit>
 ```
 
 On a unit still carrying the old limit, `systemctl --user reset-failed <unit>`
@@ -165,7 +161,7 @@ systemctl --user start <unit>           # try again
 
 ```bash
 systemctl --user stop <unit>            # halt the auto-restart cycle
-~/aqua-matrix-agent/target/debug/aqua-matrix-heartbeat   # or aqua-matrix-claude-p, whichever daemon
+~/aqua-matrix-agent/target/debug/aqua-matrix-claude-p   # the unit's ExecStart (built from ../aqua-agents)
 # ... iterate. Ctrl+C when done. systemctl --user start <unit> to resume normal supervision.
 ```
 
@@ -191,36 +187,22 @@ systemctl --user start <unit>
 ### "Tail logs"
 
 ```bash
-journalctl --user -u aqua-matrix-heartbeat -f
 journalctl --user -u aqua-matrix-claude-channel -f
 journalctl --user -u claude-bridge -f
 ```
 
-### "Restart a daemon over Matrix when local shell is unavailable"
+### "Restart a daemon without a Matrix path"
 
-From the configured `--target` account (Tim), DM the heartbeat identity:
-
-- `#shell restart` → restarts `aqua-matrix-heartbeat`
-- `#shell respawn-channel` → restarts `aqua-matrix-claude-channel`
-- `#shell respawn` → restarts `claude-bridge`
-
-If the heartbeat itself is the wedged one, this won't work — you need local shell or another path in.
+There is no Matrix-side restart command: the `#shell` channel went away with the retired ops daemon. Use a local shell: `systemctl --user restart aqua-matrix-claude-channel` or `systemctl --user restart claude-bridge`.
 
 ## Diagnostic decision tree
 
-**No heartbeat status payload in 10+ min**
-
-1. `systemctl --user is-active aqua-matrix-heartbeat` — `active` / `failed` / `activating`?
-   - `failed` → `journalctl --user -u aqua-matrix-heartbeat -n 50`. Common: crash-loop guard tripped → `reset-failed` + fix root cause.
-   - `activating` (indefinitely) → fresh-auth path stuck. Check siwx-oidc connectivity: `curl https://siwx-oidc.inblock.io/.well-known/openid-configuration`.
-   - `active` but silent → sync stream might be wedged. Send `#shell ping` from Tim. No reply → daemon is alive but its sync is stuck → `systemctl --user restart aqua-matrix-heartbeat`.
-
 **Claude channel does not respond to a DM**
 
-1. `systemctl --user is-active aqua-matrix-claude-channel` — must be `active`.
+1. `systemctl --user is-active aqua-matrix-claude-channel` must be `active` (`failed` → `journalctl --user -u aqua-matrix-claude-channel -n 50`; `activating` indefinitely → fresh-auth path stuck, check siwx-oidc connectivity: `curl https://siwx-oidc.inblock.io/.well-known/openid-configuration`).
 2. Locally test `~/.local/bin/claude -p hi`. If claude itself is broken, the daemon cannot reply.
 3. Check journal for `claude -p exited with status` or `claude -p timed out` — these are reported back to Element as `[claude-channel error]`. If Element shows the prompt was received but no error message arrived either, the reply send itself failed (look for `claude-channel reply send failed` in the journal).
-4. Last resort: `systemctl --user restart aqua-matrix-claude-channel` (or `#shell respawn-channel` from heartbeat).
+4. Last resort: `systemctl --user restart aqua-matrix-claude-channel`. If the daemon is `active` but its sync is stuck, the restart is also the fix.
 
 **Bridge tmux session is gone but unit is `active`**
 
@@ -231,19 +213,19 @@ Should NOT happen with the Type=simple supervisor design. If it does:
 **`device_id` rotates on every restart, store keeps wiping**
 
 Should NOT happen if refresh tokens are working. Check:
-1. `grep refresh_token ~/.aqua-matrix-heartbeat/config.toml` — if missing, the daemon authenticated against an old siwx-oidc that did not issue refresh tokens. Next fresh auth (against the new server) fixes it.
-2. `grep '^did' ~/.aqua-matrix-heartbeat/config.toml` — must also be present for the refresh-grant call.
+1. `grep refresh_token ~/.aqua-matrix-claude-channel/config.toml`: if missing, the daemon authenticated against an old siwx-oidc that did not issue refresh tokens. Next fresh auth (against the new server) fixes it.
+2. `grep '^did' ~/.aqua-matrix-claude-channel/config.toml`: must also be present for the refresh-grant call.
 3. Journal: `refresh grant failed` → most likely refresh token expired (>24h since last refresh). Fresh auth runs and mints a new device. One-time event, not a recurring problem unless restarts happen with >24h gaps.
 
-**"All three are running but Tim still does not see them in Element"**
+**"The daemon is running but Tim still does not see it in Element"**
 
-Less of a recovery issue, more of an onboarding one. Both Matrix daemons send a one-shot `[hello]` message on every start. If Tim sees no hello:
+Less of a recovery issue, more of an onboarding one. The Matrix daemon sends a one-shot `[hello]` message on every start. If Tim sees no hello:
 - Verify the daemons did NOT crash on hello: `journalctl --user -u <unit> -n 30 | grep hello`
-- Verify the DM rooms exist on the server: `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --read --key-file heartbeat.pem --store-dir ~/.aqua-matrix-heartbeat --target <tim>` (but stop the unit first to avoid SQLite contention)
+- Verify the DM rooms exist on the server: `~/aqua-matrix-agent/target/debug/aqua-matrix-agent --read --key-file claude-channel.pem --store-dir ~/.aqua-matrix-claude-channel --target <tim>` (but stop the unit first to avoid SQLite contention)
 - Tim's Element may have an unaccepted room invite from the claude-channel identity if this is the first time he is seeing it
 
 ## What this document does not cover
 
-- The design rationale for two-identity architecture, sync model, identity persistence: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+- The design rationale for the one-identity-per-surface architecture, sync model, identity persistence: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - Day-to-day operations (sending a message, running the e2e test, attaching to the bridge): per-skill docs under [`../Skills/`](../Skills/).
 - siwx-oidc / Synapse / Element server-side recovery: out of scope, see the companion repos in CLAUDE.md.

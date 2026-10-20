@@ -4,59 +4,54 @@ This document is the single source of truth for how the agent infrastructure on 
 
 ## Components
 
-There are three components running on the host. Each does one thing, has its own failure domain, and can be restarted independently.
+There are two components running on the host. Each does one thing, has its own failure domain, and can be restarted independently. (The third one, the `aqua-matrix-heartbeat` ops daemon with its `#shell` command channel, is retired: no unit, no process, no identity, and its crate is gone from `../aqua-agents`. Restart units from a local shell.)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Tim's Element (matrix.inblock.io)                                      │
-└────────┬───────────────────────────────────────────┬───────────────────┘
-         │ DM with heartbeat-identity                │ DM with claude-channel-identity
-         │ (ops + #shell commands)                   │ (free-form prose → LLM)
-         ▼                                           ▼
-┌────────────────────────────────┐       ┌────────────────────────────────┐
-│ aqua-matrix-heartbeat          │       │ aqua-matrix-claude-channel     │
-│   ident: heartbeat.pem         │       │   ident: claude-channel.pem    │
-│   store: ~/.aqua-matrix-       │       │   store: ~/.aqua-matrix-       │
-│          heartbeat/            │       │          claude-channel/       │
-│                                │       │                                │
-│   sends: 10-min status DM      │       │   on incoming DM from target:  │
-│   reads (event-driven sync):   │       │     spawn `claude -p <body>`   │
-│     #shell <cmd>               │       │     stream stdout back as DM   │
-│       → dispatcher             │       │                                │
-│       → systemd unit op        │       │   stateless: each msg is a     │
-│                                │       │   fresh claude invocation      │
-│   #shell respawn ──────────────┼───────┤── targets claude-bridge OR     │
-│                                │       │   aqua-matrix-claude-channel   │
-└────────────────────────────────┘       └────────────────────────────────┘
-                                                       │
-                                                       │ (#shell respawn target)
-                                                       ▼
-                                         ┌────────────────────────────────┐
-                                         │ claude-bridge.service          │
-                                         │   tmux session `claude-bridge` │
-                                         │   running:                     │
-                                         │     claude --dangerously-      │
-                                         │            skip-permissions    │
-                                         │                                │
-                                         │   for LOCAL interactive use:   │
-                                         │     tmux attach -t claude-     │
-                                         │            bridge              │
-                                         │                                │
-                                         │   NOT connected to Matrix.     │
-                                         └────────────────────────────────┘
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ DM with claude-channel-identity
+                                    │ (free-form prose → LLM)
+                                    ▼
+                  ┌────────────────────────────────┐
+                  │ aqua-matrix-claude-channel     │
+                  │   ident: claude-channel.pem    │
+                  │   store: ~/.aqua-matrix-       │
+                  │          claude-channel/       │
+                  │                                │
+                  │   on incoming DM from target:  │
+                  │     spawn `claude -p <body>`   │
+                  │     stream stdout back as DM   │
+                  │                                │
+                  │   stateless: each msg is a     │
+                  │   fresh claude invocation      │
+                  └────────────────────────────────┘
+
+                  ┌────────────────────────────────┐
+                  │ claude-bridge.service          │
+                  │   tmux session `claude-bridge` │
+                  │   running:                     │
+                  │     claude --dangerously-      │
+                  │            skip-permissions    │
+                  │                                │
+                  │   for LOCAL interactive use:   │
+                  │     tmux attach -t claude-     │
+                  │            bridge              │
+                  │                                │
+                  │   NOT connected to Matrix.     │
+                  └────────────────────────────────┘
 ```
 
 ### Component roles
 
 | Component | Purpose | Identity | Failure mode |
 |---|---|---|---|
-| `aqua-matrix-heartbeat` | Ops channel. Periodic status DMs + `#shell` commands. | `heartbeat.pem` | Heartbeat stops; commands stop. Claude side unaffected. |
-| `aqua-matrix-claude-channel` | LLM channel. Free-form prose in, Claude output out. | `claude-channel.pem` | Conversational replies stop. Ops channel unaffected. |
-| `claude-bridge.service` | Persistent interactive Claude in tmux, for local human attachment via `tmux attach`. | none (host-local process) | Local interactive Claude unavailable. Both Matrix daemons unaffected. |
+| `aqua-matrix-claude-channel` | LLM channel. Free-form prose in, Claude output out. | `claude-channel.pem` | Conversational replies stop. The local bridge is unaffected. |
+| `claude-bridge.service` | Persistent interactive Claude in tmux, for local human attachment via `tmux attach`. | none (host-local process) | Local interactive Claude unavailable. The Matrix daemon is unaffected. |
 
 ## Workspace layout
 
-The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. After the **physical repo split**, this repo is the **connector substrate only: five crates** under `crates/`. The three backend crates (`aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`) plus the agent content (`types/*.json`, `instances/*.toml.example`, `Dockerfile`, `scripts/build-image.sh`) now live in the sibling **`../aqua-agents`** repo, which path-deps back into this connector (the same cross-repo path-dep pattern `siwx-oidc-auth` uses). See "Repo boundary" below.
+The repo is a Cargo workspace (virtual root manifest) and a **reference implementation** for any agent backend over Matrix + siwx-oidc — the `claude -p` daemon is just a placeholder backend. After the **physical repo split**, this repo is the **connector substrate only: five crates** under `crates/`. The two backend crates (`aqua-matrix-template`, `aqua-matrix-claude-p`) plus the agent content (`types/*.json`, `instances/*.toml.example`, `Dockerfile`, `scripts/build-image.sh`) now live in the sibling **`../aqua-agents`** repo, which path-deps back into this connector (the same cross-repo path-dep pattern `siwx-oidc-auth` uses). See "Repo boundary" below.
 
 **Connector half** (this repo — the reusable substrate; these crates know nothing about any specific agent):
 
@@ -73,19 +68,18 @@ The repo is a Cargo workspace (virtual root manifest) and a **reference implemen
 | Crate | Role |
 |---|---|
 | `aqua-matrix-template` | The agent capability schema: `AgentType` / `InstanceBinding` / `ResolvedInstance`, plus the `build_spawn_spec(agent_type, target, id) -> ContainerSpec` factory that produces a connector `ContainerSpec` (the only place that maps a rich `AgentType` down to the agent-agnostic spawn input). |
-| `aqua-matrix-heartbeat` | Binary `aqua-matrix-heartbeat` — the ops/heartbeat agent (periodic status DM + `#shell` commands). Deps: relay, template, orchestrator. |
 | `aqua-matrix-claude-p` | Binary `aqua-matrix-claude-p` — the reference Claude backend that forwards DMs to `claude -p`. Deps: relay, template, gating. |
 
-These three crates, plus the agent content (`types/*.json`, `instances/*.toml.example`, `Dockerfile`, `scripts/build-image.sh`), have been **moved out of this repo** into `../aqua-agents`; their `[dependencies]` resolve the connector crates by path back into this repo. To build them, run `cargo build` from `../aqua-agents` (this connector must be checked out alongside as a sibling). A `cargo build` in *this* repo builds only the five connector crates.
+These two crates, plus the agent content (`types/*.json`, `instances/*.toml.example`, `Dockerfile`, `scripts/build-image.sh`), have been **moved out of this repo** into `../aqua-agents`; their `[dependencies]` resolve the connector crates by path back into this repo. To build them, run `cargo build` from `../aqua-agents` (this connector must be checked out alongside as a sibling). A `cargo build` in *this* repo builds only the five connector crates.
 
 ## Repo boundary
 
 The two halves now live in **two repos** with a **strictly one-way dependency rule**, so the connector substrate can evolve independently of any agent that rides on it. This is the invariant the whole split exists to create; see [`repo-split-execution-handover.md` (archived)](https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md) (§1 locked decisions, §4 target architecture) for the full rationale.
 
 - **Connector half (this repo, `aqua-matrix-agent`):** `aqua-matrix-agent`, `aqua-matrix-relay`, `aqua-matrix-ask-mcp`, `aqua-matrix-orchestrator`, `aqua-matrix-gating`. A reusable "run any agent over Matrix + Podman" substrate.
-- **Agents half (sibling repo, `../aqua-agents`):** `aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`. The concrete backends + the capability schema + the agent content. Its `[workspace.dependencies]` pull the connector crates in by path (`../aqua-matrix-agent/crates/...`), the same cross-repo path-dep pattern `siwx-oidc-auth` uses.
+- **Agents half (sibling repo, `../aqua-agents`):** `aqua-matrix-template`, `aqua-matrix-claude-p`. The concrete backends + the capability schema + the agent content. Its `[workspace.dependencies]` pull the connector crates in by path (`../aqua-matrix-agent/crates/...`), the same cross-repo path-dep pattern `siwx-oidc-auth` uses.
 
-**The one-way rule:** dependencies flow **agents → connector, NEVER the reverse.** No connector crate may name a backend crate (`aqua-matrix-template`, `aqua-matrix-heartbeat`, `aqua-matrix-claude-p`) in its `Cargo.toml`. With the split now physical, an inverted edge is a cross-repo dependency-cycle problem; the in-place refactor that preceded the split proved the boundary holds as a compile-time check first.
+**The one-way rule:** dependencies flow **agents → connector, NEVER the reverse.** No connector crate may name a backend crate (`aqua-matrix-template`, `aqua-matrix-claude-p`) in its `Cargo.toml`. With the split now physical, an inverted edge is a cross-repo dependency-cycle problem; the in-place refactor that preceded the split proved the boundary holds as a compile-time check first.
 
 > **Deployment glue still here pending a migration pass:** `Skills/` and `systemd/` remain in this connector repo for now (the agent systemd units' `ExecStart` still point at `%h/aqua-matrix-agent/target/debug/...`, and the `Dockerfile`/`build-image.sh` in `../aqua-agents` need a cross-repo build context with both repos present — flagged as a known follow-up in the aqua-agents README). A later deployment-migration pass reconciles the unit paths, image build context, and skill homes. The existing `localhost/aqua-matrix-agent:poc` image remains usable meanwhile.
 
@@ -94,22 +88,21 @@ Two seams keep the boundary clean:
 - **The `ContainerSpec` seam (orchestrator).** The connector's `ContainerManager::spawn` consumes a minimal, agent-agnostic `ContainerSpec`, so the connector **never sees `AgentType`**. The mapping from a rich `AgentType` down to a `ContainerSpec` lives entirely agents-side, in `aqua_matrix_template::build_spawn_spec(agent_type, target, id)` (it resolves ref-mount host paths absolute and serializes the `ResolvedInstance` into `config_blob` mounted RO at `/agent/config.json`). `aqua-matrix-template` therefore gains an `aqua-matrix-orchestrator` dep — an *allowed* agents → connector edge.
 - **The `MessageHandler` / `InboundMessage` / `authorize` seam (relay).** Backends implement `MessageHandler::handle_message(agent, target, &InboundMessage) -> anyhow::Result<()>`. The relay owns the connect-rotate-sync-watermark lifecycle and dispatch, calling `authorize(sender_mxid, target)` (default = case-insensitive equality with the single target) as the allow/deny gate for both message dispatch and invite auto-join. This is the aqua-security allow/deny hook-point (keyed on DID in a future phase), scaffolded inert today.
 
-**The guard:** `scripts/check-dep-direction.sh` enforces the one-way rule mechanically. It greps each connector crate's `Cargo.toml` with an *anchored* dependency-line regex (`^[[:space:]]*aqua-matrix-(template|heartbeat|claude-p)\b`) so it inspects dependency entries only, never `description` metadata; it exits non-zero and names the offending crate/line on any forbidden edge, prints `OK` otherwise. Run it as part of the gate alongside `cargo build` / `cargo test`.
+**The guard:** `scripts/check-dep-direction.sh` enforces the one-way rule mechanically. It greps each connector crate's `Cargo.toml` with an *anchored* dependency-line regex (`^[[:space:]]*aqua-matrix-(template|claude-p)\b`) so it inspects dependency entries only, never `description` metadata; it exits non-zero and names the offending crate/line on any forbidden edge, prints `OK` otherwise. Run it as part of the gate alongside `cargo build` / `cargo test`.
 
-## Why two Matrix identities (not one)
+## Why one Matrix identity per surface
 
-See the comparison in the chat history that led to this design. Summary:
+Each Matrix-visible surface owns its own identity and DM room. The host once ran a second, ops surface next to the claude channel (retired now); the rule stands for every surface added later. Summary:
 
-- **State**: each daemon is stateless w.r.t. the other. No "mode" to track, no command/prose dispatcher.
-- **Restart safety**: restarting one does not perturb the other. `#shell restart` of the heartbeat does not disrupt an in-flight `claude -p` invocation.
-- **Heartbeat noise stays out of the LLM conversation**: 10-minute status payloads do not interleave with Claude replies.
+- **State**: each daemon is stateless w.r.t. every other. No "mode" to track, no command/prose dispatcher.
+- **Restart safety**: restarting one does not perturb another, e.g. an in-flight `claude -p` invocation.
 - **Misroute risk**: zero. A DM to identity-A cannot be misread as a command for identity-B.
-- **Element UX**: two distinct DM rooms in Tim's Element — mute, star, or notify each independently.
+- **Element UX**: distinct DM rooms in Tim's Element, to mute, star, or notify each independently.
 - **Cost**: one extra `.pem`, one extra OIDC client, one extra systemd unit. ~20 minutes of setup, paid once.
 
 ## Synchronization model (stream sync, not polling)
 
-Both Matrix daemons use **matrix-sdk's continuous sync stream** rather than polling:
+The Matrix daemon uses **matrix-sdk's continuous sync stream** rather than polling:
 
 ```rust
 // at startup:
@@ -121,7 +114,6 @@ Implications:
 
 - Incoming DMs arrive within ~1 second (matrix-sdk's sync long-poll cadence), not after a 30s tick.
 - Event handlers run on the sync task; long-running work (e.g. `claude -p`) is spawned as a separate tokio task so it does not block sync.
-- The heartbeat timer is a third tokio task — independent of sync state.
 
 Tradeoff: the daemon holds an open HTTP connection to the homeserver continuously. If the homeserver is unreachable, sync reconnects internally; the rest of the daemon stays alive.
 
@@ -131,7 +123,7 @@ Matrix `device_id` was historically server-assigned on every fresh OAuth login (
 
 **Stable device_id (pinned on every login).** `acquire_session` (the single token-acquisition path, shared by `AgentClient::connect` and the on-401 / near-expiry self-heal `reauth_inner`) resolves an *effective* `device_id` and passes it to `siwx_oidc_auth::authenticate_with_device(..., Some(id))`. The siwx-oidc server then provisions (idempotent upsert, never deletes) that exact device instead of minting a fresh `SIWX_<uuid>`, so the device's E2EE keys survive each login. Resolution precedence:
 
-- **(a) Explicit** `AgentConfig.device_id` / `AGENT_DEVICE_ID` — lets ops give a role-named device (e.g. `heartbeat`).
+- **(a) Explicit** `AgentConfig.device_id` / `AGENT_DEVICE_ID` — lets ops give a role-named device (e.g. `claude-channel`).
 - **(b) Derived** (default, zero config) — `stable_device_id(did)` = `AQUA_` + the first 12 lowercase-hex chars of `SHA-256(did)`. A pure function of the DID, so the same agent re-derives the SAME device every time. Existing deployments get device stability with no new config.
 
 **Three-tier session resolution in `acquire_session`** (`<store_dir>/config.toml` holds the cache):
@@ -198,8 +190,8 @@ account data rather than scraping logs or systemd. The payload:
 {
   "did":          "did:...",                    // the agent's decentralized identifier
   "user_id":      "@...:matrix.inblock.io",      // server-assigned Matrix user id
-  "role":         "heartbeat" | "claude-channel",// which surface this identity serves
-  "systemd_unit": "aqua-matrix-heartbeat",       // managing unit (None for ad-hoc runs)
+  "role":         "claude-channel",              // which surface this identity serves
+  "systemd_unit": "aqua-matrix-claude-channel",  // managing unit (None for ad-hoc runs)
   "last_online":  1700000000,                    // unix seconds, refreshed on each upsert
   "version":      "..."                          // crate version
 }
@@ -208,8 +200,6 @@ account data rather than scraping logs or systemd. The payload:
 `AgentClient::update_registry(role, systemd_unit)` performs the upsert. Refresh
 cadence:
 
-- **heartbeat**: every tick (and on each client-cycle start), so `last_online`
-  tracks the heartbeat interval.
 - **claude-channel**: on each client-cycle start. The channel has no periodic
   tick of its own, so `last_online` is refreshed at the token-rotation cadence
   (≈270s).
@@ -235,7 +225,7 @@ hide real problems to cosmetically remove two expected first-run probes.
 
 ## Auto-respawn
 
-All three units are designed to be "always alive" via `Restart=always` (Matrix daemons) or a bash supervisor loop (claude-bridge). Per-unit mechanism, recovery times, manual procedures, and the diagnostic decision tree all live in [`RECOVERY.md`](RECOVERY.md) — start there when something is broken.
+Both units are designed to be "always alive" via `Restart=always` (Matrix daemons) or a bash supervisor loop (claude-bridge). Per-unit mechanism, recovery times, manual procedures, and the diagnostic decision tree all live in [`RECOVERY.md`](RECOVERY.md) — start there when something is broken.
 
 ## Auto-start chain (WSL boot → daemons up)
 
@@ -245,7 +235,6 @@ WSL distro starts
             └─ systemd PID 1 boots
                     └─ user@1000.service starts (linger=yes in loginctl)
                             └─ user systemd manager spawns
-                                    ├─ aqua-matrix-heartbeat.service (enabled)
                                     ├─ aqua-matrix-claude-channel.service (enabled)
                                     └─ claude-bridge.service (enabled)
 ```
@@ -255,7 +244,7 @@ Verify on a fresh boot:
 ```bash
 cat /etc/wsl.conf | grep -A1 boot           # systemd=true
 loginctl show-user "$USER" | grep Linger    # Linger=yes
-systemctl --user is-enabled aqua-matrix-heartbeat aqua-matrix-claude-channel claude-bridge
+systemctl --user is-enabled aqua-matrix-claude-channel claude-bridge
 ```
 
 WSL itself does **not** start on Windows boot unless triggered (open a WSL terminal, or set up a Windows scheduled task running `wsl --distribution <name> --exec true` at logon). After WSL starts, everything above is automatic.
@@ -266,11 +255,9 @@ WSL itself does **not** start on Windows boot unless triggered (open a WSL termi
 |---|---|---|
 | `agent.pem` | Free chat identity for ad-hoc `aqua-matrix-agent` runs. | Binary, on first chat run. |
 | `agent-b.pem` | Second identity for `/e2e-test`. | E2E test setup. |
-| `heartbeat.pem` | Heartbeat daemon identity. | Renamed from auto-generated `agent.pem` during initial setup. |
 | `claude-channel.pem` | Claude-channel daemon identity. | Auto-generated on first `aqua-matrix-claude-p` run. |
-| `~/.aqua-matrix-heartbeat/` | Heartbeat sync state + config + session cache. | Heartbeat daemon. |
+| `~/.aqua-matrix-heartbeat/claude-oauth-token` | The Claude OAuth token file the consultant fleet reads (`AQUA_CLAUDE_TOKEN_FILE`). The directory name is historical. | Operator (`claude setup-token`). |
 | `~/.aqua-matrix-claude-channel/` | Claude-channel sync state + config + session cache. | Claude-channel daemon. |
-| `~/.config/systemd/user/aqua-matrix-heartbeat.service` | Heartbeat unit. | Operator install (`cp` from `systemd/`). |
 | `~/.config/systemd/user/aqua-matrix-claude-channel.service` | Claude-channel unit. | Operator install. |
 | `~/.config/systemd/user/claude-bridge.service` | Interactive Claude tmux unit. | Operator install. |
 
@@ -278,8 +265,8 @@ All `.pem` files are gitignored (`*.pem` in `.gitignore`) — they ARE the ident
 
 ## Troubleshooting
 
-Moved to [`RECOVERY.md`](RECOVERY.md) — its "Diagnostic decision tree" section covers the canonical symptoms (silent ops channel, claude channel not responding, device_id rotating, `#shell` commands ignored, bridge tmux missing). RECOVERY.md is the runbook; this document is the design rationale.
+Moved to [`RECOVERY.md`](RECOVERY.md) — its "Diagnostic decision tree" section covers the canonical symptoms (claude channel not responding, device_id rotating, bridge tmux missing). RECOVERY.md is the runbook; this document is the design rationale.
 
-## Adding a fourth surface
+## Adding another surface
 
 To add another Matrix-visible agent surface (e.g. a calendar bot, a code-review bot): implement the `MessageHandler` trait in a new crate (or as an example) and call `run_daemon()` from `aqua-matrix-relay` — that gives you the connect-rotate-sync-watermark lifecycle for free, so you only write the per-message logic. Then generate a fresh `.pem`, register a fresh OIDC client (auto on first run), ship a new systemd unit, and enable it. See [`docs/REFERENCE.md`](REFERENCE.md) and `crates/aqua-matrix-relay/examples/echo_agent.rs` for a minimal working handler. Do NOT multiplex onto an existing identity — the whole point of this architecture is that each surface owns its channel.

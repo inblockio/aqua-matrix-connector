@@ -44,10 +44,14 @@
 #                        never joined); legacy = pre-R17 (not declined, not joined by the live
 #                        handler, joined at the next cycle start, which the step forces with a
 #                        restart). `boundinvite` runs under owner_only only.
+#   RETIRED: the `follow` and `digest` steps (H5/H6/H7) and the three --follow-* options below test the
+#   host.refs_follow mounts of spawn-consultant.sh, which are gone: the agent's aqua-agent-refs view is
+#   the only /refs mount, so a container never mounts a follow mirror and these steps fail. Do not select
+#   them until they are re-pointed at the agent-refs view.
 #   --follow-bed DIR     test bed of `follow` and `digest` (never the live follow root):
 #                        DIR/remote/<repo>.git local bare upstream, DIR/root the canary's
-#                        CONSULTANT_REFS_FOLLOW_ROOT, DIR/configs the job's config dir (canary
-#                        configs only), DIR/work a scratch clone for the test pushes
+#                        follow root (the job's CONSULTANT_REFS_FOLLOW_ROOT), DIR/configs the job's
+#                        config dir (canary configs only), DIR/work a scratch clone for the test pushes
 #   --follow-job PATH    consultant_refs_follow.py (aqua-ops tools/consultant-refs-follow)
 #   --follow-repo NAME   the followed repo (default aqua-rs-sdk)
 #   --keep-going         record every FAIL instead of stopping at the first
@@ -67,7 +71,7 @@
 # is UTD for the canary and must not appear in its history.
 #
 # Not checkable here (see ~/.aqua-matrix-test/canaryrooms-NOTES.md): AC5 (Marina's full extra refs;
-# the canary carries one, host.extra_refs, checked by podman inspect), AC6 (Aqua System is not
+# the canary carries one in its aqua-agent-refs list, checked by podman inspect), AC6 (Aqua System is not
 # in the test room), AC8 (build and fleet gates), the R8 daily limit at 48, R11 media. R15c
 # (to-room drafts) is the `toroom` step; its once-only note to the next room batch is unit-tested.
 set -uo pipefail

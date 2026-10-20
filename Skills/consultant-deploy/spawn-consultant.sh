@@ -23,53 +23,29 @@
 # persist volume, so the DID + memory are PRESERVED, this is the image-roll path.
 # `--fresh` forces a brand-new identity by wiping the persist dir first.
 #
-# Grounding refs (the LEGACY path, used unless the agent has an aqua-agent-refs list, see "Per-agent
-# refs lists" below): the repos in REFS_REPOS are mounted read-only at /refs inside the
-# container. Before EVERY launch the script verifies each repo exists on the host
-# (missing = fatal, with a clone hint) and is on the latest upstream commit:
-# clean + behind upstream gets a fast-forward pull; dirty / diverged / offline gets
-# a loud warning and is mounted as-is (never destructive). Skip the freshness pass
-# (presence stays fatal) with --no-refresh-refs.
+# Grounding refs: every consultant mounts exactly ONE refs source, its per-agent read-only view, as
+# `-v <view>:/refs:ro`. The view is built and kept current by the aqua-agent-refs tool from the agent's list
+# (see "Per-agent refs lists" below); this script never touches a host checkout. Before EVERY real launch it
+# syncs the view (`sync --agent=<STEM> --wait 900`); --no-refresh-refs skips the sync and only checks the view
+# (`check --agent=<STEM>`), and so does --print-run. REFS_REPOS below is the fleet default list a NEW consultant
+# starts with.
 #
-# Host block (per consultant, opt-in): settings for THIS script live in ONE `host` object in the
-# consultant JSON. The agent binary accepts the object and ignores its contents; this script
-# validates it STRICTLY before any side effect (Owner step, config render, clone, container):
-# `host` must be an object, its only keys are `extra_refs` and `refs_follow`, each a list of plain
-# repo names ([A-Za-z0-9._-], not ".", no "..", not the reserved "_developments"). Anything else
-# exits 2 with nothing changed. It is read from the config the spawn uses (the kept config, or the
-# render's base: the existing config, else the template). No `host` = today's argv, byte for byte.
-#   "host": { "extra_refs": ["aqua-mail", "siwx-oidc"], "refs_follow": ["aqua-rs-sdk"] }
-#
-# Extra refs (host.extra_refs): REFS_REPOS is fleet-wide, every consultant mounts it. A consultant
-# that needs MORE repos (private ones included) lists them in host.extra_refs. (This replaces the
-# former <test-dir>/<key>-extra-refs.list host file, which is no longer read.) Each listed repo is
-# mounted read-only at /refs/<repo> into THAT consultant only, from a CLEAN single-branch clone of
-# GitHub's default branch at <mirror>/<repo>, never from a working checkout (untracked .env or
-# target/ would ride along). <mirror> = ${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs},
-# on disk, never /tmp (RAM-backed tmpfs here). A missing mirror is cloned, a present one
-# fast-forwarded. FAIL-CLOSED, unlike the fleet pass: a clone/fetch failure, a non-fast-forward,
-# or ANY local change in a mirror (modified, untracked or ignored files) aborts the spawn.
-# --no-refresh-refs (and so --print-run) mounts the mirrors as-is: no clone, no fetch, but a
-# missing or dirty mirror still aborts. A listed repo that is already in REFS_REPOS is skipped
-# with a note (the fleet mount wins), and so is one that is followed (host.refs_follow wins).
-#
-# Followed refs (host.refs_follow): each listed repo is mounted read-only at /refs/<repo> from
-# its FOLLOW mirror <follow>/<repo>, IN PLACE of the fleet mount for that repo (a repo outside
-# REFS_REPOS is simply added), for THIS consultant only; every other consultant keeps the fleet
-# checkout. Its digest dir <follow>/_developments/<repo> is mounted read-only at
-# /refs/_developments/<repo>. Directory mounts only (a single-file bind mount goes stale when the
-# file is replaced by rename). <follow> = ${CONSULTANT_REFS_FOLLOW_ROOT:-$HOME/.local/share/consultant-refs-follow}.
-# The follow mirrors and digests are owned by the host timer consultant-refs-follow.timer
-# (aqua-ops), which keeps them on the upstream default branch; this script NEVER clones, fetches
-# or updates them. FAIL-CLOSED: a missing mirror, a missing digest dir, or a dirty mirror (same
-# rule as extra refs) aborts the spawn before the container is touched, with
-# "run: systemctl --user start consultant-refs-follow.service".
+# Host block (per consultant): settings for THIS script may live in ONE `host` object in the consultant JSON.
+# The agent binary accepts the object and ignores its contents; this script validates it STRICTLY before any
+# side effect (Owner step, config render, container): `host` must be an object, its only keys are `extra_refs`
+# and `refs_follow`, each a list of plain repo names ([A-Za-z0-9._-], not ".", no "..", not the reserved
+# "_developments"). Anything else exits 2 with nothing changed. It is read from the config the spawn uses (the
+# kept config, or the render's base: the existing config, else the template). Both keys are RETIRED: they mount
+# nothing any more, and a config that still carries a non-empty one gets one note saying it is ignored, because
+# the agent's repos come from its aqua-agent-refs list. Give one consultant more (or fewer) repos with
+# `aqua-agent-refs add|remove --agent=<STEM> <repo>`.
 #
 # Per-agent refs lists (aqua-agent-refs; design: inblockio/aqua-agents, docs/plans/2026-10-19-agent-refs.md).
-# The switch is a list file, <AGENT_REFS_ROOT>/agents/<STEM>.json, written only by the aqua-agent-refs
-# tool. Everything above is the LEGACY path. The path is decided right after the host block is validated
-# and before any side effect, by asking the tool: `$AGENT_REFS_BIN path --agent=<STEM>` (equals form in every
-# call, so a STEM starting with a dash is never parsed as a flag). Exit codes of `path`:
+# The list is a file, <AGENT_REFS_ROOT>/agents/<STEM>.json, written only by the aqua-agent-refs tool, and the
+# view built from it is <AGENT_REFS_ROOT>/views/<STEM>. This is the ONLY refs path: there is no fallback to host
+# checkouts. It is decided right after the host block is validated and before any side effect, by asking the
+# tool: `$AGENT_REFS_BIN path --agent=<STEM>` (equals form in every call, so a STEM starting with a dash is
+# never parsed as a flag). Exit codes of `path`:
 #   exit 0  the agent HAS a list; stdout is its view dir. The view must be exactly <AGENT_REFS_ROOT>/views/<STEM>
 #           (compared after `realpath -m` on both sides, nothing stripped from the answer: a trailing carriage
 #           return, a second line, a colon or a relative path is refused), and a directory that is not a
@@ -77,8 +53,7 @@
 #   exit 5  the agent has NO list file (and only then). The script also requires that neither the list file
 #           exists nor is a symlink: if it does, the tool and the disk disagree and the spawn aborts.
 #   other   (exit 2 = usage / invalid key / settings error, 1, 3, 4, 127, an old tool that answers 2 for
-#           "no list", an unusable answer): abort, nothing changed. Fail closed: an error must never turn into
-#           the legacy path, which could bring a repo back that was removed from the agent's list.
+#           "no list", an unusable answer): abort, nothing changed. Fail closed: an error never guesses a source.
 # Existing or new consultant. A consultant is EXISTING when it already has an identity or a container, NEVER
 # decided by its config file (a --print-run renders the config, and a failed first spawn leaves one too):
 #   - $STORE/agent.pem is non-empty (the DID the agent minted on its first connect; the same check that prints
@@ -89,23 +64,20 @@
 #   existing + list   exit 0 above. A real spawn runs `sync --agent=<STEM> --wait 900` (exit 0 or 3 proceed, 3 warns
 #                     that some repos are stale; anything else aborts before the config render, the --replace
 #                     removal or any container change). --print-run / --no-refresh-refs run `check --agent=<STEM>`
-#                     instead (non-zero aborts). The view is mounted `-v <view>:/refs:ro` as the ONLY refs mount,
-#                     where the fleet mounts sat in the argv: no REFS_REPOS checkouts, no host.extra_refs /
-#                     host.refs_follow mounts (a config that carries them gets one line saying they are ignored),
-#                     no working-checkout freshness pass. Repos change live, no respawn:
-#                     `aqua-agent-refs add|remove --agent=<STEM> <repo>`.
-#   existing, no list  (exit 5) the legacy path, argv byte for byte.
+#                     instead (non-zero aborts). The view is mounted `-v <view>:/refs:ro` as the ONLY refs mount.
+#                     Repos change live, no respawn: `aqua-agent-refs add|remove --agent=<STEM> <repo>`.
+#   existing, no list (exit 5) abort, exit 2, nothing changed. The message names the fix:
+#                     `aqua-agent-refs add --agent=<STEM> <REFS_REPOS>`, then spawn again.
 #   new               ALWAYS `add --agent=<STEM> --wait 900 <REFS_REPOS...>` first, with or without a list file:
 #                     add is idempotent (listed repos are kept), so a retry after a PARTIAL add (the tool wrote a
 #                     list and exited 1) tops up the missing fleet repos. Exit 0 or 3 proceed (3 warns), anything
 #                     else aborts with a note that a partial list may exist (`aqua-agent-refs list --agent=<STEM>`).
 #                     Then `path`, `sync` and the mount, as for an existing agent with a list. --print-run creates
 #                     nothing: it prints what the add would be and a placeholder as the /refs source.
-# Tool not installed (AGENT_REFS_BIN not found): the legacy path with ONE warning line, for an existing and for
-# a new consultant alike (classified by the store identity only), so this script keeps working on a host before
-# the tool is installed (it stays inert until the tool AND a list file exist). Fail-closed exception: the list
-# file exists (or is a symlink) but the tool is missing = abort, because the legacy path could bring a removed
-# repo back through host.extra_refs. Rollback for one agent = delete its list file and respawn.
+# Tool not installed (AGENT_REFS_BIN not found): abort, exit 2, nothing changed (no container removed, no config
+# written, no persist touched), with an install hint. There is no legacy fallback any more.
+# Changing one agent's repos (and so rolling one back): edit its list with `aqua-agent-refs add|remove
+# --agent=<STEM> <repo>`, live, no respawn. Deleting the list is not a rollback: the spawn then refuses.
 #
 # Rooms (per consultant, opt-in): when the directory <test-dir>/<key>-rooms/ exists it is
 # mounted read-only at /agent/rooms, and <test-dir>/<key>-room-state/ (created when missing,
@@ -173,8 +145,8 @@
 #
 # --print-run: assemble everything, print the `podman run` argument vector one arg per line,
 # exit 0. Stops BEFORE any container, systemd unit, DM, --replace removal or --fresh wipe,
-# and implies --no-refresh-refs (presence of every refs repo is still checked; extra-refs and
-# follow mirrors must also be clean). It DOES render/patch the config file and create the persist
+# and implies --no-refresh-refs (the refs view is only checked, never synced, and a new consultant's list is
+# not created). It DOES render/patch the config file and create the persist
 # dirs (and a rooms consultant's room-state dir), since those are the run's
 # inputs. Secrets print as bare names (`-e DEEPGRAM_API_KEY`), never as values.
 #
@@ -204,15 +176,10 @@
 # Env overrides (all optional; the defaults are this host's live paths):
 #   CONSULTANT_TEST_DIR     dir holding configs/persist/avatars/template (default ~/.aqua-matrix-test)
 #   CONSULTANT_TEMPLATE     config template path (default $CONSULTANT_TEST_DIR/consultant-config.template.json)
-#   CONSULTANT_REFS_BASE    parent dir of the REFS_REPOS checkouts (default /home/waldknoten-01)
-#   CONSULTANT_REFS_MIRROR  root of the extra-refs mirrors (default $HOME/.local/share/consultant-refs; never /tmp)
-#   CONSULTANT_REFS_REMOTE  clone base of the extra refs, <base>/<repo>.git (default https://github.com/inblockio)
-#   CONSULTANT_REFS_FOLLOW_ROOT  root of the follow mirrors + _developments digests (default
-#                           $HOME/.local/share/consultant-refs-follow; written only by the host timer)
 #   AGENT_REFS_BIN          the aqua-agent-refs binary (default aqua-agent-refs on PATH, else $HOME/.local/bin/aqua-agent-refs
 #                           when executable: a systemd / cron roll has no ~/.local/bin on PATH; tests point it at a stub)
-#   AGENT_REFS_ROOT         the tool's root (default $HOME/.local/share/agent-refs); read here only to find agents/<STEM>.json
-#                           when the binary is missing (the tool itself reads the same variable)
+#   AGENT_REFS_ROOT         the tool's root (default $HOME/.local/share/agent-refs); read here to derive the expected view
+#                           (views/<STEM>) and the list file (agents/<STEM>.json); the tool reads the same variable
 #   CONSULTANT_IMAGE        image to run (default localhost/aqua-matrix-agent:poc)
 #   AQUA_CLAUDE_TOKEN_FILE  OAuth token file (default ~/.aqua-matrix-heartbeat/claude-oauth-token)
 #   AQUA_DEEPGRAM_ENV       Deepgram env file (default $HOME/.aqua-secrets/deepgram.env)
@@ -269,7 +236,7 @@ FRESH=0               # wipe persist dir first (force a brand-new identity)
 ONBOARD=0             # after launch, wait for the consultant's welcome to be delivered and tell Tim
 PRINT_ONBOARDING=0    # --print-onboarding: print the consultant's hello + both Tim notices and exit 0
 KEEP_CONFIG=0         # reuse the existing config verbatim (image-roll; never clobber customizations)
-REFRESH_REFS=1        # fast-forward the /refs repos before launch (--no-refresh-refs to skip)
+REFRESH_REFS=1        # sync the agent's refs view before launch (--no-refresh-refs: only check it, no sync)
 REFRESH_PROMPT=0      # adopt the template's system_prompt/description/ref_mounts into the config
 AVATAR=""             # explicit avatar image path; default = <test-dir>/<key>-avatar.jpg (key = label, or "generic")
 VOICE=""              # --voice on|off: patch voice.enabled in the config; empty = leave the config untouched
@@ -282,20 +249,13 @@ MATRIX_URL_ARG=""     # --matrix-url: homeserver base URL for the agent; empty =
 TEST_DIR="${CONSULTANT_TEST_DIR:-/home/waldknoten-01/.aqua-matrix-test}"
 TEMPLATE="${CONSULTANT_TEMPLATE:-$TEST_DIR/consultant-config.template.json}"
 IMAGE="${CONSULTANT_IMAGE:-localhost/aqua-matrix-agent:poc}"
-REFS_BASE="${CONSULTANT_REFS_BASE:-/home/waldknoten-01}"
 # Persona rendering helper, alongside this script (resolve through the ~/ symlink).
 PERSONA_HELPER="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/consultant-persona.py"
-# Grounding repos, mounted ro at /refs/<name>. This ONE list drives the presence check,
-# the freshness pass, and the podman -v flags, so the three can never drift apart.
-# Keep it in sync with ref_mounts in consultant-config.template.json.
+# Fleet default grounding repos: a NEW consultant's agent-refs list is created from this list
+# (`aqua-agent-refs add --agent=<STEM> <these, in order>`), and the add command in the refusal for an
+# existing consultant without a list is printed from it. An existing list is never touched by this
+# script. Keep it in sync with ref_mounts in consultant-config.template.json.
 REFS_REPOS=(aqua-rs-sdk aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io)
-# Per-consultant extra refs (host.extra_refs): clean clones live under REFS_MIRROR, one
-# dir per repo, cloned from REFS_REMOTE/<repo>.git. Disk only: /tmp is RAM-backed on this host.
-REFS_MIRROR="${CONSULTANT_REFS_MIRROR:-$HOME/.local/share/consultant-refs}"
-REFS_REMOTE="${CONSULTANT_REFS_REMOTE:-https://github.com/inblockio}"
-# Followed refs (host.refs_follow): mirrors + _developments digests under FOLLOW_ROOT, kept current
-# by the host timer consultant-refs-follow.timer (aqua-ops). This script only reads them.
-FOLLOW_ROOT="${CONSULTANT_REFS_FOLLOW_ROOT:-$HOME/.local/share/consultant-refs-follow}"
 # Per-agent refs lists (aqua-agent-refs): the tool owns agents/<STEM>.json under AGENT_REFS_ROOT and one
 # read-only view dir per agent; this script only asks it (see the header, "Per-agent refs lists").
 # AGENT_REFS_BIN: aqua-agent-refs on PATH, else $HOME/.local/bin/aqua-agent-refs when it is an executable file (systemd
@@ -354,7 +314,7 @@ esac
 # own default (prod). CONSULTANT_SIWX_URL overrides for tests.
 LOOKUP_SIWX_URL="${SIWX_URL_ARG:-${CONSULTANT_SIWX_URL:-https://siwx-oidc.inblock.io}}"
 LOOKUP_SIWX_URL="${LOOKUP_SIWX_URL%/}"
-# --print-run must not fetch/pull anything; presence of the refs repos is still enforced.
+# --print-run must not sync anything: it only checks the refs view (and creates no list).
 [ "$PRINT_RUN" -eq 1 ] && REFRESH_REFS=0
 
 # ---------------------------------------------------------------- validate label + paths
@@ -555,10 +515,10 @@ fi
 
 # ---------------------------------------------------------------- host block: read + validate
 # The config's `host` object (spawn-only settings, ignored by the agent) is parsed and validated
-# HERE, before the Owner step, the config render or any clone, so a bad block aborts with exit 2
-# and nothing changed. Source: the config this spawn uses (kept config, or the render's base).
-# Names are plain GitHub repo names: [A-Za-z0-9._-] only, so no slash and no ".." can steer a
-# mirror path or a /refs mount; "_developments" is reserved for the follow digests' mount point.
+# HERE, before the Owner step or the config render, so a bad block aborts with exit 2 and nothing
+# changed. Source: the config this spawn uses (kept config, or the render's base). Both keys
+# (extra_refs, refs_follow) are retired and mount nothing; the schema check stays so existing configs
+# still validate. Names are plain repo names: [A-Za-z0-9._-] only; "_developments" stays reserved.
 host_block() {  # host_block <config.json>: prints HOST_EXTRA_REFS=(...) HOST_REFS_FOLLOW=(...)
   python3 - "$1" <<'PY'
 import json, re, shlex, sys
@@ -602,13 +562,13 @@ if ! HOST_ASSIGN="$(host_block "$HOST_SRC")"; then
 fi
 eval "$HOST_ASSIGN"
 
-# ---------------------------------------------------------------- agent-refs: which refs path
-# Decided HERE, read-only, before the Owner step or any other side effect (see the header, "Per-agent
-# refs lists"). REFS_MODE: legacy (today's REFS_REPOS / extra / follow mounts), list (an existing consultant
-# whose agent has a list: its view is the only refs mount) or new (a NEW consultant: a real spawn runs the
-# idempotent `add` of REFS_REPOS first, then it is a list agent). Fail closed on anything unexpected, except a
-# tool that is not installed at all, which keeps the legacy path so this script works before the install.
-REFS_MODE=legacy
+# ---------------------------------------------------------------- agent-refs: the refs source
+# Decided HERE, read-only, before the Owner step or any other side effect (see the header, "Per-agent refs
+# lists"). The agent's aqua-agent-refs view is the only refs source. REFS_MODE: list (an existing consultant
+# whose agent has a list) or new (a NEW consultant: a real spawn runs the idempotent `add` of REFS_REPOS first,
+# then it is a list agent). Fail closed on anything else: a tool that is not installed and an existing
+# consultant without a list both abort with exit 2, nothing changed.
+REFS_MODE=""
 REFS_VIEW=""
 REFS_LIST_FILE="$AGENT_REFS_ROOT/agents/$STEM.json"
 refs_list_file_present() { [ -e "$REFS_LIST_FILE" ] || [ -L "$REFS_LIST_FILE" ]; }
@@ -682,91 +642,22 @@ refs_view_ok() {
   exit 1
 }
 if ! command -v "$AGENT_REFS_BIN" >/dev/null 2>&1; then
-  if refs_list_file_present; then
-    echo "!! agent-refs: $STEM has a list ($REFS_LIST_FILE) but '$AGENT_REFS_BIN' is not installed;" >&2
-    echo "   refusing the legacy refs path (it could bring a removed repo back). Install it, or set AGENT_REFS_BIN (nothing was changed)." >&2
-    exit 1
-  fi
-  if store_has_identity; then WHO_REFS="existing"; else WHO_REFS="new"; fi
-  echo "!! agent-refs: '$AGENT_REFS_BIN' not found; $WHO_REFS consultant $STEM keeps the legacy refs path (install it to use per-agent refs lists)" >&2
-else
-  REFS_PATH_RC=0; agent_refs_view || REFS_PATH_RC=$?
-  if ! consultant_is_existing; then
-    REFS_MODE=new
-  elif [ "$REFS_PATH_RC" -eq 0 ]; then
-    REFS_MODE=list
-  fi
-  if [ "$REFS_MODE" != legacy ] && { [ "${#HOST_EXTRA_REFS[@]}" -gt 0 ] || [ "${#HOST_REFS_FOLLOW[@]}" -gt 0 ]; }; then
-    echo ">> refs: $STEM has an agent-refs list; host.extra_refs / host.refs_follow in $HOST_SRC are ignored (its repos come from the list only)"
-    HOST_EXTRA_REFS=(); HOST_REFS_FOLLOW=()
-  fi
+  echo "!! aborting: '$AGENT_REFS_BIN' not found; the aqua-agent-refs view is the only /refs source and there is no fallback (nothing was changed)" >&2
+  echo "   install it:  cd ~/aqua-agents && cargo install --locked --path crates/aqua-agent-refs --root ~/.local   (or set AGENT_REFS_BIN to the binary)" >&2
+  exit 2
 fi
-
-# REFS_FOLLOW: host.refs_follow, a repeated name dropped.
-REFS_FOLLOW=()
-for name in "${HOST_REFS_FOLLOW[@]}"; do
-  for r in "${REFS_FOLLOW[@]}"; do [ "$r" != "$name" ] || continue 2; done
-  REFS_FOLLOW+=( "$name" )
-done
-is_followed() { local r; for r in "${REFS_FOLLOW[@]}"; do [ "$r" != "$1" ] || return 0; done; return 1; }
-is_fleet_repo() { local r; for r in "${REFS_REPOS[@]}"; do [ "$r" != "$1" ] || return 0; done; return 1; }
-
-# EXTRA_REFS: host.extra_refs, minus followed repos (the follow mount wins) and REFS_REPOS (the
-# fleet mount wins), a repeated name dropped.
-EXTRA_REFS=()
-for name in "${HOST_EXTRA_REFS[@]}"; do
-  if is_followed "$name"; then
-    echo ">> extra refs: $name is followed (host.refs_follow), skipped"
-    continue
-  fi
-  if is_fleet_repo "$name"; then
-    echo ">> extra refs: $name is already fleet-mounted (REFS_REPOS), skipped"
-    continue
-  fi
-  for r in "${EXTRA_REFS[@]}"; do [ "$r" != "$name" ] || continue 2; done
-  EXTRA_REFS+=( "$name" )
-done
-
-# Followed refs: the host timer consultant-refs-follow.timer owns FOLLOW_ROOT; this script never
-# clones, fetches or updates it, it only checks (read-only) that each followed mirror is a clean
-# git clone and that its digest dir exists. GIT_OPTIONAL_LOCKS=0: the status must not take the
-# index lock, which would race the timer's fast-forward. Checked here, before the Owner step, so
-# a missing or dirty mirror aborts with nothing changed.
-check_follow_refs() {
-  local repo dir dev st
-  for repo in "${REFS_FOLLOW[@]}"; do
-    dir="$FOLLOW_ROOT/$repo"; dev="$FOLLOW_ROOT/_developments/$repo"
-    if [ ! -e "$dir" ]; then
-      echo "!! refs follow: mirror MISSING: $dir" >&2
-      return 1
-    fi
-    if [ ! -d "$dir/.git" ]; then
-      echo "!! refs follow: $dir is not a git clone; refusing to mount it" >&2
-      return 1
-    fi
-    if ! st="$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" status --porcelain --ignored 2>&1)"; then
-      echo "!! refs follow: cannot read the status of $dir: $st" >&2
-      return 1
-    fi
-    if [ -n "$st" ]; then
-      echo "!! refs follow: mirror $dir has LOCAL CHANGES (modified, untracked or ignored files); refusing to mount it" >&2
-      echo "   inspect: git -C $dir status --ignored   (or delete the dir; the service re-clones it)" >&2
-      return 1
-    fi
-    if [ ! -d "$dev" ]; then
-      echo "!! refs follow: digest dir MISSING: $dev" >&2
-      return 1
-    fi
-  done
-}
-if [ "${#REFS_FOLLOW[@]}" -gt 0 ]; then
-  if ! check_follow_refs; then
-    echo "   this script never clones or updates follow mirrors; the host timer does." >&2
-    echo "   run: systemctl --user start consultant-refs-follow.service" >&2
-    echo "!! aborting: follow mirror not usable (nothing was changed)" >&2
-    exit 1
-  fi
-  echo ">> refs follow: ${#REFS_FOLLOW[@]} repo(s) from $FOLLOW_ROOT (kept current by consultant-refs-follow.timer), ro at /refs, digests ro at /refs/_developments: ${REFS_FOLLOW[*]}"
+REFS_PATH_RC=0; agent_refs_view || REFS_PATH_RC=$?
+if ! consultant_is_existing; then
+  REFS_MODE=new
+elif [ "$REFS_PATH_RC" -eq 0 ]; then
+  REFS_MODE=list
+else
+  echo "!! aborting: $STEM is an existing consultant (it has an identity or a container) but has NO agent-refs list, and the list is its only refs source (nothing was changed)." >&2
+  echo "   create it first (REFS_REPOS is the fleet default), then spawn again:  $AGENT_REFS_BIN add --agent=$STEM ${REFS_REPOS[*]}" >&2
+  exit 2
+fi
+if [ "${#HOST_EXTRA_REFS[@]}" -gt 0 ] || [ "${#HOST_REFS_FOLLOW[@]}" -gt 0 ]; then
+  echo ">> refs: $STEM has an agent-refs list; host.extra_refs / host.refs_follow in $HOST_SRC are ignored (its repos come from the list only)"
 fi
 
 # ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
@@ -879,58 +770,9 @@ fi
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 
 # ---------------------------------------------------------------- refs grounding
-# The consultant's knowledge is the host checkouts in REFS_REPOS, bind-mounted ro at
-# /refs. A missing repo is FATAL (the mount would fail, or silently ground the agent
-# in nothing). The freshness pass brings each repo to the latest upstream commit when
-# that is safe (clean tree, fast-forward only) and warns loudly otherwise; it never
-# rewrites local work. Network failure is non-fatal: an offline host mounts as-is.
-refresh_refs() {
-  local rc=0 repo dir behind ahead
-  for repo in "${REFS_REPOS[@]}"; do
-    dir="$REFS_BASE/$repo"
-    if [ ! -d "$dir" ]; then
-      echo "!! refs repo MISSING: $dir" >&2
-      echo "   clone it first:  git clone https://github.com/inblockio/${repo}.git $dir" >&2
-      rc=1; continue
-    fi
-    if [ "$REFRESH_REFS" -eq 0 ]; then
-      echo ">> refs: $repo present (freshness pass skipped via --no-refresh-refs)"
-      continue
-    fi
-    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      echo "!! refs: $dir is not a git checkout; cannot verify freshness, mounting as-is" >&2
-      continue
-    fi
-    if ! git -C "$dir" fetch --quiet 2>/dev/null; then
-      echo "!! refs: fetch failed for $repo (offline?); mounting the checkout as-is" >&2
-      continue
-    fi
-    if ! git -C "$dir" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
-      echo "!! refs: $repo has no upstream configured; cannot verify freshness, mounting as-is" >&2
-      continue
-    fi
-    behind="$(git -C "$dir" rev-list --count 'HEAD..@{upstream}')"
-    ahead="$(git -C "$dir" rev-list --count '@{upstream}..HEAD')"
-    if [ "$behind" -eq 0 ]; then
-      echo ">> refs: $repo up to date ($(git -C "$dir" rev-parse --short HEAD))"
-    elif [ "$ahead" -gt 0 ]; then
-      echo "!! refs: $repo DIVERGED from upstream ($ahead ahead / $behind behind); resolve manually, mounting as-is" >&2
-    elif [ -n "$(git -C "$dir" status --porcelain)" ]; then
-      echo "!! refs: $repo is $behind commit(s) behind upstream but the tree is DIRTY; not pulling, mounting as-is" >&2
-    elif git -C "$dir" pull --ff-only --quiet 2>/dev/null; then
-      echo ">> refs: $repo fast-forwarded $behind commit(s) to $(git -C "$dir" rev-parse --short HEAD)"
-    else
-      echo "!! refs: fast-forward pull failed for $repo; mounting the checkout as-is" >&2
-    fi
-  done
-  return "$rc"
-}
-# An agent with an aqua-agent-refs list (REFS_MODE list / new, decided above) skips the checkout pass
-# below and gets its view instead (agent_refs_ground, further down). Same place in the flow: before
-# the config render, the --replace removal and any container change.
-if [ "$REFS_MODE" = legacy ]; then
-  refresh_refs || { echo "!! aborting: missing refs repo(s), see clone hints above" >&2; exit 1; }
-fi
+# The consultant's knowledge is its aqua-agent-refs view, bind-mounted ro at /refs as the ONLY refs mount
+# (REFS_MODE list / new, decided above). agent_refs_ground below syncs or checks the view, and runs in the
+# same place in the flow as always: before the config render, the --replace removal and any container change.
 
 # agent_refs_ground: a NEW consultant first runs the idempotent add of REFS_REPOS (creates the list, or tops up
 # a partial one left by an earlier failed add), then the view is synced (real spawn) or only checked
@@ -969,91 +811,15 @@ agent_refs_ground() {
   else
     "$AGENT_REFS_BIN" check --agent="$STEM" || rc=$?
     [ "$rc" -eq 0 ] || { echo "!! aborting: '$AGENT_REFS_BIN check --agent=$STEM' failed (exit $rc); nothing was launched" >&2; exit 1; }
-    echo ">> refs: $STEM view checked: $REFS_VIEW (ro at /refs; freshness pass skipped via --no-refresh-refs / --print-run)"
+    echo ">> refs: $STEM view checked: $REFS_VIEW (ro at /refs; no sync, skipped via --no-refresh-refs / --print-run)"
   fi
   refs_view_ok "after the refs sync / check"
 }
 
-# Legacy: a followed fleet repo is mounted from its follow mirror IN PLACE of the fleet checkout (same
-# position in the argv); a followed repo outside REFS_REPOS is added after the fleet mounts, then
-# one digest dir per followed repo. No host.refs_follow = exactly the fleet mounts, as before.
-# Agent-refs: the view is the ONE refs mount, in the position the fleet mounts had.
+# The view is the ONE refs mount.
 REF_MOUNT_ARGS=()
-if [ "$REFS_MODE" != legacy ]; then
-  agent_refs_ground
-  REF_MOUNT_ARGS+=( -v "$REFS_VIEW:/refs:ro" )
-else
-  for repo in "${REFS_REPOS[@]}"; do
-    if is_followed "$repo"; then
-      REF_MOUNT_ARGS+=( -v "$FOLLOW_ROOT/$repo:/refs/$repo:ro" )
-    else
-      REF_MOUNT_ARGS+=( -v "$REFS_BASE/$repo:/refs/$repo:ro" )
-    fi
-  done
-  for repo in "${REFS_FOLLOW[@]}"; do
-    is_fleet_repo "$repo" || REF_MOUNT_ARGS+=( -v "$FOLLOW_ROOT/$repo:/refs/$repo:ro" )
-  done
-  for repo in "${REFS_FOLLOW[@]}"; do
-    REF_MOUNT_ARGS+=( -v "$FOLLOW_ROOT/_developments/$repo:/refs/_developments/$repo:ro" )
-  done
-fi
-
-# Extra refs (EXTRA_REFS, from host.extra_refs): clean single-branch clones of each
-# repo's default branch under REFS_MIRROR. The whole tree is readable in the container, so the
-# mirror must be exactly what upstream has: FAIL-CLOSED on a missing mirror under
-# --no-refresh-refs, a failed clone or fetch, a non-fast-forward, and ANY local change
-# (modified, untracked OR ignored files). Never prompts for credentials (GIT_TERMINAL_PROMPT=0);
-# private repos authenticate through the host's git credential helper.
-sync_extra_refs() {
-  local repo dir st before
-  for repo in "${EXTRA_REFS[@]}"; do
-    dir="$REFS_MIRROR/$repo"
-    if [ ! -e "$dir" ]; then
-      if [ "$REFRESH_REFS" -eq 0 ]; then
-        echo "!! extra refs: mirror MISSING: $dir (nothing is cloned under --no-refresh-refs / --print-run)" >&2
-        echo "   run once without --no-refresh-refs, or:  git clone --single-branch $REFS_REMOTE/${repo}.git $dir" >&2
-        return 1
-      fi
-      mkdir -p "$REFS_MIRROR"
-      if ! GIT_TERMINAL_PROMPT=0 git clone --quiet --single-branch "$REFS_REMOTE/${repo}.git" "$dir"; then
-        echo "!! extra refs: clone FAILED for $repo ($REFS_REMOTE/${repo}.git)" >&2
-        return 1
-      fi
-      echo ">> extra refs: $repo cloned ($(git -C "$dir" rev-parse --abbrev-ref HEAD) at $(git -C "$dir" rev-parse --short HEAD))"
-      continue
-    fi
-    if [ ! -d "$dir/.git" ]; then
-      echo "!! extra refs: $dir is not a git clone; refusing to mount it" >&2
-      return 1
-    fi
-    if ! st="$(git -C "$dir" status --porcelain --ignored 2>&1)"; then
-      echo "!! extra refs: cannot read the status of $dir: $st" >&2
-      return 1
-    fi
-    if [ -n "$st" ]; then
-      echo "!! extra refs: mirror $dir has LOCAL CHANGES (modified, untracked or ignored files); refusing to mount it" >&2
-      echo "   inspect: git -C $dir status --ignored   (or delete the dir; the next spawn re-clones it)" >&2
-      return 1
-    fi
-    [ "$REFRESH_REFS" -eq 1 ] || continue
-    before="$(git -C "$dir" rev-parse HEAD)"
-    if ! GIT_TERMINAL_PROMPT=0 git -C "$dir" pull --ff-only --quiet; then
-      echo "!! extra refs: fetch / fast-forward FAILED for $repo (offline, or the mirror diverged from upstream)" >&2
-      return 1
-    fi
-    if [ "$(git -C "$dir" rev-parse HEAD)" != "$before" ]; then
-      echo ">> extra refs: $repo fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
-    fi
-  done
-}
-if [ "${#EXTRA_REFS[@]}" -gt 0 ]; then
-  sync_extra_refs || { echo "!! aborting: extra refs mirror not usable, see above (nothing was launched)" >&2; exit 1; }
-  for repo in "${EXTRA_REFS[@]}"; do
-    REF_MOUNT_ARGS+=( -v "$REFS_MIRROR/$repo:/refs/$repo:ro" )
-  done
-  if [ "$REFRESH_REFS" -eq 1 ]; then EXTRA_MODE="up to date with upstream"; else EXTRA_MODE="as-is, freshness pass skipped"; fi
-  echo ">> extra refs: ${#EXTRA_REFS[@]} repo(s) from $REFS_MIRROR ($EXTRA_MODE), ro at /refs: ${EXTRA_REFS[*]}"
-fi
+agent_refs_ground
+REF_MOUNT_ARGS+=( -v "$REFS_VIEW:/refs:ro" )
 
 # ---------------------------------------------------------------- avatar mount
 # Each consultant has a female profile picture at <test-dir>/<key>-avatar.jpg, bind-mounted

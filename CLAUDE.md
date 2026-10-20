@@ -3,7 +3,7 @@
 Rust library and CLI for Matrix agent communication with E2E encryption.
 Agents authenticate via [siwx-oidc](https://github.com/inblockio/siwx-oidc) using decentralized identifiers (DIDs), not passwords.
 
-**Architecture:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design rationale for the host's three agent components (heartbeat ops channel, claude-channel LLM channel, local claude-bridge tmux), identity/device-id persistence model, stream-sync design, file/identity inventory.
+**Architecture:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design rationale for the host's two agent components (claude-channel LLM channel, local claude-bridge tmux; the ops heartbeat daemon is retired), identity/device-id persistence model, stream-sync design, file/identity inventory.
 
 **Recovery / when things break:** [`docs/RECOVERY.md`](docs/RECOVERY.md) — what auto-recovers vs needs human intervention, per-unit restart policies, crash-loop guard explained, manual recovery procedures, and a diagnostic decision tree keyed by symptom. Start here when something is broken.
 
@@ -47,7 +47,6 @@ Each key file produces a unique DID and separate Matrix account. Convention on t
 
 - `agent.pem` — chat identity (re-created on first chat run if absent)
 - `agent-b.pem` — second test identity for `/e2e-test`
-- `heartbeat.pem` — ops identity (heartbeat + `#shell` command channel). Store at `~/.aqua-matrix-heartbeat/`. Managed by `aqua-matrix-heartbeat.service`.
 - `claude-channel.pem` — LLM channel identity (forwards prose to `claude -p`). Store at `~/.aqua-matrix-claude-channel/`. Managed by `aqua-matrix-claude-channel.service`.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the rationale (one daemon per surface, separate failure domains, no stateful mode-switching).
@@ -136,14 +135,12 @@ aqua-matrix-agent (virtual workspace — CONNECTOR substrate, 6 crates)
 ../aqua-agents (sibling repo — AGENTS half; path-deps the connector crates above)
   +-- crates/aqua-matrix-template     -- AgentType/InstanceBinding/ResolvedInstance + the
   |                                      build_spawn_spec(agent_type, target, id) -> ContainerSpec factory
-  +-- crates/aqua-matrix-heartbeat    -- binary `aqua-matrix-heartbeat` (ops agent: periodic
-  |                                      status DM + #shell commands); deps: relay, template, orchestrator
   +-- crates/aqua-matrix-claude-p     -- binary `aqua-matrix-claude-p` (reference Claude backend:
   |                                      forwards DMs to `claude -p`); deps: relay, template, gating
   +-- types/*.json, instances/*.toml.example, Dockerfile, scripts/build-image.sh  -- agent content
 ```
 
-**Repo boundary (the one-way rule):** dependencies flow **agents → connector, NEVER the reverse.** The two halves now live in **two repos**: this connector and the sibling `../aqua-agents` (which must be checked out alongside this repo for its path-deps to resolve). No connector crate (`agent`, `relay`, `ask-mcp`, `orchestrator`, `gating`, `activity-watch`) may name a backend crate (`template`, `heartbeat`, `claude-p`) in its `Cargo.toml`. The connector reaches agents only through two seams: the `ContainerSpec` seam (`aqua_matrix_template::build_spawn_spec` maps a rich `AgentType` down to the agent-agnostic spec the orchestrator consumes) and the `MessageHandler`/`InboundMessage`/`authorize` seam in the relay. The guard `scripts/check-dep-direction.sh` enforces this mechanically (anchored grep of connector `Cargo.toml` dependency lines) — **run it as part of the gate** alongside `cargo build` / `cargo test`. Full rationale: [`repo-split-execution-handover.md` (archived)](https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md).
+**Repo boundary (the one-way rule):** dependencies flow **agents → connector, NEVER the reverse.** The two halves now live in **two repos**: this connector and the sibling `../aqua-agents` (which must be checked out alongside this repo for its path-deps to resolve). No connector crate (`agent`, `relay`, `ask-mcp`, `orchestrator`, `gating`, `activity-watch`) may name a backend crate (`template`, `claude-p`) in its `Cargo.toml`. The connector reaches agents only through two seams: the `ContainerSpec` seam (`aqua_matrix_template::build_spawn_spec` maps a rich `AgentType` down to the agent-agnostic spec the orchestrator consumes) and the `MessageHandler`/`InboundMessage`/`authorize` seam in the relay. The guard `scripts/check-dep-direction.sh` enforces this mechanically (anchored grep of connector `Cargo.toml` dependency lines) — **run it as part of the gate** alongside `cargo build` / `cargo test`. Full rationale: [`repo-split-execution-handover.md` (archived)](https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md).
 
 **Deployment glue stays here (for now):** `Skills/` and `systemd/` remain in this connector repo pending a later deployment-migration pass — the agent systemd units still `ExecStart` from `%h/aqua-matrix-agent/target/debug/...`. (The `Dockerfile`/`build-image.sh` half of that pass is **done as of 2026-06-03**: both — now in `../aqua-agents` — stage a cross-repo two-workspace context, building `claude-p` from the agents workspace and `ask-mcp` from the connector, and rebuild `localhost/aqua-matrix-agent:poc` correctly.)
 
@@ -164,7 +161,7 @@ cargo test                                   # run unit tests (config roundtrip,
 cargo test --test e2e --features e2e         # run E2E test (requires live matrix.inblock.io)
 ```
 
-A `cargo build` in this connector repo builds the six connector crates, producing `target/debug/aqua-matrix-agent` (the one-shot CLI) and `target/debug/aqua-activity-watch` (the host-side activity tracker). The `aqua-matrix-heartbeat` and `aqua-matrix-claude-p` binaries now build from the **sibling `../aqua-agents` repo** (`cd ../aqua-agents && cargo build`, which path-deps this connector). The systemd units still point at `%h/aqua-matrix-agent/target/debug/...` — reconciling that build/output location is part of the deferred deployment-migration pass.
+A `cargo build` in this connector repo builds the six connector crates, producing `target/debug/aqua-matrix-agent` (the one-shot CLI) and `target/debug/aqua-activity-watch` (the host-side activity tracker). The `aqua-matrix-claude-p` binary now builds from the **sibling `../aqua-agents` repo** (`cd ../aqua-agents && cargo build`, which path-deps this connector). The systemd units still point at `%h/aqua-matrix-agent/target/debug/...` — reconciling that build/output location is part of the deferred deployment-migration pass.
 
 ## Configuration (`.env`, per-instance)
 
@@ -203,14 +200,14 @@ your own. Precedence, high → low: explicit CLI flag > process env (e.g. system
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |
 
-These are the only flags on the `aqua-matrix-agent` binary — it is one-shot. The long-running daemons now live in the **sibling `../aqua-agents` repo** (built with `cargo build` there): `aqua-matrix-heartbeat` (status-DM + `#shell`; interval via `--interval <secs>`, see `/heartbeat` skill) and `aqua-matrix-claude-p` (forwards inbound DMs from `--target` through `claude -p`, see `/claude-channel` skill). See [`docs/REFERENCE.md`](docs/REFERENCE.md).
+These are the only flags on the `aqua-matrix-agent` binary — it is one-shot. The long-running daemon now lives in the **sibling `../aqua-agents` repo** (built with `cargo build` there): `aqua-matrix-claude-p` (forwards inbound DMs from `--target` through `claude -p`, see `/claude-channel` skill). See [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ## Wrapped-harness configuration
 
 This repo runs under `claude-ws` (alias for `claude --dangerously-skip-permissions`, defined at `~/.bashrc:122`). `~/.claude/settings.json` is configured to:
 
 - pin `"model": "claude-opus-4-7"` so every session uses the most capable model
-- expose `CONTEXT_WINDOW=1000000` so the Stop hook + heartbeat report the right context % for the 1M variant
+- expose `CONTEXT_WINDOW=1000000` so the Stop hook reports the right context % for the 1M variant
 - register a `Stop` hook at `~/.claude/hooks/compact-at-50.py` that blocks stop with `decision: "block"` and instructs Claude to run `/compact` whenever context usage crosses 50% (`COMPACT_THRESHOLD` env var to tune)
 
 The hook reads the latest `usage.input_tokens` from the active transcript, so token accounting matches whatever the model itself reported.
@@ -221,9 +218,8 @@ The hook reads the latest `usage.input_tokens` from the active transcript, so to
 |---|---|
 | `/matrix-message` | Full reference for sending and receiving E2E encrypted messages |
 | `/e2e-test` | Run and verify E2EE integration tests between two agent identities |
-| `/heartbeat` | Run the `aqua-matrix-heartbeat` binary — DMs status every 10min AND honors `#shell help`, `#shell status`, `#shell ping`, `#shell uptime`, `#shell restart`, `#shell respawn`, `#shell respawn-channel`, `#shell logs`, `#shell import <message>` commands sent from `--target` |
-| `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawnable via `#shell respawn`. Messages can be injected into it via `#shell import` → `~/import` inbox → `aqua-import-watch` (see `/heartbeat`). |
-| `/claude-channel` | Matrix LLM channel daemon (`aqua-matrix-claude-p` binary) — separate identity, forwards DMs from `--target` to `claude -p` and replies with stdout; respawnable via `#shell respawn-channel` |
+| `/claude-bridge` | Persistent `claude --dangerously-skip-permissions` in tmux, supervised by systemd; respawn with `systemctl --user restart claude-bridge`. |
+| `/claude-channel` | Matrix LLM channel daemon (`aqua-matrix-claude-p` binary) — separate identity, forwards DMs from `--target` to `claude -p` and replies with stdout; respawn with `systemctl --user restart aqua-matrix-claude-channel` |
 
 **Skill layout.** Skill source-of-truth lives at the repo root in `Skills/<name>/skill.md`. The Claude Code discovery directory `.claude/skills/<name>` is a symlink into `Skills/`:
 
@@ -245,6 +241,6 @@ Edit skills in `Skills/`. Do not duplicate content into `.claude/skills/`. When 
 | `../siwx-oidc/` | CAIP-122 OIDC provider. Path-dep source of `siwx-oidc-auth` (see Cargo.toml). |
 | `../aqua-auth/` | Workspace member of `../siwx-oidc/`. Must be checked out as a sibling for `cargo build` to resolve `siwx-oidc-auth`'s `path = "../../aqua-auth"` dep. |
 | `../siwx-oidc-matrix-server/` | Docker Compose stack (Synapse + siwx-oidc + Element Web) |
-| `../aqua-agents/` | The **agents half** (backends `aqua-matrix-template`/`-heartbeat`/`-claude-p` + `types`/`instances`/`Dockerfile`/`build-image.sh`). Path-deps this connector's crates (`../aqua-matrix-agent/crates/...`); build with `cargo build` from there. |
+| `../aqua-agents/` | The **agents half** (backends `aqua-matrix-template`/`-claude-p` + `types`/`instances`/`Dockerfile`/`build-image.sh`). Path-deps this connector's crates (`../aqua-matrix-agent/crates/...`); build with `cargo build` from there. |
 
 Fresh dev setup needs `git clone https://github.com/inblockio/siwx-oidc.git` and `git clone https://github.com/inblockio/aqua-auth.git` alongside this repo.
