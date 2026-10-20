@@ -63,6 +63,8 @@ pub struct Daemon {
     started: Instant,
     /// The hub's host allow-list (hot-reloaded `hosts.toml`).
     pub hosts: Mutex<crate::hosts::HostList>,
+    /// Humans the hub invites to the roster room (hot-reloaded `operators.toml`).
+    pub operators: Mutex<crate::operators::OperatorList>,
 }
 
 fn rss_kb() -> u64 {
@@ -97,6 +99,7 @@ fn actor(by: Option<&str>, session: Option<&str>) -> Actor {
 impl Daemon {
     pub fn new(cfg: Config) -> Arc<Self> {
         let cfg_hosts = cfg.hosts_file.clone();
+        let cfg_operators = cfg.root.join("operators.toml");
         Arc::new(Self {
             cfg,
             seats: Mutex::new(HashMap::new()),
@@ -104,6 +107,7 @@ impl Daemon {
             shutdown: Notify::new(),
             started: Instant::now(),
             hosts: Mutex::new(crate::hosts::HostList::new(cfg_hosts)),
+            operators: Mutex::new(crate::operators::OperatorList::new(cfg_operators)),
         })
     }
 

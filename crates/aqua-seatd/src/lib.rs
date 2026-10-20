@@ -17,6 +17,7 @@ pub mod hub;
 pub mod keys;
 pub mod knock;
 pub mod meta;
+pub mod operators;
 pub mod roster;
 pub mod seat;
 pub mod server;

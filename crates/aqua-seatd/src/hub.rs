@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use aqua_matrix_agent::AgentClient;
-use matrix_sdk::{room::Room, RoomMemberships};
+use matrix_sdk::{room::Room, ruma::OwnedUserId, RoomMemberships};
 use serde_json::{json, Value};
 
 use crate::daemon::Daemon;
@@ -116,6 +116,51 @@ fn knock_reason(m: &matrix_sdk::room::RoomMember) -> Option<String> {
     }
 }
 
+/// Invite the humans listed in `operators.toml` (resolved DID -> MXID by the
+/// provider, never from a profile field). Settled for this process once the
+/// operator is in the room or invited; a failure retries after a minute.
+pub async fn invite_operators(d: &Arc<Daemon>, room: &Room) {
+    use matrix_sdk::ruma::events::room::member::MembershipState;
+
+    let due = d.operators.lock().unwrap().due();
+    for op in due {
+        let result: Result<&'static str> = async {
+            let r = resolve_did(&d.cfg.siwx_url, &op.did).await?;
+            let mxid = match (r.exists, r.mxid) {
+                (true, Some(m)) => m,
+                _ => return Err(anyhow!("{} has no account on this provider", op.name)),
+            };
+            let user: OwnedUserId = mxid
+                .as_str()
+                .try_into()
+                .map_err(|e| anyhow!("resolved MXID is invalid: {e}"))?;
+            match room.get_member(&user).await?.map(|m| m.membership().clone()) {
+                Some(MembershipState::Join | MembershipState::Invite) => return Ok("present"),
+                Some(MembershipState::Ban) => return Ok("banned"),
+                _ => {}
+            }
+            room.invite_user_by_id(&user)
+                .await
+                .context("inviting the operator")?;
+            Ok("invited")
+        }
+        .await;
+        match result {
+            Ok(what) => {
+                tracing::info!(operator = %op.name, what, "operator checked");
+                if what == "invited" {
+                    audit(d, json!({"verdict": "invited_operator", "operator": op.name, "did": op.did}));
+                }
+                d.operators.lock().unwrap().settle(&op.did, true);
+            }
+            Err(err) => {
+                tracing::warn!(operator = %op.name, "inviting an operator failed: {err:#}");
+                d.operators.lock().unwrap().settle(&op.did, false);
+            }
+        }
+    }
+}
+
 /// Look at every pending knock at the roster room and invite or decline.
 pub async fn process_knocks(
     d: &Arc<Daemon>,
@@ -123,6 +168,7 @@ pub async fn process_knocks(
     agent: &AgentClient,
     room: &Room,
 ) -> Result<()> {
+    invite_operators(d, room).await;
     let knockers = room
         .members(RoomMemberships::KNOCK)
         .await
