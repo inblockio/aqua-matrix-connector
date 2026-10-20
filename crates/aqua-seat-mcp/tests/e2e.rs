@@ -136,6 +136,18 @@ impl Drop for Daemon {
     }
 }
 
+/// This host's name, set from the first `whoami`. Since the cross-host work the
+/// roster can hold the same seat name on several hosts (the simulated hosts of
+/// the xhost test reuse the fixed test names), so the e2e addresses `seat@host`.
+static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn at(seat: &str) -> String {
+    format!(
+        "{seat}@{}",
+        HOST.get().expect("host known after the first whoami")
+    )
+}
+
 fn items(v: &Value) -> Vec<Item> {
     serde_json::from_value(v["items"].clone()).expect("items")
 }
@@ -177,9 +189,10 @@ async fn wait_for(d: &Daemon, seat: &str, needle: &str, secs: u64) -> Item {
 }
 
 async fn send(d: &Daemon, from: &str, to: &str, text: &str, mention: Option<Value>) -> Value {
+    let to = if to == "room" { to.to_string() } else { at(to) };
     d.call(Request::Send {
         seat: from.into(),
-        to: to.into(),
+        to,
         text: text.into(),
         reply_to: None,
         mention,
@@ -219,6 +232,7 @@ async fn e2_three_seats_on_dev() {
         assert!(did.starts_with("did:key:z6Mk"), "{s}: {did}");
         assert!(mxid.ends_with(":dev.matrix.inblock.io"), "{s}: {mxid}");
         assert_eq!(w["connected"], true);
+        let _ = HOST.set(w["host"].as_str().unwrap().to_string());
         // D9: the roster room is a knock room with the alias, on a hub daemon
         assert_eq!(w["roster_join_rule"], "knock", "{s}: {w}");
         assert_eq!(w["roster_alias_resolves_here"], true, "{s}: {w}");
@@ -264,7 +278,7 @@ async fn e2_three_seats_on_dev() {
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
     for p in peers.as_array().unwrap() {
-        if let Some((_, did, mxid, _)) = ident.iter().find(|i| i.0 == p["seat"].as_str().unwrap()) {
+        if let Some((_, did, mxid, _)) = ident.iter().find(|i| i.2 == p["mxid"].as_str().unwrap()) {
             assert_eq!(
                 p["did"].as_str().unwrap(),
                 did,
@@ -308,7 +322,7 @@ async fn e2_three_seats_on_dev() {
 
     // -- room @mention a -> c, chatter reaches b only as chatter ---------------------------
     let t_men = format!("room-mention-c {n}");
-    let s = send(&d, A, "room", &t_men, Some(json!(C))).await;
+    let s = send(&d, A, "room", &t_men, Some(json!(at(C)))).await;
     assert_eq!(s["via"], "mention");
     assert_eq!(
         s["encrypted"], true,
@@ -361,7 +375,7 @@ async fn e2_three_seats_on_dev() {
     let t_off_dm = format!("while-detached dm {n}");
     let t_off_men = format!("while-detached mention {n}");
     let s1 = send(&d, A, C, &t_off_dm, None).await;
-    let s2 = send(&d, B, "room", &t_off_men, Some(json!(C))).await;
+    let s2 = send(&d, B, "room", &t_off_men, Some(json!(at(C)))).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     let w = d.call(Request::Whoami { seat: C.into() }).await; // re-attaches
     assert_eq!(w["did"].as_str().unwrap(), ident[2].1);
@@ -382,7 +396,7 @@ async fn e2_three_seats_on_dev() {
     let e = d
         .try_call(Request::Send {
             seat: A.into(),
-            to: B.into(),
+            to: at(B),
             text: big,
             reply_to: None,
             mention: None,
@@ -413,7 +427,7 @@ async fn e2_three_seats_on_dev() {
         let r = d
             .try_call(Request::Send {
                 seat: A.into(),
-                to: C.into(),
+                to: at(C),
                 text: format!("rate-{ok} {n}"),
                 reply_to: None,
                 mention: None,
@@ -557,7 +571,9 @@ async fn mcp_flow(d: &Daemon, n: &str, rep: &mut Report) {
     assert!(!err && roster.contains(B) && roster.contains(C), "{roster}");
 
     let hello = format!("mcp-hello {n}");
-    let (sent, err) = m.tool("seat_send", json!({"to": B, "text": hello})).await;
+    let (sent, err) = m
+        .tool("seat_send", json!({"to": at(B), "text": hello}))
+        .await;
     assert!(
         !err && sent.contains("\"via\": \"dm\"") && sent.contains("event_id"),
         "{sent}"
@@ -708,7 +724,7 @@ async fn listen_flow(d: &Daemon, n: &str, a_did: &str, rep: &mut Report) {
     let l = listen_cmd(C, &sock, &["--timeout", "90"]).spawn().unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     let men = format!("e3-mention {n}");
-    let sent = send(d, A, "room", &men, Some(json!(C))).await;
+    let sent = send(d, A, "room", &men, Some(json!(at(C)))).await;
     let out = l.wait_with_output().await.unwrap();
     assert_eq!(
         out.status.code(),
