@@ -408,7 +408,7 @@ put_host iota '{"extra_refs": ["extra-one", "extra-two", "aqua-rs-sdk", "extra-o
 rc=0; run i1 --label iota --target "$TARGET" --persona Thalia --name Tester || rc=$?
 check "host.extra_refs + host.refs_follow: exit 0" [ "$rc" -eq 0 ]
 check "host.extra_refs + host.refs_follow: exactly ONE note says they are ignored" \
-  bash -c '[ "$(grep -c "host.extra_refs / host.refs_follow" "$1")" -eq 1 ] && grep -q "^>> refs: iota-aqua-consultant has an agent-refs list; host.extra_refs / host.refs_follow in .* are ignored" "$1"' _ "$SB/out/i1.out"
+  bash -c '[ "$(grep -c "host.extra_refs / host.refs_follow" "$1")" -eq 1 ] && grep -q "^>> refs: host.extra_refs / host.refs_follow in .* are ignored: the repos of iota-aqua-consultant come from its agent-refs list only" "$1"' _ "$SB/out/i1.out"
 check "host.extra_refs + host.refs_follow: exactly one /refs mount, the agent's view, read-only" \
   bash -c '[ "$(awk "prev==\"-v\" && /:\/refs/ {n++} {prev=\$0} END{print n+0}" "$1")" -eq 1 ] && [ "$(awk "prev==\"-v\" && /:\/refs/ {print} {prev=\$0}" "$1")" = "<view dir of iota-aqua-consultant, known only after aqua-agent-refs add creates its list>:/refs:ro" ]' _ "$SB/out/i1.argv"
 check "host.extra_refs + host.refs_follow: no extra, follow or digest mount, no extra-refs / follow notes" \

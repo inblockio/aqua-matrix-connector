@@ -657,7 +657,7 @@ else
   exit 2
 fi
 if [ "${#HOST_EXTRA_REFS[@]}" -gt 0 ] || [ "${#HOST_REFS_FOLLOW[@]}" -gt 0 ]; then
-  echo ">> refs: $STEM has an agent-refs list; host.extra_refs / host.refs_follow in $HOST_SRC are ignored (its repos come from the list only)"
+  echo ">> refs: host.extra_refs / host.refs_follow in $HOST_SRC are ignored: the repos of $STEM come from its agent-refs list only"
 fi
 
 # ---------------------------------------------------------------- peer DID -> MXID (lookup, never derived)
@@ -723,56 +723,12 @@ case "$DISPLAY_NAME" in
     echo "!! --display must not contain a double-quote or newline (would break the systemd unit)." >&2; exit 2 ;;
 esac
 
-# The Owner (= TARGET, now a resolved MXID) must be allow-listed BEFORE anything else changes:
-# before the config render, the --replace removal and the launch. --print-run only previews.
-if [ "$PRINT_RUN" -eq 1 ]; then
-  ensure_owner_allowlisted check
-elif ! ensure_owner_allowlisted apply; then
-  echo "!! aborting: could not put the Owner $TARGET on the Aqua System allow-list ($ALLOWLIST_FILE)." >&2
-  echo "   Nothing was changed: no config render, no container removal, no launch. Fix the file (or" >&2
-  echo "   the name clash) and re-run; see SKILL.md \"Owner rule\"." >&2
-  exit 1
-fi
-
-# ---------------------------------------------------------------- token (by reference)
-TOKEN_FILE="${AQUA_CLAUDE_TOKEN_FILE:-/home/waldknoten-01/.aqua-matrix-heartbeat/claude-oauth-token}"
-if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -s "$TOKEN_FILE" ]; then
-  CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
-  export CLAUDE_CODE_OAUTH_TOKEN
-fi
-: "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN, or populate $TOKEN_FILE via:  claude setup-token}"
-
-# ---------------------------------------------------------------- Deepgram key (optional, by reference)
-# Voice messages need DEEPGRAM_API_KEY inside the container. Same discipline as the OAuth
-# token: the value is taken from a file and handed to podman as a bare `-e NAME` (inherited
-# from this process's environment), so it never appears on a command line, in `podman
-# inspect`, or in this script's output. The file is sourced in a SUBSHELL and only the one
-# variable is captured, so nothing else in it (other vars, shell options) leaks in here.
-# An already-exported DEEPGRAM_API_KEY wins over the file. No file = silent skip (one notice
-# line): the container starts unchanged and voice stays disabled.
-DEEPGRAM_ENV_FILE="${AQUA_DEEPGRAM_ENV:-$HOME/.aqua-secrets/deepgram.env}"
-if [ -z "${DEEPGRAM_API_KEY:-}" ] && [ -r "$DEEPGRAM_ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  # A malformed file must not abort the spawn: it degrades to "no key" plus the notice below.
-  DEEPGRAM_API_KEY="$(set -a; . "$DEEPGRAM_ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "${DEEPGRAM_API_KEY:-}")" || DEEPGRAM_API_KEY=""
-fi
-DEEPGRAM_ENV_ARGS=()
-if [ -n "${DEEPGRAM_API_KEY:-}" ]; then
-  export DEEPGRAM_API_KEY
-  DEEPGRAM_ENV_ARGS+=( -e DEEPGRAM_API_KEY )
-  echo ">> voice: DEEPGRAM_API_KEY available (by reference), passed into the container as a bare -e"
-elif [ -e "$DEEPGRAM_ENV_FILE" ]; then
-  echo "!! voice: $DEEPGRAM_ENV_FILE exists but yields no DEEPGRAM_API_KEY (unreadable, or empty); voice stays disabled" >&2
-else
-  echo ">> voice: no Deepgram env file at $DEEPGRAM_ENV_FILE, voice stays disabled"
-fi
-
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-
 # ---------------------------------------------------------------- refs grounding
 # The consultant's knowledge is its aqua-agent-refs view, bind-mounted ro at /refs as the ONLY refs mount
-# (REFS_MODE list / new, decided above). agent_refs_ground below syncs or checks the view, and runs in the
-# same place in the flow as always: before the config render, the --replace removal and any container change.
+# (REFS_MODE list / new, decided above). agent_refs_ground below syncs or checks the view. It runs before the
+# Owner allow-list apply, the config render, the --replace removal and any container change, so an add or
+# sync abort leaves the allow-list, the config and the old container exactly as they were. It touches only
+# the agent's own list and view.
 
 # agent_refs_ground: a NEW consultant first runs the idempotent add of REFS_REPOS (creates the list, or tops up
 # a partial one left by an earlier failed add), then the view is synced (real spawn) or only checked
@@ -820,6 +776,54 @@ agent_refs_ground() {
 REF_MOUNT_ARGS=()
 agent_refs_ground
 REF_MOUNT_ARGS+=( -v "$REFS_VIEW:/refs:ro" )
+
+# The Owner (= TARGET, now a resolved MXID) must be allow-listed BEFORE anything else changes:
+# before the config render, the --replace removal and the launch (only the refs grounding above runs
+# earlier, so its aborts never leave a new Owner on the list). --print-run only previews.
+if [ "$PRINT_RUN" -eq 1 ]; then
+  ensure_owner_allowlisted check
+elif ! ensure_owner_allowlisted apply; then
+  echo "!! aborting: could not put the Owner $TARGET on the Aqua System allow-list ($ALLOWLIST_FILE)." >&2
+  echo "   Nothing was changed: no config render, no container removal, no launch. Fix the file (or" >&2
+  echo "   the name clash) and re-run; see SKILL.md \"Owner rule\"." >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------- token (by reference)
+TOKEN_FILE="${AQUA_CLAUDE_TOKEN_FILE:-/home/waldknoten-01/.aqua-matrix-heartbeat/claude-oauth-token}"
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -s "$TOKEN_FILE" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+: "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN, or populate $TOKEN_FILE via:  claude setup-token}"
+
+# ---------------------------------------------------------------- Deepgram key (optional, by reference)
+# Voice messages need DEEPGRAM_API_KEY inside the container. Same discipline as the OAuth
+# token: the value is taken from a file and handed to podman as a bare `-e NAME` (inherited
+# from this process's environment), so it never appears on a command line, in `podman
+# inspect`, or in this script's output. The file is sourced in a SUBSHELL and only the one
+# variable is captured, so nothing else in it (other vars, shell options) leaks in here.
+# An already-exported DEEPGRAM_API_KEY wins over the file. No file = silent skip (one notice
+# line): the container starts unchanged and voice stays disabled.
+DEEPGRAM_ENV_FILE="${AQUA_DEEPGRAM_ENV:-$HOME/.aqua-secrets/deepgram.env}"
+if [ -z "${DEEPGRAM_API_KEY:-}" ] && [ -r "$DEEPGRAM_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  # A malformed file must not abort the spawn: it degrades to "no key" plus the notice below.
+  DEEPGRAM_API_KEY="$(set -a; . "$DEEPGRAM_ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "${DEEPGRAM_API_KEY:-}")" || DEEPGRAM_API_KEY=""
+fi
+DEEPGRAM_ENV_ARGS=()
+if [ -n "${DEEPGRAM_API_KEY:-}" ]; then
+  export DEEPGRAM_API_KEY
+  DEEPGRAM_ENV_ARGS+=( -e DEEPGRAM_API_KEY )
+  echo ">> voice: DEEPGRAM_API_KEY available (by reference), passed into the container as a bare -e"
+elif [ -e "$DEEPGRAM_ENV_FILE" ]; then
+  echo "!! voice: $DEEPGRAM_ENV_FILE exists but yields no DEEPGRAM_API_KEY (unreadable, or empty); voice stays disabled" >&2
+else
+  echo ">> voice: no Deepgram env file at $DEEPGRAM_ENV_FILE, voice stays disabled"
+fi
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
 
 # ---------------------------------------------------------------- avatar mount
 # Each consultant has a female profile picture at <test-dir>/<key>-avatar.jpg, bind-mounted

@@ -303,6 +303,16 @@ for code in 1 2 4 127; do
 done
 rm -f "$RUNNING"
 
+echo "== list present: a refs abort leaves the Owner allow-list untouched, also for a new Owner"
+touch "$RUNNING"
+al_before="$(sha_of "$AL")"
+rc=0; RUN_ENV=( STUB_SYNC_RC=1 ); runs r3o --replace --label alpha --target '@did-key-zbrandnewowner:matrix.inblock.io' --persona Thalia --name Tester || rc=$?; RUN_ENV=()
+check "sync exit 1, new Owner: exit 1" [ "$rc" -eq 1 ]
+check "sync exit 1, new Owner: allow-list byte-identical (the refs grounding runs before the Owner apply)" \
+  bash -c '[ "$(sha256sum < "$1" | cut -d" " -f1)" = "$2" ]' _ "$AL" "$al_before"
+check "sync exit 1, new Owner: the old container is still running" test -e "$RUNNING"
+rm -f "$RUNNING"
+
 echo "== list present: --no-refresh-refs runs check, not sync"
 rc=0; runs r4 --replace --keep-config --label alpha --no-refresh-refs || rc=$?
 check "exit 0" [ "$rc" -eq 0 ]
@@ -341,6 +351,12 @@ check "no persist dir created" test ! -e "$TEST_DIR/newbie2-aqua-consultant-pers
 check "no podman rm / run / start" bash -c '! grep -qE "^podman (rm|run|start)" "$1" 2>/dev/null' _ "$SIDE_EFFECTS"
 check "no list left behind" test ! -e "$STUB_ROOT/agents/newbie2-aqua-consultant.json"
 check "sync never reached" no_stub_cmd sync
+
+echo "== new consultant: add fails with a new Owner -> allow-list untouched"
+al_before="$(sha_of "$AL")"
+rc=0; RUN_ENV=( STUB_ADD_RC=1 ); runs n2o --label newbieowner --target '@did-key-zanotherowner:matrix.inblock.io' --persona Thalia --name Newbie || rc=$?; RUN_ENV=()
+check "add exit 1, new Owner: exit 1, allow-list byte-identical" \
+  bash -c '[ "$1" -eq 1 ] && [ "$(sha256sum < "$2" | cut -d" " -f1)" = "$3" ]' _ "$rc" "$AL" "$al_before"
 
 echo "== new consultant: add exit 3 proceeds (degraded), 2 / 4 / 127 abort"
 rm -f "$RUNNING"
@@ -639,7 +655,7 @@ make_list "$ALPHA"
 put_host alpha '{"extra_refs": ["no-such-extra", "aqua-spec"], "refs_follow": ["no-such-follow"]}'
 rc=0; runp h1 --label alpha --target "$TARGET" --persona Thalia --name Tester || rc=$?
 check "exit 0 (no follow mirror or extra mirror is looked at)" [ "$rc" -eq 0 ]
-check "exactly ONE line says they are ignored" bash -c '[ "$(grep -c "host.extra_refs / host.refs_follow" "$1")" -eq 1 ] && grep -q "^>> refs: alpha-aqua-consultant has an agent-refs list; host.extra_refs / host.refs_follow in .* are ignored" "$1"' _ "$SB/out/h1.out"
+check "exactly ONE line says they are ignored" bash -c '[ "$(grep -c "host.extra_refs / host.refs_follow" "$1")" -eq 1 ] && grep -q "^>> refs: host.extra_refs / host.refs_follow in .* are ignored: the repos of alpha-aqua-consultant come from its agent-refs list only" "$1"' _ "$SB/out/h1.out"
 check "no extra, follow or digest mount: only the view" [ "$(refs_seq h1)" = "$VIEW_A:/refs:ro" ]
 check "no extra-refs / follow notes, no mirror clone attempt (git never called)" bash -c '! grep -q "extra refs\|refs follow" "$1" "$2"' _ "$SB/out/h1.out" "$SB/out/h1.err"
 check "no git" no_git
