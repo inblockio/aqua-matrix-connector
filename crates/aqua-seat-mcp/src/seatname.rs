@@ -1,6 +1,11 @@
-//! Seat names (decision D1): a seat is a lane or track, not a process. The name
-//! is the tmux session name (the same key `tim-report` uses), else the env var
-//! `CLAUDE_SEAT`, else `adhoc-<8 hex of the session id>`.
+//! Seat names (decision D1): a seat is a lane or track, not a process. Order:
+//! the env var `CLAUDE_SEAT`; the parent Claude session file
+//! (`<CLAUDE_CONFIG_DIR or ~/.claude>/sessions/<ppid>.json`: its `name` when
+//! `nameSource` is not "derived", else the session part of its `tmux` field);
+//! the tmux session name (`tmux` from PATH or `~/.local/bin/tmux`, with
+//! `$TMUX_PANE`; the same key `tim-report` uses); else
+//! `adhoc-<8 hex of the session id>`. Names are unique per host only; the
+//! roster addresses them as `seat@host`.
 //!
 //! The charset is `[a-z0-9_-]`, 1..=40 characters, and the name is used as a
 //! directory name, so it is sanitised before it touches a path and re-checked
@@ -17,6 +22,8 @@ pub const RESERVED: [&str; 3] = ["room", "roster", "claude-seats"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Env,
+    /// The parent Claude session file.
+    SessionFile,
     Tmux,
     Adhoc,
 }
@@ -78,39 +85,84 @@ pub fn is_valid(name: &str) -> bool {
 pub struct Inputs {
     /// `CLAUDE_SEAT`.
     pub env_seat: Option<String>,
+    /// The seat name the parent Claude session file gives (best effort).
+    pub session_file_seat: Option<String>,
     /// The tmux session name of `$TMUX_PANE`, when the process runs in tmux.
     pub tmux_session: Option<String>,
     /// `CLAUDE_CODE_SESSION_ID`, or any random string if there is none.
     pub session_id: Option<String>,
 }
 
+/// What the undocumented Claude session file tells us about the seat: its
+/// `name` when `nameSource` is not "derived" (the user named the session),
+/// else the session part of its `tmux` field (`name:@win.%pane`).
+pub fn seat_from_session_json(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let named = v.get("name").and_then(|n| n.as_str()).filter(|n| !n.trim().is_empty());
+    let source = v.get("nameSource").and_then(|n| n.as_str()).unwrap_or("");
+    if let Some(n) = named {
+        if source != "derived" {
+            if let Some(s) = sanitize(n) {
+                return Some(s);
+            }
+        }
+    }
+    let tmux = v.get("tmux").and_then(|t| t.as_str())?;
+    sanitize(tmux.split(':').next()?)
+}
+
+fn claude_config_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(d) if !d.is_empty() => Some(std::path::PathBuf::from(d)),
+        _ => std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")),
+    }
+}
+
+/// `<config dir>/sessions/<ppid>.json` of the Claude process that started us.
+fn session_file_seat() -> Option<String> {
+    let path = claude_config_dir()?
+        .join("sessions")
+        .join(format!("{}.json", std::os::unix::process::parent_id()));
+    seat_from_session_json(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The tmux session of `$TMUX_PANE`. `tmux` is looked up on PATH first, then
+/// in `~/.local/bin` (not on the PATH of non-interactive shells on some hosts).
+fn tmux_session() -> Option<String> {
+    let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.trim().is_empty())?;
+    let mut candidates = vec![std::path::PathBuf::from("tmux")];
+    if let Some(h) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(h).join(".local/bin/tmux"));
+    }
+    for bin in candidates {
+        let Ok(out) = std::process::Command::new(&bin)
+            .args(["display", "-p", "-t", &pane, "#S"])
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            continue; // not found here, try the next place
+        };
+        if out.status.success() {
+            return Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+    }
+    None
+}
+
 impl Inputs {
-    /// Read the real environment. Runs `tmux display` only when `$TMUX_PANE`
-    /// is set.
+    /// Read the real environment. Never requires `tmux` to exist.
     pub fn from_env() -> Self {
-        let tmux_session = std::env::var("TMUX_PANE")
-            .ok()
-            .filter(|p| !p.trim().is_empty())
-            .and_then(|pane| {
-                let out = std::process::Command::new("tmux")
-                    .args(["display", "-p", "-t", &pane, "#S"])
-                    .stderr(std::process::Stdio::null())
-                    .output()
-                    .ok()?;
-                out.status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            });
         Self {
             env_seat: std::env::var("CLAUDE_SEAT").ok(),
-            tmux_session,
+            session_file_seat: session_file_seat(),
+            tmux_session: tmux_session(),
             session_id: std::env::var("CLAUDE_CODE_SESSION_ID").ok(),
         }
     }
 }
 
-/// D1: `CLAUDE_SEAT`, else the tmux session name, else `adhoc-<8 hex>`.
-/// A value that sanitises to nothing is skipped, not an error.
+/// D1: `CLAUDE_SEAT`, else the session file, else the tmux session name, else
+/// `adhoc-<8 hex>`. A value that sanitises to nothing is skipped, not an error.
 pub fn derive(i: &Inputs) -> Derived {
     // The explicit env var wins; the tmux session name is the lane key
     // `tim-report` uses.
@@ -118,6 +170,12 @@ pub fn derive(i: &Inputs) -> Derived {
         return Derived {
             name,
             source: Source::Env,
+        };
+    }
+    if let Some(name) = i.session_file_seat.as_deref().and_then(sanitize) {
+        return Derived {
+            name,
+            source: Source::SessionFile,
         };
     }
     if let Some(name) = i.tmux_session.as_deref().and_then(sanitize) {
@@ -230,9 +288,29 @@ mod tests {
     }
 
     #[test]
-    fn derive_prefers_env_then_tmux_then_adhoc() {
+    fn session_file_name_wins_unless_derived_then_the_tmux_part() {
+        assert_eq!(
+            seat_from_session_json(r#"{"name":"Fix The Build","nameSource":"user","tmux":"lane:@1.%2"}"#).as_deref(),
+            Some("fix-the-build")
+        );
+        assert_eq!(
+            seat_from_session_json(r#"{"name":"auto title","nameSource":"derived","tmux":"claude_id_comms:@3.%12"}"#).as_deref(),
+            Some("claude_id_comms")
+        );
+        // no nameSource at all counts as not derived
+        assert_eq!(seat_from_session_json(r#"{"name":"lane-a"}"#).as_deref(), Some("lane-a"));
+        // derived name and no tmux field: nothing usable
+        assert_eq!(seat_from_session_json(r#"{"name":"auto","nameSource":"derived"}"#), None);
+        assert_eq!(seat_from_session_json(r#"{"tmux":"::"}"#), None);
+        assert_eq!(seat_from_session_json("not json"), None);
+        assert_eq!(seat_from_session_json(r#"{"name":"../../etc","nameSource":"user"}"#).as_deref(), Some("etc"));
+    }
+
+    #[test]
+    fn derive_prefers_env_then_session_file_then_tmux_then_adhoc() {
         let i = Inputs {
             env_seat: Some("My Lane".into()),
+            session_file_seat: Some("from-file".into()),
             tmux_session: Some("tmuxname".into()),
             session_id: Some("0f3a9c21-aaaa-bbbb-cccc-1234567890ab".into()),
         };
@@ -245,6 +323,17 @@ mod tests {
         );
         let i = Inputs {
             env_seat: Some("   ".into()),
+            ..i
+        };
+        assert_eq!(
+            derive(&i),
+            Derived {
+                name: "from-file".into(),
+                source: Source::SessionFile
+            }
+        );
+        let i = Inputs {
+            session_file_seat: None,
             ..i
         };
         assert_eq!(

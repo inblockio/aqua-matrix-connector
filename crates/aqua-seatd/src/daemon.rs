@@ -464,7 +464,7 @@ impl Daemon {
             .map(|p| {
                 let l = local.iter().find(|(m, _)| m.eq_ignore_ascii_case(&p.mxid));
                 json!({
-                    "seat": p.seat, "did": p.did, "host": p.host, "mxid": p.mxid,
+                    "seat": p.seat, "address": format!("{}@{}", p.seat, p.host), "did": p.did, "host": p.host, "mxid": p.mxid,
                     "self": p.mxid.eq_ignore_ascii_case(&own),
                     "local": l.is_some(),
                     "attached": l.is_some_and(|(_, up)| *up),
