@@ -1,11 +1,11 @@
 ---
 name: claude-channel
-description: Matrix LLM channel — DMs from --target are forwarded to `claude -p` and the stdout is DM'd back. Separate identity from the heartbeat.
+description: Matrix LLM channel — DMs from --target are forwarded to `claude -p` and the stdout is DM'd back.
 ---
 
 # Matrix Claude Channel
 
-Separate Matrix identity (`claude-channel.pem` + `~/.aqua-matrix-claude-channel/` store) running the `aqua-matrix-claude-p` binary. Each inbound DM from the configured `--target` becomes a fresh `claude -p <prompt>` invocation; stdout is sent back as a Matrix reply. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design and why this is a separate daemon from the heartbeat.
+Separate Matrix identity (`claude-channel.pem` + `~/.aqua-matrix-claude-channel/` store) running the `aqua-matrix-claude-p` binary. Each inbound DM from the configured `--target` becomes a fresh `claude -p <prompt>` invocation; stdout is sent back as a Matrix reply. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full design and the one-identity-per-surface rationale.
 
 ## Quick check
 
@@ -34,7 +34,7 @@ journalctl --user -u aqua-matrix-claude-channel -n 30 | grep "agent DID"
 
 ## Sending it a prompt
 
-From `--target` (Tim's account in Element), DM the **claude-channel identity** any plain prose (NOT starting with `#shell` — that prefix is the heartbeat's). The daemon will:
+From `--target` (Tim's account in Element), DM the **claude-channel identity** any plain prose. The daemon will:
 
 1. See the message via stream sync (~1 sec).
 2. Spawn `claude -p "<your message>"`, resuming the user's prior session
@@ -47,11 +47,9 @@ From `--target` (Tim's account in Element), DM the **claude-channel identity** a
 
 Stateless per message: each invocation starts fresh, no conversation continuity. For continuity, attach locally to the `claude-bridge` tmux session (see `claude-bridge` skill).
 
-## Respawn from Matrix
+## Respawn
 
-The heartbeat's `#shell respawn-channel` (sent from `--target` to the **heartbeat** identity) runs `systemctl --user restart aqua-matrix-claude-channel`. Useful when the claude-channel daemon is wedged but the heartbeat still works.
-
-`#shell respawn` (no suffix) restarts a different unit — `claude-bridge.service`, the local interactive tmux session. Don't confuse them.
+From a local shell: `systemctl --user restart aqua-matrix-claude-channel`. This is a different unit from `claude-bridge.service`, the local interactive tmux session; don't confuse them. There is no Matrix-side restart command (the `#shell` command channel went away with the retired ops daemon).
 
 ## Sync model
 
@@ -62,8 +60,7 @@ Stream sync (`client.sync(...)` running forever in a background tokio task). Eve
 - **`claude -p timed out`** in the reply: the prompt was too complex or claude hung. The daemon stays running; just send another shorter prompt.
 - **`claude -p exited with status ...`**: claude CLI rejected the prompt. Stderr is included in the reply.
 - **Empty reply (`[claude-channel] (no output)`)**: claude produced no stdout. Check `claude --version` works locally; also check `which claude`.
-- **No reply at all**: check `systemctl --user is-active aqua-matrix-claude-channel`. If active but unresponsive, `#shell respawn-channel` from the heartbeat side, or `systemctl --user restart aqua-matrix-claude-channel` locally.
-- **`heartbeat sent` continues but no claude replies**: that's correct — the two daemons are independent. Different identities, different DMs, different processes.
+- **No reply at all**: check `systemctl --user is-active aqua-matrix-claude-channel`. If active but unresponsive, `systemctl --user restart aqua-matrix-claude-channel` locally.
 
 ## Limits
 

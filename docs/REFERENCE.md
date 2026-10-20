@@ -21,16 +21,13 @@ aqua-matrix-agent/                  # virtual Cargo workspace
     │                               #   Also a one-shot CLI: send / read / print-did.
     ├── aqua-matrix-relay/          # GENERIC DAEMON: MessageHandler trait + run_daemon()
     │   └── examples/echo_agent.rs  #   a complete ~30-line agent
-    ├── aqua-matrix-heartbeat/      # ops agent (status DMs + #shell) — host-specific
     └── aqua-matrix-claude-p/       # reference backend: forwards DMs to `claude -p`
 ```
 
 Dependency direction is one-way:
 
 ```
-aqua-matrix-heartbeat ─┐
-                       ├─► aqua-matrix-relay ─► aqua-matrix-agent ─► siwx-oidc-auth + matrix-sdk
-aqua-matrix-claude-p ──┘
+aqua-matrix-claude-p ──► aqua-matrix-relay ─► aqua-matrix-agent ─► siwx-oidc-auth + matrix-sdk
 ```
 
 `aqua-matrix-relay` re-exports everything a backend needs
@@ -71,8 +68,7 @@ Contract:
   `tokio::spawn` a task and reply from there so the sync stream keeps flowing —
   see `aqua-matrix-claude-p`.
 - All methods are `&self`; the handler is shared (`Arc`) across the sync stream
-  and every spawned task. Put mutable state behind a `Mutex`/atomics (see
-  `OpsHandler`'s stats in `aqua-matrix-heartbeat`).
+  and every spawned task. Put mutable state behind a `Mutex`/atomics.
 - Errors are yours to log; the relay never unwinds on a handler error.
 
 ## Rich media and calls
@@ -230,7 +226,7 @@ call `run_daemon`. No auth code, no sync loop, no matrix-sdk.
    `systemd_unit()` — these populate the fleet registry
    (`io.inblock.aqua.registry`, see ARCHITECTURE.md).
 3. **Parse args / build `AgentConfig`** in a thin `main.rs` (copy
-   `aqua-matrix-heartbeat/src/main.rs` as a template). Give the agent its own
+   `aqua-matrix-claude-p/src/main.rs` as a template). Give the agent its own
    `--key-file` and `--store-dir` — **one identity per surface**, never
    multiplex onto an existing `.pem`.
 4. **Ship a systemd user unit** (copy one from `systemd/`): `Restart=always`,
@@ -252,8 +248,8 @@ agent, implement `MessageHandler`.
 
 ## See also
 
-- `docs/ARCHITECTURE.md` — design rationale: two-identity model, identity/
+- `docs/ARCHITECTURE.md` — design rationale: one-identity-per-surface model, identity/
   device-id persistence, stream-sync, the self-registry, auto-start chain.
 - `docs/RECOVERY.md` — what auto-recovers vs needs a human; diagnostic decision
   tree.
-- `Skills/heartbeat`, `Skills/claude-channel` — operating the two shipped agents.
+- `Skills/claude-channel`: operating the shipped agent.

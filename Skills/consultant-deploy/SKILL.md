@@ -9,7 +9,8 @@ Deploy and maintain **dedicated, single-target Aqua consultants** — one contai
 running `localhost/aqua-matrix-agent:poc` (the `aqua-matrix-claude-p` backend), bound to exactly
 ONE peer MXID by the relay firewall (`authorize(sender == target)` in
 [`crates/aqua-matrix-relay`](../../crates/aqua-matrix-relay/src/lib.rs)). Each consultant is a
-read-only Aqua-protocol assistant grounded in five repos mounted read-only at `/refs`:
+read-only Aqua-protocol assistant grounded in five repos (the fleet default, `REFS_REPOS`) that its
+`aqua-agent-refs` view mounts read-only at `/refs`:
 `aqua-rs-sdk` (reference implementation and the authoritative protocol documents, `docs/pca/`),
 `aqua-ecosystem` (trust-layer map: tiers, products, per-repo registry facts),
 `aqua-governance-corpus` (governance principles, ICT kernels, deliberation methods),
@@ -44,10 +45,10 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 ## Prerequisites
 
 - Image built: `bash ~/aqua-agents/scripts/build-image.sh` (stages the 4 sibling repos + host `claude`, retags `:poc`).
-- Refs checkouts on the host: `~/aqua-rs-sdk`, `~/aqua-governance-corpus`,
-  `~/aqua-ecosystem`, `~/aqua-compliance`, `~/inblockio.github.io` (all under
-  `github.com/inblockio/`). The spawner mounts them ro at
-  `/refs/<name>` and **refuses to launch if one is missing** (it prints the exact clone command).
+- The `aqua-agent-refs` tool (`~/.local/bin/aqua-agent-refs`, or `AGENT_REFS_BIN`, or on `PATH`). The spawner
+  mounts the agent's view of it at `/refs` and **refuses to run (exit 2, nothing changed) without it**. Install:
+  `cd ~/aqua-agents && cargo install --locked --path crates/aqua-agent-refs --root ~/.local`. No host
+  checkouts are needed any more; the tool clones and fetches its own mirrors.
 - OAuth token at `~/.aqua-matrix-heartbeat/claude-oauth-token` (passed **by reference** — never on a command line).
 - Optional: `~/.aqua-secrets/deepgram.env` (one line, `DEEPGRAM_API_KEY=...`) for voice messages, also
   passed by reference. Missing file = voice stays disabled, nothing else changes. See "Voice messages".
@@ -232,91 +233,53 @@ SIGTERMed all 23 freshly rolled consultants; they exited 0, `--restart on-failur
 the fleet stayed down for 8 h. A new script that starts agent containers must call
 `podman-detached.sh run|start|restart ...` instead of bare `podman`.
 
-## Refs grounding and freshness (automatic)
+## Refs grounding (the agent-refs view, the only refs path)
 
-This is the LEGACY path, used unless the agent has an `aqua-agent-refs` list (see "Per-agent refs lists"
-below). The agent's knowledge is the live host checkouts, bind-mounted read-only; a host-side
-`git pull` is visible to running consultants immediately. On **every** launch (spawn,
-relabel, and each consultant of a fleet roll) the spawner runs a refs check over the
-`REFS_REPOS` list, so a rebuild can never ship stale or missing grounding:
+The agent's knowledge is ONE read-only view directory per agent, built and kept current by the
+`aqua-agent-refs` tool from the agent's list of repos and bind-mounted as `-v <view>:/refs:ro`. It is the
+only refs mount: the spawner mounts no host checkout, has no clone or fast-forward pass of its own, and
+no fallback. Design: inblockio/aqua-agents `docs/plans/2026-10-19-agent-refs.md`. A host-side change to
+the list is visible to the running consultant at once (the mount is the whole view directory).
 
-| Repo state | Behaviour |
-|---|---|
-| missing on host | **FATAL**: refuses to launch, prints the `git clone` command |
-| clean + behind upstream | fast-forward pull, logs old/new state |
-| dirty + behind | loud warning, mounted as-is (local work never touched) |
-| diverged from upstream | loud warning, mounted as-is (resolve manually) |
-| fetch fails (offline) / no upstream / not a git checkout | warning, mounted as-is |
+`REFS_REPOS` in `spawn-consultant.sh` is the fleet default list a NEW consultant starts with (five repos).
+Keep it in sync with `ref_mounts` in `consultant-config.template.json` (which the system prompt mirrors).
+An existing consultant's list is never touched by the spawner.
 
-`--no-refresh-refs` skips the freshness pass (presence stays fatal). The mount flags,
-the presence check, and the freshness pass are all driven by the single `REFS_REPOS`
-list in `spawn-consultant.sh`; keep that list in sync with `ref_mounts` in
-`consultant-config.template.json` (which the system prompt mirrors).
-
-**The `host` block (per consultant, opt-in).** Settings that only this spawn script uses live
-in ONE `host` object in the consultant JSON:
+**The `host` block (per consultant, legacy keys only).** The consultant JSON may carry a `host` object that
+only this spawn script reads:
 
 ```json
 "host": { "extra_refs": ["aqua-mail", "siwx-oidc"], "refs_follow": ["aqua-rs-sdk"] }
 ```
 
-The agent binary accepts the object and ignores its contents (IMAGE BEFORE CONFIG: only an image
-that knows the `host` field may run a config that carries it, `deny_unknown_fields`). The script
-reads it from the config the spawn uses (the kept config, or the render's base: the existing
-config, else the template) and validates it strictly before any side effect (Owner step, config
-render, clone, container): `host` must be an object, its only keys are `extra_refs` and
-`refs_follow`, each a list of plain repo names (`[A-Za-z0-9._-]`, not `.`, no `..`, not the
-reserved `_developments`). Anything else exits 2 with nothing changed. Persona render,
-`--keep-config` (including its `avatar_path` patch and `--voice`) and `--refresh-prompt` carry
-`host`, `invite_policy` and `rooms` through byte for byte. No `host` = today's argv, byte for byte.
-
-**Extra refs (`host.extra_refs`).** `REFS_REPOS` reaches every consultant. A repo only ONE
-consultant may see (private ones included) goes in its `host.extra_refs`: it is mounted `:ro` at
-`/refs/<repo>` into that consultant only, from a clean single-branch clone of the default branch
-under `${CONSULTANT_REFS_MIRROR:-~/.local/share/consultant-refs}` (never a working checkout,
-never /tmp). Unlike the fleet pass this is fail-closed: a failed clone/fetch, a non-fast-forward
-or any local change in a mirror (ignored files included) aborts the spawn before the container is
-touched. A fleet repo or a followed repo in the list is skipped with a note. The former host file
-`<test-dir>/<key>-extra-refs.list` is NOT read any more (no fallback): move its names into
-`host.extra_refs` before the next spawn of that consultant, or they silently drop out of its
-`/refs`. These mounts are NOT in `ref_mounts` and NOT in the system prompt; the agent reads them
-through its unscoped `Read`/`Glob`/`Grep`, so tell it about them in its own config if it should
-use them.
-
-**Followed refs (`host.refs_follow`).** A followed repo is mounted `:ro` at `/refs/<repo>` from
-its FOLLOW mirror `<follow>/<repo>`, IN PLACE of the fleet mount for that repo (a repo outside
-`REFS_REPOS` is simply added), for that consultant only; everyone else keeps the fleet checkout.
-Its digest dir `<follow>/_developments/<repo>` (holding `DEVELOPMENTS.md`: latest tags, main of
-the last 30 days, open PRs) is mounted `:ro` at `/refs/_developments/<repo>`. Both are directory
-mounts, never a single-file bind mount (a file replaced by rename would go stale in the
-container). `<follow>` = `${CONSULTANT_REFS_FOLLOW_ROOT:-~/.local/share/consultant-refs-follow}`.
-The follow mirrors and digests come from the host timer `consultant-refs-follow.timer`
-(inblockio/aqua-ops, every 30 min, `Persistent=true`), which reads every live config's
-`host.refs_follow`, fast-forwards each mirror to the upstream default branch and refuses a dirty
-one. The spawn script NEVER clones, fetches or updates them; it only checks (read-only, with
-`GIT_OPTIONAL_LOCKS=0` so it never races the timer for the index lock) that each mirror is a
-clean git clone and its digest dir exists. Missing or dirty: exit 1 before anything changes, with
-`run: systemctl --user start consultant-refs-follow.service`.
+Both keys are RETIRED: they mount nothing, because an agent's repos come only from its list. They stay in the
+schema so existing configs still validate (IMAGE BEFORE CONFIG: only an image that knows the `host` field may
+run a config that carries it, `deny_unknown_fields`). The script reads the block from the config the spawn
+uses (the kept config, or the render's base: the existing config, else the template) and validates it
+strictly before any side effect (Owner step, config render, container): `host` must be an object, its only
+keys are `extra_refs` and `refs_follow`, each a list of plain repo names (`[A-Za-z0-9._-]`, not `.`, no `..`,
+not the reserved `_developments`). Anything else exits 2 with nothing changed. A config with a non-empty
+`host.extra_refs` or `host.refs_follow` gets ONE note that they are ignored because the repos come from the
+agent's list. To give one consultant another repo (private ones included), add it to its list:
+`aqua-agent-refs add --agent=<STEM> <repo>`. Persona render, `--keep-config` (including its `avatar_path` patch
+and `--voice`) and `--refresh-prompt` carry `host`, `invite_policy` and `rooms` through byte for byte.
 
 **Rooms.** A `<test-dir>/<key>-rooms/` dir is mounted `:ro` at `/agent/rooms`, together with a
 durable, writable `<test-dir>/<key>-room-state/` (created if missing, never wiped) at
 `/agent/room-state` with the same `:U` as `/agent/memory`. No rooms dir = no rooms mounts.
 
-**Per-agent refs lists (`aqua-agent-refs`).** An agent can have its own list of repos, mounted
-`:ro` as ONE view at `/refs` and changed live. Design: inblockio/aqua-agents
-`docs/plans/2026-10-19-agent-refs.md`. The switch is the list file
+**Per-agent refs lists (`aqua-agent-refs`).** The list file is
 `~/.local/share/agent-refs/agents/<STEM>.json` (`<STEM>` = `<label>-aqua-consultant`, or
 `aqua-consultant` for `--generic`), written only by the `aqua-agent-refs` tool; the spawn asks
 `aqua-agent-refs path --agent=<STEM>` before any side effect (every call passes the key in the equals
 form, so a STEM starting with `-` is never read as a flag). `AGENT_REFS_BIN` overrides the binary; the
 default is `aqua-agent-refs` on `PATH`, else `~/.local/bin/aqua-agent-refs` when executable (systemd and cron
-rolls have no `~/.local/bin` on `PATH`).
+rolls have no `~/.local/bin` on `PATH`). The tool is required: there is no legacy path to fall back to.
 
 `path` exit codes the spawn relies on: 0 = list, stdout is the view dir; 5 = no list (and only then); every
 other code (2 = usage, invalid key or settings error, also what a tool older than the exit-5 contract
 answers for "no list") aborts with nothing changed. Exit 5 is also refused when the list file exists or is a
-symlink. An error must never turn into the legacy path: it could bring a repo back that was removed from the
-agent's list.
+symlink. An error never guesses a refs source.
 
 **Existing or new consultant** is decided by the store and the container, never by the config file (a
 `--print-run` renders the config, and a failed first spawn leaves one). Existing = `<persist>/store/agent.pem`
@@ -327,10 +290,10 @@ class.
 
 | State | What the spawn does |
 |---|---|
-| Existing, list exists | Real spawn: `sync --agent=<STEM> --wait 900` (exit 0 or 3 go on, 3 warns "stale"; anything else aborts before the config render, the `--replace` removal and any container change). `--print-run` / `--no-refresh-refs`: `check --agent=<STEM>` instead. Mounts exactly `-v <view>:/refs:ro`, where the fleet mounts sat in the argv. `REFS_REPOS` checkouts, `host.extra_refs` and `host.refs_follow` are not used (one line says the host entries are ignored). |
-| Existing, no list (exit 5) | Today's behaviour, argv byte for byte. |
+| Existing, list exists | Real spawn: `sync --agent=<STEM> --wait 900` (exit 0 or 3 go on, 3 warns "stale"; anything else aborts before the config render, the `--replace` removal and any container change). `--print-run` / `--no-refresh-refs`: `check --agent=<STEM>` instead. Mounts exactly `-v <view>:/refs:ro`, the only refs mount. A config that still carries `host.extra_refs` / `host.refs_follow` gets one line saying they are ignored. |
+| Existing, no list (exit 5) | Abort, exit 2, nothing changed (no container removed, no config written, no persist touched). The message names the fix: `aqua-agent-refs add --agent=<STEM> <REFS_REPOS>` (the fleet default list), then spawn again. |
 | NEW consultant | A real spawn ALWAYS runs `add --agent=<STEM> --wait 900 <REFS_REPOS in order>` first, with or without a list file: add is idempotent, so a retry after a partial add (list written, exit 1) tops up the missing repos. Exit 0 or 3 go on (3 warns), anything else aborts, naming that a partial list may exist (`aqua-agent-refs list --agent=<STEM>`). Then `path`, `sync` and the mount as above. `--print-run` runs nothing and prints the add it would run; a real spawn after a preview is still new. |
-| `aqua-agent-refs` not installed | Legacy path with one warning line (existing and new consultant alike), so the script works before the install. Exception, fail closed: the list file exists (or is a symlink) but the binary is missing = abort. |
+| `aqua-agent-refs` not installed | Abort, exit 2, nothing changed, with the install command (existing and new consultant alike, also when the list file exists or is a symlink). |
 | `path` answers anything but 0 / 5 | Abort, nothing changed (also exit 2 with the list file present: no podman call at all). |
 | `path` prints anything but the agent's view | Abort. The view must be exactly `<AGENT_REFS_ROOT>/views/<STEM>` (compared with `realpath -m`, nothing stripped: a trailing carriage return, a second line, a colon, a relative or a foreign path are refused) and a plain directory, not a symlink. Checked after the `sync` / `check` and again right before `podman run`. |
 
@@ -342,8 +305,9 @@ aqua-agent-refs remove --agent zdnaez-aqua-consultant aqua-mail
 aqua-agent-refs list   --agent zdnaez-aqua-consultant
 ```
 
-Rollback for one agent: delete `~/.local/share/agent-refs/agents/<STEM>.json` and respawn it
-(`--replace --keep-config`); the consultant config was never written by the tool.
+Changing or rolling back one agent's repos: edit its list with `aqua-agent-refs add|remove --agent=<STEM> <repo>`
+(live, no respawn; the consultant config was never written by the tool). Deleting the list is NOT a rollback:
+an existing consultant without a list cannot be spawned (see the table).
 
 ## Identity & lifecycle flags
 
@@ -356,10 +320,10 @@ Rollback for one agent: delete `~/.local/share/agent-refs/agents/<STEM>.json` an
 | `--fresh` | Wipe the persist dir first → brand-new identity + empty memory. (Rejected with `--keep-config`.) The wipe runs inside the rootless user namespace (`podman unshare rm -rf`), because the `:U` mount leaves the files owned by the container's mapped UID and a host `rm` is denied; `podman unshare` is probed before any `--replace` removal, so a broken namespace aborts with the old container still in place. |
 | `--onboard` | After launch, wait (`ONBOARD_WAIT`, default 180 s) for the consultant's own welcome to be delivered (greeted marker) and DM the operator "welcome delivered" (INFO, hello quoted) or "welcome NOT confirmed" (WARN, last relay failure line). Nothing when the peer was greeted before. Never fails the spawn. See "Onboarding". |
 | `--print-onboarding` | Print the consultant's hello as this spawn would render it and both operator notices to stdout and exit 0 before any token, network, config write, container or DM; previews the Owner allow-list step on stderr. |
-| `--no-refresh-refs` | Skip the refs freshness pass (fetch/ff-pull). Presence of every refs repo is still enforced. |
+| `--no-refresh-refs` | Do not sync the agent's refs view before launch: run `aqua-agent-refs check --agent=<STEM>` instead of `sync` (a failing check still aborts). The view is the only refs mount either way. |
 | `--refresh-prompt` | Adopt the template's current `system_prompt`/`description`/`ref_mounts` into the config; hello/homeserver customizations, DID, and memory preserved. The sanctioned way to push a prompt update to existing consultants. |
 | `--voice on\|off` | Patch only `voice.enabled` in the rendered/kept config (idempotent, sibling voice keys preserved, `off` keeps the block). Without it the config's voice block is left exactly as it is. See "Voice messages". |
-| `--print-run` | Print the assembled `podman run` argument vector one arg per line and exit 0 **before** any container, systemd unit, DM, `--replace` removal or `--fresh` wipe. Implies `--no-refresh-refs` (presence still enforced). Still renders/patches the config and creates the persist dirs (they are the run's inputs). Secrets print as bare names only. |
+| `--print-run` | Print the assembled `podman run` argument vector one arg per line and exit 0 **before** any container, systemd unit, DM, `--replace` removal or `--fresh` wipe. Implies `--no-refresh-refs` (the view is only checked; a new consultant's list is not created). Still renders/patches the config and creates the persist dirs (they are the run's inputs). Secrets print as bare names only. |
 
 ## Invariants the tooling enforces (verified by adversarial audit, 2026-06-08)
 
@@ -374,15 +338,13 @@ Rollback for one agent: delete `~/.local/share/agent-refs/agents/<STEM>.json` an
   diff <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e )' ~/recreate-zdnaez-consultant.sh) \
        <(grep -E '^\s*(--restart|--memory|--cpus|--pids-limit|--cap-drop|--security-opt|--tmpfs|-e )' ~/spawn-consultant.sh)
   ```
-- **Mounts**: config mounted `:ro`, persist store/memory mounted `:U`, every `REFS_REPOS` repo
-  mounted `:ro`. Since 2026-06-12 the refs mounts are list-driven and the legacy two-mount
-  baseline was deliberately extended with `aqua-governance-corpus` + `aqua-ecosystem`, so the
-  `-v` lines no longer byte-match the legacy script (the flag diff above intentionally excludes
-  them). Verify nothing mounts writable:
+- **Mounts**: config mounted `:ro`, persist store/memory mounted `:U`, the agent's refs view mounted `:ro`
+  at `/refs` as the ONE refs mount (no `/refs/<repo>` mounts). The `-v` lines do not byte-match the original
+  `recreate-*.sh` scripts (the flag diff above intentionally excludes them). Verify nothing mounts writable:
   ```bash
-  grep -n 'REF_MOUNT_ARGS+' ~/spawn-consultant.sh        # the one mount template; must end :ro
+  grep -n 'REF_MOUNT_ARGS+' ~/spawn-consultant.sh        # the one refs mount; must end :ro
   podman inspect aqua-agent-<label>-aqua-consultant-1 \
-    --format '{{range .Mounts}}{{.Destination}} rw={{.RW}}{{"\n"}}{{end}}'   # every /refs/* rw=false
+    --format '{{range .Mounts}}{{.Destination}} rw={{.RW}}{{"\n"}}{{end}}'   # /refs rw=false, exactly one /refs mount
   ```
 - **Containers outlive their launcher**: `spawn-consultant.sh` (`podman run -d`),
   `restore-agent-fleet.sh` (`podman start`) and `scripts/canary-rooms.sh` (`podman restart`) launch
@@ -438,18 +400,15 @@ with the unit) and one through the wrapper (it must survive, conmon outside the 
 
 
 `tests/spawn-consultant-args.sh` renders the argument vector with `--print-run` in a sandbox
-(temp HOME, test dir, refs base, token and env files; `podman`/`systemctl` replaced by shims
-that fail and record any call) and asserts: no key file means no `DEEPGRAM_API_KEY`; a fake
+(temp HOME, test dir, agent-refs root with a stub `aqua-agent-refs`, token and env files;
+`podman`/`systemctl` replaced by shims that fail and record any call) and asserts: no key file means no `DEEPGRAM_API_KEY`; a fake
 key file means exactly one bare `-e DEEPGRAM_API_KEY` and the value nowhere; `--voice on|off`
 flips only that key; `--replace --keep-config` preserves the block; `inblockio.github.io` is in
-`REFS_REPOS` and mounted `:ro`; the template pins `model`, a fresh render carries it, and a
+`REFS_REPOS` and the argv carries exactly one `/refs` mount, the agent's view, `:ro`; the template pins `model`, a fresh render carries it, and a
 persona re-render or `--refresh-prompt` keeps an existing config's `model` (and never injects one);
 the `host` block is validated strictly (unknown key, non-object `host`, non-list value, every bad or
-reserved name: exit 2, config byte-identical, no persist dir, no argv), `host.extra_refs` mounts
-from the mirrors and the old `<key>-extra-refs.list` is ignored, `host.refs_follow` puts the follow
-mirror IN PLACE of the fleet mount (exact `/refs` sequence) plus one `/refs/_developments/<repo>`
-directory mount, and a missing, non-clone or dirty follow mirror or a missing digest dir exits 1
-with the service hint and nothing changed; `host`, `invite_policy` and `rooms` keep their exact bytes
+reserved name: exit 2, config byte-identical, no persist dir, no argv), a valid `host.extra_refs` /
+`host.refs_follow` mounts nothing and the old `<key>-extra-refs.list` is ignored; `host`, `invite_policy` and `rooms` keep their exact bytes
 through a persona render, the `avatar_path` patch, `--voice` and `--refresh-prompt`; the shims were
 never called.
 
@@ -474,21 +433,23 @@ that line now legitimately follows `--voice`.
 `tests/spawn-consultant-agent-refs.sh` covers the `aqua-agent-refs` path with a stub binary
 (`AGENT_REFS_BIN`, recording argv, scripted exit codes, a tiny list store under `AGENT_REFS_ROOT`) in
 the same kind of sandbox: list present (print-run uses `path` + `check`, never `sync`; one view mount
-in the fleet position, whole argv compared; real spawn runs `sync --agent <STEM> --wait 900`; sync exit
+right after the memory mount; real spawn runs `sync --agent <STEM> --wait 900`; sync exit
 3 proceeds with a stale warning; sync exit 1, 2, 4, 127 abort before the config render and any podman
 call, and on `--replace` the old container is still running; `--no-refresh-refs` runs `check`), existing
 vs new by store identity or container (a preview then a real spawn of a new consultant takes the new
-path; a store identity without a list stays legacy), a new consultant (`add --wait 900` in `REFS_REPOS`
+path; a store identity or a container without a list aborts), a new consultant (`add --wait 900` in `REFS_REPOS`
 order every time, a partial add aborts and the retry tops the list up, add exit 3 goes on, 1 / 2 / 4 / 127
-abort, print-run creates nothing), an existing consultant without a list (argv, stdout and stderr
-byte-identical to the script at 8bb03b3, the commit before this feature, for fleet / extra+follow / rooms /
-generic / keep-config), the binary missing (legacy with one warning, list file or symlink present aborts,
-default name found on `PATH`, else in `~/.local/bin`), fail-closed `path` answers (exit 2 with a list
+abort, print-run creates nothing), an existing consultant without a list (exit 2 before any change, the
+message names `aqua-agent-refs add --agent=<STEM> <REFS_REPOS>`, config / allow-list / running container
+untouched; print-run, real `--replace`, `--keep-config --no-refresh-refs`), the binary missing (exit 2
+before any change with the install hint, for an existing and a new consultant, also with the list file or a
+dangling symlink present; default name found on `PATH`, else in `~/.local/bin`), the retired legacy env vars
+having no effect, fail-closed `path` answers (exit 2 with a list
 present aborts with no podman call; a real spawn aborted by `path` leaves the Owner allow-list
 byte-identical), the exact view path and view directory checks (CR, newline, foreign path, symlink, swap
-between the sync and `podman run`), and `host.extra_refs` / `host.refs_follow` ignored when a list exists.
-The other suites set `AGENT_REFS_BIN` to a nonexistent path, so they stay hermetic even when the tool is
-installed system-wide.
+between the sync and `podman run`), and `host.extra_refs` / `host.refs_follow` ignored (one note, no
+extra mount) for an existing and a new consultant. The other suites point `AGENT_REFS_BIN` at a small stub that
+gives every agent a list, so they stay hermetic even when the tool is installed system-wide.
 `KEEP_SANDBOX=1` keeps the temp dir for debugging.
 
 ```bash
@@ -499,8 +460,7 @@ bash Skills/consultant-deploy/tests/podman-detached.sh
 ```
 
 The sandbox relies on the spawner's env overrides: `CONSULTANT_TEST_DIR` (configs, persist,
-avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `CONSULTANT_REFS_BASE`,
-`CONSULTANT_REFS_MIRROR`, `CONSULTANT_REFS_REMOTE`, `CONSULTANT_REFS_FOLLOW_ROOT`, `AGENT_REFS_BIN`, `AGENT_REFS_ROOT`, `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
+avatars, template; default `~/.aqua-matrix-test`), `CONSULTANT_TEMPLATE`, `AGENT_REFS_BIN`, `AGENT_REFS_ROOT`, `CONSULTANT_IMAGE`, `AQUA_CLAUDE_TOKEN_FILE`, `AQUA_DEEPGRAM_ENV`, plus for onboarding
 `CONSULTANT_NOTIFY`, `ONBOARD_WAIT` and `AQUA_SYSTEM_ALLOWLIST`.
 
 ## Model pin (`model`)
@@ -549,7 +509,7 @@ podman ps --filter name=aqua-agent-<label>            # Up, restarts 0
 podman logs aqua-agent-<label>-aqua-consultant-1 | grep -E 'agent DID|connected|display name set|daemon starting'
 systemctl --user is-active aqua-activity-watch-<label>.service   # n/a for --generic (no watcher by design)
 podman inspect aqua-agent-<label>-aqua-consultant-1 \
-  --format '{{range .Mounts}}{{.Destination}} {{end}}'   # expect all four /refs/* + config + store + memory
+  --format '{{range .Mounts}}{{.Destination}} {{end}}'   # expect exactly one /refs (the view) + config + store + memory
 ```
 
 For the generic consultant the container name is plain `aqua-agent-aqua-consultant-1` (no label).
@@ -565,4 +525,4 @@ localpart is opaque).
 
 - Memory: `consultant-fleet-recreate` (procedure + legacy per-script notes), `gawain-aqua-consultant`,
   `zdnaez-aqua-consultant` (= "Aubert"), `notify-tim-channel`, `relay-mxid-auth-case`.
-- Skills: [`claude-channel`](../claude-channel/skill.md) (the backend daemon), [`heartbeat`](../heartbeat/skill.md).
+- Skills: [`claude-channel`](../claude-channel/skill.md) (the backend daemon).

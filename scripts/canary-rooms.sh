@@ -44,10 +44,14 @@
 #                        never joined); legacy = pre-R17 (not declined, not joined by the live
 #                        handler, joined at the next cycle start, which the step forces with a
 #                        restart). `boundinvite` runs under owner_only only.
+#   RETIRED: the `follow` and `digest` steps (H5/H6/H7) and the three --follow-* options below test the
+#   host.refs_follow mounts of spawn-consultant.sh, which are gone: the agent's aqua-agent-refs view is
+#   the only /refs mount, so a container never mounts a follow mirror and these steps fail. Do not select
+#   them until they are re-pointed at the agent-refs view; they are left out of the default run.
 #   --follow-bed DIR     test bed of `follow` and `digest` (never the live follow root):
 #                        DIR/remote/<repo>.git local bare upstream, DIR/root the canary's
-#                        CONSULTANT_REFS_FOLLOW_ROOT, DIR/configs the job's config dir (canary
-#                        configs only), DIR/work a scratch clone for the test pushes
+#                        follow root (the job's CONSULTANT_REFS_FOLLOW_ROOT), DIR/configs the job's
+#                        config dir (canary configs only), DIR/work a scratch clone for the test pushes
 #   --follow-job PATH    consultant_refs_follow.py (aqua-ops tools/consultant-refs-follow)
 #   --follow-repo NAME   the followed repo (default aqua-rs-sdk)
 #   --keep-going         record every FAIL instead of stopping at the first
@@ -67,7 +71,7 @@
 # is UTD for the canary and must not appear in its history.
 #
 # Not checkable here (see ~/.aqua-matrix-test/canaryrooms-NOTES.md): AC5 (Marina's full extra refs;
-# the canary carries one, host.extra_refs, checked by podman inspect), AC6 (Aqua System is not
+# the canary carries one in its aqua-agent-refs list, checked by podman inspect), AC6 (Aqua System is not
 # in the test room), AC8 (build and fleet gates), the R8 daily limit at 48, R11 media. R15c
 # (to-room drafts) is the `toroom` step; its once-only note to the next room batch is unit-tested.
 set -uo pipefail
@@ -77,7 +81,8 @@ REPO=$(cd "$SELF_DIR/.." && pwd)
 TEST_DIR=${CONSULTANT_TEST_DIR:-$HOME/.aqua-matrix-test}
 MARINA_CONTAINER='aqua-agent-aqua-consultant-1'
 KICKOFF_TEXT='Open the conversation with the collaborator: introduce yourself in two sentences and ask what they want to tackle first.'
-STEPS_ALL="k dm burst header noreply ignored boundinvite redteam persona needstim security dmheader toroom follow digest pause log logs"
+# The default run's steps; follow and digest are retired (see the header) and run only via --only.
+STEPS_ALL="k dm burst header noreply ignored boundinvite redteam persona needstim security dmheader toroom pause log logs"
 LIVE_FOLLOW_ROOT=$HOME/.local/share/consultant-refs-follow
 
 usage() { sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
@@ -279,7 +284,11 @@ fatal() { KEEP_GOING=0; check FAIL "$@"; }
 verdict() { if [ "$1" = 1 ]; then echo PASS; else echo FAIL; fi; }
 info() { printf 'info   %s\n' "$*" | tee -a "$RUN/summary.txt"; }
 step() { STEP=$1; printf '\n== %s: %s (%s)\n' "$1" "$2" "$(date -u +%H:%M:%SZ)" | tee -a "$RUN/summary.txt"; }
-want() { [ -z "$ONLY" ] || [[ " $ONLY " == *" $1 "* ]]; }
+# The default run (no --only) skips the retired steps follow and digest (see the header).
+want() {
+  if [ -z "$ONLY" ]; then case "$1" in follow|digest) return 1 ;; esac; return 0; fi
+  [[ " $ONLY " == *" $1 "* ]]
+}
 
 # ------------------------------------------------------------------ helpers
 nowms() { local t=${EPOCHREALTIME//[.,]/}; echo $(( 10#$t / 1000 )); }

@@ -65,11 +65,11 @@ cargo build
 | `--read-limit` | | `20` | Number of messages to fetch |
 | `--print-did` | | | Print agent DID and exit |
 
-The `aqua-matrix-agent` binary is one-shot only (`--message` / `--read` / `--print-did`). The long-running daemons are now separate workspace binaries — `aqua-matrix-heartbeat` and `aqua-matrix-claude-p` — built from the same `cargo build`. See [`docs/REFERENCE.md`](docs/REFERENCE.md).
+The `aqua-matrix-agent` binary is one-shot only (`--message` / `--read` / `--print-did`). The long-running daemon is a separate workspace binary, `aqua-matrix-claude-p`, built in the sibling `aqua-agents` repo. See [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ## Daemons
 
-The heartbeat and `claude -p` daemons are separate workspace binaries (`aqua-matrix-heartbeat`, `aqua-matrix-claude-p`), both built on the generic `aqua-matrix-relay` crate (implement the `MessageHandler` trait, call `run_daemon()` for the connect-rotate-sync-watermark lifecycle). The heartbeat sends a periodic status DM and honors `#shell` commands; `claude -p` forwards inbound DMs to the `claude` CLI. Ready-to-install systemd user units ship under `systemd/`. See [`docs/REFERENCE.md`](docs/REFERENCE.md) and `Skills/heartbeat/skill.md` for setup, payload format, and tuning.
+The `claude -p` daemon is a separate workspace binary (`aqua-matrix-claude-p`), built on the generic `aqua-matrix-relay` crate (implement the `MessageHandler` trait, call `run_daemon()` for the connect-rotate-sync-watermark lifecycle); it forwards inbound DMs to the `claude` CLI. Ready-to-install systemd user units ship under `systemd/`. See [`docs/REFERENCE.md`](docs/REFERENCE.md) and `Skills/claude-channel/SKILL.md` for setup and tuning.
 
 ## Using as a library
 

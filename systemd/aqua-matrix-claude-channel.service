@@ -14,8 +14,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=%h/aqua-matrix-agent
-# Forward CONTEXT_WINDOW for consistency with the heartbeat (status payloads
-# only matter on the heartbeat side, but keep envs aligned).
+# Keep CONTEXT_WINDOW aligned with the 1M-context model variant.
 Environment=CONTEXT_WINDOW=1000000
 # claude is at ~/.local/bin/claude; the daemon also resolves this dynamically
 # but setting PATH lets a future PATH-based claude lookup work too.
@@ -27,7 +26,7 @@ Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=AGENT_ENV_FILE=%h/.aqua-matrix-claude-channel/agent.env
 # Reference example backend (was `aqua-matrix-agent --claude-channel` before
 # the workspace split). The unit name stays `aqua-matrix-claude-channel` so
-# `#shell respawn-channel`, the registry role, and skills are unaffected.
+# the registry role and skills are unaffected.
 # The `aqua-matrix-claude-p` crate lives in the sibling ~/aqua-agents
 # workspace (path-depending on this repo's relay crate), so the canonical
 # binary is built THERE: `cd ~/aqua-agents && cargo build -p aqua-matrix-claude-p`.

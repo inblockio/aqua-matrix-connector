@@ -3,8 +3,9 @@
 # spawn-consultant-onboarding.sh, offline tests for the welcome + --onboard flow of
 # spawn-consultant.sh and consultant-persona.py, and for the Owner allow-list step.
 #
-# Nothing live is touched: HOME, the config/persist dir and the refs base point into a temp
-# dir, Tim's notifier is a recorder (CONSULTANT_NOTIFY), and podman/systemctl are shims (the
+# Nothing live is touched: HOME, the config/persist dir and the agent-refs root point into a temp
+# dir, aqua-agent-refs is a stub, Tim's notifier is a recorder (CONSULTANT_NOTIFY), and
+# podman/systemctl are shims (the
 # podman shim can play the agent: write the greeted marker after `run`, or serve canned
 # `logs`). No message leaves the machine.
 #
@@ -45,17 +46,28 @@ hasnt()  { ! grep -qF -- "$2" "$1"; }
 
 SB="$(mktemp -d "${TMPDIR:-/tmp}/spawn-onboard-test.XXXXXX")"
 trap 'rm -rf "$SB"' EXIT
-FAKE_HOME="$SB/home"; TEST_DIR="$SB/aqua-matrix-test"; REFS_BASE="$SB/refs"; SHIM_BIN="$SB/bin"
-# Hermetic: the spawn never finds a real aqua-agent-refs, not even one installed system-wide or in ~/.local/bin.
-NO_REFS_BIN="$SB/no-such-dir/aqua-agent-refs"
+FAKE_HOME="$SB/home"; TEST_DIR="$SB/aqua-matrix-test"; SHIM_BIN="$SB/bin"
+# Hermetic: the spawn gets a stub aqua-agent-refs (AGENT_REFS_BIN), never a real one, not even one installed
+# system-wide or in ~/.local/bin. The refs view is the only /refs source, so every scenario that reaches the
+# refs step needs a tool. This stub gives every agent a list: path prints its view dir (created on demand),
+# add / sync / check succeed. The refs behaviour itself is covered by spawn-consultant-agent-refs.sh.
+STUB="$SB/stub/aqua-agent-refs"; STUB_ROOT="$SB/agent-refs-root"
 SIDE_EFFECTS="$SB/side-effects.log"; NOTIFY_LOG="$SB/notify.jsonl"
 TOKEN_FILE="$FAKE_HOME/.aqua-matrix-heartbeat/claude-oauth-token"
-mkdir -p "$FAKE_HOME/.aqua-matrix-heartbeat" "$TEST_DIR" "$REFS_BASE" "$SHIM_BIN" "$SB/out"
+mkdir -p "$FAKE_HOME/.aqua-matrix-heartbeat" "$TEST_DIR" "$SHIM_BIN" "$SB/out" "$SB/stub" "$STUB_ROOT"
 echo fake-token > "$TOKEN_FILE"
 cp "$TEMPLATE" "$TEST_DIR/consultant-config.template.json"
-for r in aqua-rs-sdk aqua-governance-corpus aqua-ecosystem aqua-compliance inblockio.github.io; do
-  mkdir -p "$REFS_BASE/$r"
-done
+cat > "$STUB" <<'STUBEOF'
+#!/usr/bin/env bash
+cmd="${1:-}"; agent=""
+for a in "$@"; do case "$a" in --agent=*) agent="${a#--agent=}" ;; esac; done
+case "$cmd" in
+  path) mkdir -p "$AGENT_REFS_ROOT/views/$agent"; printf '%s\n' "$AGENT_REFS_ROOT/views/$agent" ;;
+  add|sync|check) : ;;
+  *) exit 64 ;;
+esac
+STUBEOF
+chmod +x "$STUB"
 TARGET='@did-key-zfaketestpeer:matrix.inblock.io'
 AGENT_MXID='@0a1b2c3d4e5f6g7h:matrix.inblock.io'
 TIM_MXID='@tim-operator:matrix.inblock.io'
@@ -200,8 +212,8 @@ echo "== render / refresh: voice line follows the final voice.enabled; --keep-co
 # run_print <name> [spawn args...]: --print-run (renders the config, starts nothing)
 run_print() {
   local name="$1"; shift; local rc=0
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" \
-    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" \
+    CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     AQUA_SYSTEM_ALLOWLIST="$AL" \
     bash "$SPAWN" --print-run "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
@@ -236,8 +248,8 @@ echo "== --print-onboarding"
 # print_onb <name> [spawn args...]: --print-onboarding in the sandbox (shims in print mode).
 print_onb() {
   local name="$1"; shift; local rc=0
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" \
-    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_SYSTEM_ALLOWLIST="$AL" \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" \
+    CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_SYSTEM_ALLOWLIST="$AL" \
     bash "$SPAWN" --print-onboarding "$@" > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
   echo "$rc" > "$SB/out/$name.rc"
   # Split the three sections for targeted assertions.
@@ -289,8 +301,8 @@ spawn_onb() {
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
   rm -f "$NOTIFY_LOG"
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" SHIM_MODE=spawn \
-    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" SHIM_MODE=spawn \
+    CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$AL" ONBOARD_WAIT=10 "${envs[@]}" \
     bash "$SPAWN" --label "$label" --target "$TARGET" --no-refresh-refs "$@" \
     > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
@@ -352,7 +364,7 @@ check "no em/en dash in any spawn output or notice" no_dashes "$SB"/out/f*.out "
 echo "== the Aqua System peer send is gone"
 check "onboard-send.py deleted" [ ! -e "$SKILL_DIR/onboard-send.py" ]
 check "no script references the bridge MCP or the direct send" bash -c '! grep -nE "aqua-system-bridge-mcp|AQUA_SYSTEM_BRIDGE_MCP|onboard-send|ONBOARD_SEND_TIMEOUT|onboard-forward-only|send_message|ONBOARD_DIRECT" "$1"/*.sh "$1"/*.py' _ "$SKILL_DIR"
-check "--onboard-forward-only is now an unknown flag" bash -c '! env -i HOME="$1" PATH=/usr/bin:/bin AGENT_REFS_BIN="$4" bash "$2" --print-onboarding --label x --target "$3" --persona P --onboard-forward-only >/dev/null 2>&1' _ "$FAKE_HOME" "$SPAWN" "$TARGET" "$NO_REFS_BIN"
+check "--onboard-forward-only is now an unknown flag" bash -c '! env -i HOME="$1" PATH=/usr/bin:/bin AGENT_REFS_BIN="$4" bash "$2" --print-onboarding --label x --target "$3" --persona P --onboard-forward-only >/dev/null 2>&1' _ "$FAKE_HOME" "$SPAWN" "$TARGET" "$STUB"
 
 echo "== Owner allow-list (owner-allowlist.py; real spawns with podman shimmed)"
 OWNER_HELPER="$SKILL_DIR/owner-allowlist.py"
@@ -371,8 +383,8 @@ spawn_owner() {
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
   rm -f "$SIDE_EFFECTS"
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" SHIM_MODE=spawn \
-    CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" SHIM_MODE=spawn \
+    CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$al" \
     bash "$SPAWN" --label "$label" --target "$OWNER" --persona Pelagia --name Andreas --no-refresh-refs "$@" \
     > "$SB/out/$name.out" 2> "$SB/out/$name.err" || rc=$?
@@ -452,8 +464,8 @@ check "--replace + bad allow-list: no podman rm (no podman at all)" no_podman
 
 # O7: print modes write nothing, but preview
 O7="$SB/o7.toml"; mk_al "$O7"; cp "$O7" "$SB/o7.before"
-rc=0; env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$NO_REFS_BIN" \
-  CONSULTANT_TEST_DIR="$TEST_DIR" CONSULTANT_REFS_BASE="$REFS_BASE" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
+rc=0; env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" \
+  CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
   AQUA_SYSTEM_ALLOWLIST="$O7" bash "$SPAWN" --print-run --label printrun --target "$OWNER" --persona Pelagia \
   > "$SB/out/o7.out" 2> "$SB/out/o7.err" || rc=$?
 check "--print-run: exit 0, allow-list untouched, no backup, no lock file" bash -c '[ "$1" = 0 ] && cmp -s "$2" "$3" && [ "$(backups "$2")" = 0 ] && [ ! -e "$2.lock" ]' _ "$rc" "$O7" "$SB/o7.before"

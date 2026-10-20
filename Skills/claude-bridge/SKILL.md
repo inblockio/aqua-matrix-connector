@@ -1,11 +1,11 @@
 ---
 name: claude-bridge
-description: Persistent claude-ws (Claude Code) session in a tmux session managed by systemd, respawnable via #shell respawn
+description: Persistent claude-ws (Claude Code) session in a tmux session managed by systemd
 ---
 
 # Claude Bridge (local interactive Claude in tmux)
 
-A long-lived `claude --dangerously-skip-permissions` process running inside a detached tmux session named `claude-bridge`, supervised by the `claude-bridge.service` systemd user unit. The heartbeat's `#shell respawn` command restarts it remotely. For Matrix-routed Claude conversations see the separate `/claude-channel` skill — this skill is about the LOCAL interactive session you can `tmux attach` to. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full layout.
+A long-lived `claude --dangerously-skip-permissions` process running inside a detached tmux session named `claude-bridge`, supervised by the `claude-bridge.service` systemd user unit. For Matrix-routed Claude conversations see the separate `/claude-channel` skill — this skill is about the LOCAL interactive session you can `tmux attach` to. See [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) for the full layout.
 
 ## Quick check
 
@@ -28,19 +28,15 @@ systemctl --user daemon-reload
 systemctl --user enable --now claude-bridge
 ```
 
-The same wsl.conf-systemd + linger chain that auto-starts the heartbeat covers this unit too — verified by `systemctl --user is-enabled claude-bridge` returning `enabled`.
+The wsl.conf-systemd + linger chain (see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md), "Auto-start chain") starts every enabled user unit, this one included. Verified by `systemctl --user is-enabled claude-bridge` returning `enabled`.
 
 ## Respawn
 
 ```bash
-# From any local shell
 systemctl --user restart claude-bridge
-
-# Remotely via Matrix DM from the configured --target identity
-#shell respawn
 ```
 
-Both paths run `ExecStop` (`tmux kill-session -t claude-bridge`) followed by `ExecStart` (`tmux new-session -d -s claude-bridge -- ~/.local/bin/claude --dangerously-skip-permissions`), giving a clean Claude Code process.
+This runs `ExecStop` (`tmux kill-session -t claude-bridge`) followed by `ExecStart` (`tmux new-session -d -s claude-bridge -- ~/.local/bin/claude --dangerously-skip-permissions`), giving a clean Claude Code process.
 
 ## Unit anatomy
 

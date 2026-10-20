@@ -8,7 +8,7 @@
 #     one-way only:  aqua-agents -> connector,  NEVER the reverse.
 #
 # No CONNECTOR crate may name an AGENTS-side (backend) crate
-# (aqua-matrix-template / aqua-matrix-heartbeat / aqua-matrix-claude-p)
+# (aqua-matrix-template / aqua-matrix-claude-p)
 # in its Cargo.toml [dependencies].
 #
 # We inspect DEPENDENCY LINES ONLY, never package metadata: a
@@ -16,7 +16,7 @@
 # so an unanchored grep would false-positive. The anchored regex below
 # matches only a dependency-table entry at line start (optionally indented):
 #
-#     ^[[:space:]]*aqua-matrix-(template|heartbeat|claude-p)\b
+#     ^[[:space:]]*aqua-matrix-(template|claude-p)\b
 #
 # A dep line like `aqua-matrix-template.workspace = true` or
 # `aqua-matrix-template = { path = ... }` starts that way; a
@@ -46,7 +46,7 @@ CONNECTOR_CRATES=(
 )
 
 # Anchored dependency-line regex (backend crate names only).
-FORBIDDEN_RE='^[[:space:]]*aqua-matrix-(template|heartbeat|claude-p)\b'
+FORBIDDEN_RE='^[[:space:]]*aqua-matrix-(template|claude-p)\b'
 
 violations=0
 
@@ -75,7 +75,7 @@ done
 echo
 if [[ "${violations}" -ne 0 ]]; then
   echo "FAIL: ${violations} connector crate(s) violate the one-way dependency rule."
-  echo "      Connector crates must never name aqua-matrix-{template,heartbeat,claude-p}."
+  echo "      Connector crates must never name aqua-matrix-{template,claude-p}."
   echo "      See https://github.com/inblockio/aqua-matrix-connector/blob/2da07d7940dc1f320789134393e802398fd87b95/docs/plans/repo-split-execution-handover.md §1, §4."
   exit 1
 fi
