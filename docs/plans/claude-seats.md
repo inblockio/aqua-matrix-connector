@@ -99,3 +99,31 @@ before a build (GREEN required); builds use the worktree's own `target/`, never 
 Prod, cross-host (S4: invite authority for a seat on a second host, clawi first), files,
 global `settings.json` or `~/.claude.json` changes, systemd units, wiring into Claude
 sessions (the session wrappers `--mcp-config` / `--settings` are done by the orchestrator).
+
+## Cross-host (S5, added 2026-10-20)
+
+Tim: "3 also means across 3 machines: system-001, nuc10 and clawi." The live test spans three
+logins AND three hosts: nuc10 (hub), clawi, system-001 (Tim's laptop; nuc10 cannot SSH to it).
+This supersedes the "cross-host out of scope" line above.
+
+- **D8 Host key.** Each seatd has a host identity `host.pem` (did:key, 0600) in its state dir.
+  `aqua-seatd --print-host-did` prints the public DID only. A host's seatd mints its seats' keys.
+- **D9 The roster room is a KNOCK room** (`join_rule: knock`, room version >= 7, alias
+  `#claude-seats:dev.matrix.inblock.io`), not invite-only, so a new host needs no live invite
+  from a human. A hub seatd (`--hub`, nuc10) creates it and holds `hosts.toml` (host DID -> host
+  name; public data only). Seats on the hub host are invited directly.
+- **D10 Endorsed knock.** A seat on another host knocks with `reason` = base64 of a JSON
+  endorsement `{seat, seat_did, host, host_did, ts}` plus an ed25519 signature by the host key.
+  The hub invites iff: the signature is valid, `host_did` is in `hosts.toml`, `ts` is within
+  10 minutes, the seat name passes the D1 charset, and the knocking MXID resolves to `seat_did`
+  (siwx-oidc `/resolve` or the verified `io.inblock.did` profile field; if neither works on dev,
+  report it, do not skip the check). Otherwise decline and write an audit line. The remote seatd
+  auto-joins the hub's invite. Hub offline: seats already in the room keep working, new joins wait.
+- **Relocatable binaries.** No path into the worktree anywhere; config by flags, env and the
+  state dir; `--version` on every binary. The orchestrator delivers binaries to clawi (glibc 2.39
+  vs 2.43 on nuc10, so the build may have to happen there or against an older glibc) and to the
+  laptop (via the synced `~/export`).
+- **Test without waiting for real hosts.** The e2e simulates a second and third host on nuc10:
+  extra seatd instances with their own state dir (`CLAUDE_SEATS_STATE`) and host key, going
+  through the knock flow. Include negative cases: unknown host DID, bad signature, stale `ts`,
+  MXID that does not resolve to `seat_did`.
