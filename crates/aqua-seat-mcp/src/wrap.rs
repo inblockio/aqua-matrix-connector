@@ -74,16 +74,17 @@ pub fn frame_items(items: &[Item], note: &str) -> String {
     )
 }
 
-/// First `max` characters of `body` on one line, for a human preview.
+/// `body` on one line, at most `max` characters in total (an ellipsis counts).
 pub fn preview(body: &str, max: usize) -> String {
     let one_line: String = body
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let mut out: String = one_line.chars().take(max).collect();
-    if one_line.chars().count() > max {
-        out.push_str("...");
+    if one_line.chars().count() <= max {
+        return one_line;
     }
+    let mut out: String = one_line.chars().take(max.saturating_sub(3)).collect();
+    out.push_str("...");
     out
 }
 
@@ -159,7 +160,7 @@ mod tests {
         assert_eq!(preview("a\nb\tc", 200), "a b c");
         let long = "x".repeat(300);
         let p = preview(&long, 200);
-        assert_eq!(p.chars().count(), 203);
+        assert_eq!(p.chars().count(), 200);
         assert!(p.ends_with("..."));
     }
 }
