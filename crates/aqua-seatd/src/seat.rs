@@ -121,7 +121,7 @@ pub enum SeatCmd {
     Send {
         to: SendTo,
         content: Box<matrix_sdk::ruma::events::room::message::RoomMessageEventContent>,
-        done: oneshot::Sender<Result<String, String>>,
+        done: oneshot::Sender<Result<SentInfo, String>>,
     },
     Invite {
         mxid: String,
@@ -130,6 +130,14 @@ pub enum SeatCmd {
     RefreshRoster {
         done: oneshot::Sender<Result<Vec<Peer>, String>>,
     },
+}
+
+/// What a delivered send reports back.
+#[derive(Debug, Clone)]
+pub struct SentInfo {
+    pub event_id: String,
+    /// The room the event went into is end-to-end encrypted.
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -646,9 +654,9 @@ async fn execute(agent: &AgentClient, shared: &Arc<SeatShared>, cmd: SeatCmd) ->
         SeatCmd::Send { to, content, done } => {
             let fut = send_one(agent, &to, (*content).clone());
             match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, fut).await {
-                Ok(Ok(id)) => {
+                Ok(Ok(info)) => {
                     shared.counters.sent.fetch_add(1, Ordering::Relaxed);
-                    let _ = done.send(Ok(id));
+                    let _ = done.send(Ok(info));
                     None
                 }
                 Ok(Err(e)) if is_unknown_token(&e) => Some(SeatCmd::Send { to, content, done }),
@@ -702,14 +710,31 @@ async fn send_one(
     agent: &AgentClient,
     to: &SendTo,
     content: matrix_sdk::ruma::events::room::message::RoomMessageEventContent,
-) -> Result<String> {
-    match to {
+) -> Result<SentInfo> {
+    let (event_id, room_id) = match to {
         SendTo::Dm(mxid) => {
             ensure_dm_ready(agent, mxid).await?;
-            agent.send_dm_content(mxid, content).await
+            let id = agent.send_dm_content(mxid, content).await?;
+            (id, agent.dm_room_id(mxid).await.ok().flatten())
         }
-        SendTo::Room(room_id) => agent.send_content_to_room(room_id, content).await,
-    }
+        SendTo::Room(room_id) => (
+            agent.send_content_to_room(room_id, content).await?,
+            Some(room_id.clone()),
+        ),
+    };
+    let encrypted = match room_id
+        .as_deref()
+        .and_then(|r| <&matrix_sdk::ruma::RoomId>::try_from(r).ok())
+        .and_then(|rid| agent.client().get_room(rid))
+    {
+        Some(room) => room
+            .latest_encryption_state()
+            .await
+            .map(|s| s.is_encrypted())
+            .unwrap_or(false),
+        None => false,
+    };
+    Ok(SentInfo { event_id, encrypted })
 }
 
 /// Create the DM with `mxid` if there is none and wait (bounded) for the peer

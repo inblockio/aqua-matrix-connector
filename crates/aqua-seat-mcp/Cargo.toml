@@ -22,6 +22,15 @@ path = "src/bin/listen.rs"
 name = "aqua-seat-stress"
 path = "src/bin/stress.rs"
 
+[features]
+# Live end-to-end tests against dev.matrix.inblock.io (state in ~/.local/state/claude-seats).
+e2e = []
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+required-features = ["e2e"]
+
 [dependencies]
 aqua-messenger.workspace = true
 tokio.workspace = true

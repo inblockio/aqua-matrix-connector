@@ -530,15 +530,7 @@ impl Daemon {
         reply_to: Option<&str>,
         mention: Option<&Value>,
     ) -> Result<Value, String> {
-        if text.trim().is_empty() {
-            return Err("empty message".into());
-        }
-        if text.len() > MAX_MESSAGE_BYTES {
-            return Err(format!(
-                "message is {} bytes; the cap is {MAX_MESSAGE_BYTES}",
-                text.len()
-            ));
-        }
+        check_text(text)?;
         let e = self.attach(seat, true).await?;
         let sh = &e.shared;
         let own = sh.mxid().ok_or("the seat has no Matrix identity yet")?;
@@ -626,17 +618,13 @@ impl Daemon {
                 _ => r.clone(),
             },
         };
-        {
-            let mut rl = sh.rate.lock().unwrap();
-            if let Err(wait) = rl.try_acquire(&key, Instant::now()) {
-                return Err(format!(
-                    "rate limit: at most {} sends per {} s to the same recipient; retry in {} s",
-                    self.cfg.rate_count,
-                    self.cfg.rate_window.as_secs(),
-                    wait.as_secs() + 1
-                ));
-            }
-        }
+        acquire_budget(
+            &mut sh.rate.lock().unwrap(),
+            &key,
+            Instant::now(),
+            self.cfg.rate_count,
+            self.cfg.rate_window,
+        )?;
         let (tx, rx) = oneshot::channel();
         let sent = async {
             self.send_cmd(&e, SeatCmd::Send { to: dest, content: Box::new(content), done: tx }).await?;
@@ -648,10 +636,11 @@ impl Daemon {
         }
         .await;
         match sent {
-            Ok(event_id) => {
+            Ok(info) => {
                 let remaining = sh.rate.lock().unwrap().remaining(&key, Instant::now());
                 Ok(json!({
-                    "event_id": event_id,
+                    "event_id": info.event_id,
+                    "encrypted": info.encrypted,
                     "via": via,
                     "to": target.as_ref().map(|p| json!({"seat": p.seat, "did": p.did, "host": p.host, "mxid": p.mxid})),
                     "sends_left_to_this_recipient": remaining,
@@ -700,6 +689,37 @@ impl Daemon {
     }
 }
 
+/// Take one send from the recipient's budget, or say when the next is free.
+pub fn acquire_budget(
+    rl: &mut aqua_messenger::ratelimit::RateLimiter,
+    key: &str,
+    now: Instant,
+    count: usize,
+    window: Duration,
+) -> Result<(), String> {
+    rl.try_acquire(key, now).map_err(|wait| {
+        format!(
+            "rate limit: at most {count} sends per {} s to the same recipient; retry in {} s",
+            window.as_secs(),
+            wait.as_secs() + 1
+        )
+    })
+}
+
+/// The size cap on an outgoing message.
+pub fn check_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("empty message".into());
+    }
+    if text.len() > MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "message is {} bytes; the cap is {MAX_MESSAGE_BYTES}",
+            text.len()
+        ));
+    }
+    Ok(())
+}
+
 fn items_json(items: &[Item], note: &str) -> Value {
     let direct = items.iter().filter(|i| i.direct).count();
     let unread_hint = format!("{} entries ({} direct); {note}", items.len(), direct);
@@ -709,3 +729,35 @@ fn items_json(items: &[Item], note: &str) -> Value {
 /// Keep `Via` linked for docs.
 #[allow(dead_code)]
 fn _via(_: Via) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aqua_messenger::ratelimit::RateLimiter;
+
+    #[test]
+    fn twenty_sends_per_ten_minutes_per_recipient_then_refused() {
+        let (count, window) = (aqua_seat::proto::RATE_LIMIT_COUNT, Duration::from_secs(aqua_seat::proto::RATE_LIMIT_WINDOW_SECS));
+        assert_eq!((count, window.as_secs()), (20, 600));
+        let mut rl = RateLimiter::new(count, window);
+        let t0 = Instant::now();
+        for i in 0..20 {
+            acquire_budget(&mut rl, "@b:x", t0, count, window).unwrap_or_else(|e| panic!("send {i}: {e}"));
+        }
+        let e = acquire_budget(&mut rl, "@b:x", t0, count, window).unwrap_err();
+        assert!(e.contains("rate limit") && e.contains("20 sends per 600"), "{e}");
+        // another recipient has its own budget
+        acquire_budget(&mut rl, "@c:x", t0, count, window).unwrap();
+        // and the window recovers
+        acquire_budget(&mut rl, "@b:x", t0 + window, count, window).unwrap();
+    }
+
+    #[test]
+    fn message_size_cap_is_20_kb() {
+        check_text("hello").unwrap();
+        check_text(&"x".repeat(20_000)).unwrap();
+        let e = check_text(&"x".repeat(20_001)).unwrap_err();
+        assert!(e.contains("cap"), "{e}");
+        assert!(check_text("  \n ").is_err());
+    }
+}
