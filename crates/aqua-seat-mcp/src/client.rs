@@ -15,6 +15,8 @@ use crate::proto::{encode_line, Request, Response};
 
 /// Timeout for requests that answer at once.
 pub const QUICK_TIMEOUT: Duration = Duration::from_secs(150);
+/// A socket that does not accept within this is treated as unreachable.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Env var that stops front ends starting `aqua-seatd` themselves.
 pub const NO_SPAWN_ENV: &str = "CLAUDE_SEATS_NO_SPAWN";
 
@@ -36,6 +38,12 @@ impl SeatClient {
             sock: paths::sock_path(),
             spawn: std::env::var_os(NO_SPAWN_ENV).is_none(),
         }
+    }
+
+    /// Never start the daemon from this client (hooks: a hook must not spawn or wait).
+    pub fn without_spawn(mut self) -> Self {
+        self.spawn = false;
+        self
     }
 
     pub fn sock(&self) -> &Path {
@@ -81,31 +89,32 @@ impl SeatClient {
     }
 
     async fn connect(&self) -> Result<UnixStream, String> {
-        match UnixStream::connect(&self.sock).await {
-            Ok(s) => Ok(s),
-            Err(first) => {
-                if !self.spawn {
-                    return Err(self.unreachable(&first));
-                }
-                spawn_daemon(&self.sock).map_err(|e| {
-                    format!(
-                        "{}; starting aqua-seatd failed too: {e}",
-                        self.unreachable(&first)
-                    )
-                })?;
-                for _ in 0..100 {
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    if let Ok(s) = UnixStream::connect(&self.sock).await {
-                        return Ok(s);
-                    }
-                }
-                Err(format!(
-                    "{} (started aqua-seatd, but it did not open the socket within 15s; see {})",
-                    self.unreachable(&first),
-                    paths::state_root().join("seatd.log").display()
-                ))
+        let first = match tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.sock)).await
+        {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => e,
+            Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"),
+        };
+        if !self.spawn {
+            return Err(self.unreachable(&first));
+        }
+        spawn_daemon(&self.sock).map_err(|e| {
+            format!(
+                "{}; starting aqua-seatd failed too: {e}",
+                self.unreachable(&first)
+            )
+        })?;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if let Ok(s) = UnixStream::connect(&self.sock).await {
+                return Ok(s);
             }
         }
+        Err(format!(
+            "{} (started aqua-seatd, but it did not open the socket within 15s; see {})",
+            self.unreachable(&first),
+            paths::state_root().join("seatd.log").display()
+        ))
     }
 
     fn unreachable(&self, e: &std::io::Error) -> String {

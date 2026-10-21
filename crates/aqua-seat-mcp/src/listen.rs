@@ -168,7 +168,7 @@ pub async fn run(client: &SeatClient, seat: &str, timeout_secs: u64) -> Outcome 
             seat: seat.to_string(),
             timeout_secs: poll,
         };
-        match client.call(&req, Duration::from_secs(poll + 200)).await {
+        match client.call(&req, Duration::from_secs(poll + 30)).await {
             Ok(data) => {
                 failures = 0;
                 if let Some(w) = parse_listen(&data) {
@@ -186,21 +186,66 @@ pub async fn run(client: &SeatClient, seat: &str, timeout_secs: u64) -> Outcome 
     }
 }
 
+/// How long `--nudge` may take in all: it runs before every prompt.
+pub const NUDGE_TIMEOUT: Duration = Duration::from_secs(1);
+/// After a failed nudge the daemon is not asked again for this long, so a wedged
+/// `aqua-seatd` costs one slow prompt a minute, not every prompt.
+pub const NUDGE_BREAKER: Duration = Duration::from_secs(60);
+
 /// The count for `--nudge`; any failure counts as zero (a hook must never
-/// break the prompt).
+/// break or delay the prompt).
 pub async fn unread_count(client: &SeatClient, seat: &str) -> usize {
-    match client
+    unread_count_checked(client, seat).await.unwrap_or(0)
+}
+
+/// Like [`unread_count`], but says when the daemon could not answer.
+pub async fn unread_count_checked(client: &SeatClient, seat: &str) -> Result<usize, String> {
+    client
         .call(
             &Request::Unread {
                 seat: seat.to_string(),
             },
-            Duration::from_secs(20),
+            NUDGE_TIMEOUT,
         )
         .await
-    {
-        Ok(d) => d["unread_direct"].as_u64().unwrap_or(0) as usize,
-        Err(_) => 0,
+        .map(|d| d["unread_direct"].as_u64().unwrap_or(0) as usize)
+}
+
+/// Is the nudge breaker open (a nudge failed within [`NUDGE_BREAKER`])?
+pub fn nudge_breaker_open() -> bool {
+    std::fs::metadata(crate::paths::state_root().join("nudge.fail"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < NUDGE_BREAKER)
+}
+
+/// Open the breaker (touch the marker).
+pub fn trip_nudge_breaker() {
+    let _ = std::fs::write(crate::paths::state_root().join("nudge.fail"), b"");
+}
+
+/// A hook that fails writes one line here and exits 0: a seat problem must
+/// never reach the session. The file is capped (rotated once at 64 KiB).
+pub fn log_hook_failure(seat: &str, what: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = crate::paths::state_root();
+    let path = dir.join("hook.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 64 * 1024).unwrap_or(false) {
+        let _ = std::fs::rename(&path, dir.join("hook.log.1"));
     }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let what: String = what.chars().filter(|c| !c.is_control()).take(300).collect();
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "ts={ts} seat={seat} {what}"));
 }
 
 #[cfg(test)]
@@ -369,5 +414,33 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let c = SeatClient::new(t.path().join("nothing.sock"));
         assert_eq!(unread_count(&c, "seat-x").await, 0);
+    }
+
+    #[tokio::test]
+    async fn nudge_gives_up_on_a_hung_daemon_within_its_budget() {
+        let t = tempfile::tempdir().unwrap();
+        let sock = t.path().join("hung.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                keep.push(s); // accept and never answer
+            }
+        });
+        let t0 = Instant::now();
+        assert_eq!(unread_count(&SeatClient::new(sock), "seat-x").await, 0);
+        assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_client_without_spawn_fails_at_once_when_nothing_listens() {
+        let t = tempfile::tempdir().unwrap();
+        let c = SeatClient::new(t.path().join("nothing.sock")).without_spawn();
+        let t0 = Instant::now();
+        let r = c
+            .call(&Request::Unread { seat: "seat-x".into() }, NUDGE_TIMEOUT)
+            .await;
+        assert!(r.is_err());
+        assert!(t0.elapsed() < Duration::from_secs(2));
     }
 }
