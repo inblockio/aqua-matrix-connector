@@ -628,25 +628,30 @@ impl Daemon {
             tokio::pin!(notified);
             notified.as_mut().enable();
             e.shared.touch();
-            let next = {
-                let mut st = e.shared.store.lock().unwrap();
-                let n = st.next_unannounced_direct();
-                if let Some(x) = &n {
-                    st.advance_listen_cursor(x.seq);
-                }
-                n
-            };
-            if let Some(entry) = next {
+            // Peek first, then look up the sender, and only then advance the cursor in one step with
+            // no await in between: a dropped request (its client left) must never have taken the wake.
+            let peeked = e.shared.store.lock().unwrap().next_unannounced_direct();
+            if let Some(entry) = peeked {
                 let peers = self.peers_best_effort(e, Duration::from_secs(30)).await;
-                let items = e.shared.store.lock().unwrap().items(&[entry], &peers);
-                let it = &items[0];
-                return Ok(json!({
-                    "found": true,
-                    "seq": it.seq, "event_id": it.event_id, "ts_ms": it.ts_ms,
-                    "via": it.via, "from_mxid": it.from_mxid,
-                    "from_seat": it.from_seat, "from_did": it.from_did, "from_host": it.from_host,
-                    "body": it.body,
-                }));
+                let item = {
+                    let mut st = e.shared.store.lock().unwrap();
+                    if st.listen_cursor() >= entry.seq {
+                        None // another listener took it while we looked up the sender
+                    } else {
+                        st.advance_listen_cursor(entry.seq);
+                        st.items(&[entry], &peers).into_iter().next()
+                    }
+                };
+                if let Some(it) = item {
+                    return Ok(json!({
+                        "found": true,
+                        "seq": it.seq, "event_id": it.event_id, "ts_ms": it.ts_ms,
+                        "via": it.via, "from_mxid": it.from_mxid,
+                        "from_seat": it.from_seat, "from_did": it.from_did, "from_host": it.from_host,
+                        "body": it.body,
+                    }));
+                }
+                continue;
             }
             tokio::select! {
                 _ = &mut notified => {}
