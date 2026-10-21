@@ -168,7 +168,10 @@ pub async fn run(client: &SeatClient, seat: &str, timeout_secs: u64) -> Outcome 
             seat: seat.to_string(),
             timeout_secs: poll,
         };
-        match client.call(&req, Duration::from_secs(poll + 30)).await {
+        // The daemon attaches the seat first (up to its 180 s attach timeout) and then polls: a
+        // shorter deadline would hang up on a wake it is about to consume. Unreachable and hung
+        // daemons are bounded elsewhere (1 s connect; the hook is async, never on the start path).
+        match client.call(&req, Duration::from_secs(poll + 200)).await {
             Ok(data) => {
                 failures = 0;
                 if let Some(w) = parse_listen(&data) {
@@ -226,24 +229,26 @@ pub fn trip_nudge_breaker() {
 }
 
 /// A hook that fails writes one line here and exits 0: a seat problem must
-/// never reach the session. The file is capped (rotated once at 64 KiB).
+/// never reach the session. The file is capped: past 64 KiB the next writer
+/// truncates it (concurrent hooks may lose a few lines, never the file's role).
 pub fn log_hook_failure(seat: &str, what: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let dir = crate::paths::state_root();
-    let path = dir.join("hook.log");
-    if std::fs::metadata(&path).map(|m| m.len() > 64 * 1024).unwrap_or(false) {
-        let _ = std::fs::rename(&path, dir.join("hook.log.1"));
-    }
+    let path = crate::paths::state_root().join("hook.log");
+    let over = std::fs::metadata(&path).map(|m| m.len() > 64 * 1024).unwrap_or(false);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let what: String = what.chars().filter(|c| !c.is_control()).take(300).collect();
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).mode(0o600);
+    if over {
+        o.write(true).truncate(true);
+    } else {
+        o.append(true);
+    }
+    let _ = o
         .open(&path)
         .and_then(|mut f| writeln!(f, "ts={ts} seat={seat} {what}"));
 }
