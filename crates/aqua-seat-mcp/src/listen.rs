@@ -152,7 +152,16 @@ pub fn acquire_lock(paths: &SeatPaths) -> std::io::Result<Lock> {
 /// Long-poll the daemon until a direct address arrives, `timeout_secs` pass
 /// (0 = no limit) or the daemon cannot be reached.
 pub async fn run(client: &SeatClient, seat: &str, timeout_secs: u64) -> Outcome {
+    run_with(client, seat, timeout_secs, false).await
+}
+
+/// [`run`], optionally `patient`: an unreachable daemon is waited out (retry every
+/// 5 s until the budget is spent) instead of ending in an error after three tries.
+/// Hooks are patient so an idle session stays reachable across a daemon restart;
+/// the first failure of an outage goes to `hook.log`, not every retry.
+pub async fn run_with(client: &SeatClient, seat: &str, timeout_secs: u64, patient: bool) -> Outcome {
     let t0 = Instant::now();
+    let mut logged = false;
     let mut failures = 0u32;
     loop {
         let left = if timeout_secs == 0 {
@@ -174,9 +183,17 @@ pub async fn run(client: &SeatClient, seat: &str, timeout_secs: u64) -> Outcome 
         match client.call(&req, Duration::from_secs(poll + 200)).await {
             Ok(data) => {
                 failures = 0;
+                logged = false;
                 if let Some(w) = parse_listen(&data) {
                     return Outcome::Wake(w);
                 }
+            }
+            Err(e) if patient => {
+                if !logged {
+                    log_hook_failure(seat, &format!("listen: {e}; retrying"));
+                    logged = true;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
                 failures += 1;
@@ -447,5 +464,28 @@ mod tests {
             .await;
         assert!(r.is_err());
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_patient_listener_waits_out_a_daemon_restart() {
+        let t = tempfile::tempdir().unwrap();
+        let sock = t.path().join("late.sock");
+        let late = sock.clone();
+        // the daemon comes back after 6 s (longer than three non-patient tries)
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let l = UnixListener::bind(&late).unwrap();
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut line = String::new();
+                BufReader::new(&mut s).read_line(&mut line).await.unwrap();
+                let r = Response::ok(json!({"found": true, "from_seat": "peer", "from_did": "did:key:z6Mkx", "from_mxid": "@p:x", "event_id": "$e", "ts_ms": 1, "body": "hi"}));
+                s.write_all(encode_line(&r).as_bytes()).await.unwrap();
+            }
+        });
+        let c = SeatClient::new(sock).without_spawn();
+        let o = tokio::time::timeout(Duration::from_secs(30), run_with(&c, "seat-x", 60, true))
+            .await
+            .unwrap();
+        assert!(matches!(o, Outcome::Wake(_)), "{o:?}");
     }
 }

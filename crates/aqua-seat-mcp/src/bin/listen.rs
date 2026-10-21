@@ -98,7 +98,7 @@ async fn main() {
         }
     };
 
-    let outcome = listen::run(&client, &seat, args.timeout).await;
+    let outcome = listen::run_with(&client, &seat, args.timeout, hook).await;
     match &outcome {
         Outcome::Wake(w) => {
             let [a, b] = listen::stderr_lines(w);
