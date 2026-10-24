@@ -13,6 +13,8 @@ mod deliver;
 #[cfg(test)]
 mod delivery_red_tests;
 #[cfg(test)]
+mod delivery_tests;
+#[cfg(test)]
 mod fake_hs;
 pub mod obligation;
 pub mod net_retry;

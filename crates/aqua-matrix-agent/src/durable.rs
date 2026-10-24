@@ -773,4 +773,214 @@ mod tests {
         let j2 = WorkJournal::load_or_empty(&dir);
         assert!(j2.is_empty());
     }
+
+    // ---- obligation journal ------------------------------------------------
+
+    use crate::ManualClock;
+
+    fn journal_at(dir: &Path, clock: &Arc<ManualClock>) -> WorkJournal {
+        WorkJournal::load_with(dir, clock.clone(), ObligationPolicy::default())
+    }
+
+    const MIN: u64 = 60_000;
+
+    /// A journal the current binary wrote loads in the old binary's item shape
+    /// (no `deny_unknown_fields`), with `state` meaning what it always did.
+    #[test]
+    fn old_binary_reads_a_journal_carrying_obligations() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreObligationWorkItem {
+            event_id: String,
+            room_id: String,
+            ts_ms: u64,
+            msgtype: String,
+            body: String,
+            state: WorkState,
+            #[serde(default)]
+            sender: Option<String>,
+        }
+        let dir = tmp_dir("old-reads-new");
+        let clock = Arc::new(ManualClock::new(1));
+        let j = journal_at(&dir, &clock);
+        j.enqueue(item("$a"));
+        j.enqueue(item("$b"));
+        j.set_to_deliver("$b", "answer");
+        j.record_post("$b", 0, "$posted", false);
+        let json = std::fs::read_to_string(dir.join(WorkJournal::FILE_NAME)).unwrap();
+        let old: Vec<PreObligationWorkItem> = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.len(), 2);
+        assert_eq!(old[0].state, WorkState::Pending);
+        assert_eq!(old[1].state, WorkState::ToDeliver { text: "answer".into() });
+    }
+
+    /// A journal from before obligations: every item loads as an open
+    /// obligation received at its own `ts_ms`, so the watchdog sees its age.
+    #[test]
+    fn legacy_journal_items_become_obligations_received_at_ts() {
+        let dir = tmp_dir("legacy-ob");
+        std::fs::write(
+            dir.join(WorkJournal::FILE_NAME),
+            r#"[{"event_id":"$old","room_id":"!r:s","ts_ms":7000,"msgtype":"m.text","body":"q","state":"Pending"}]"#,
+        )
+        .unwrap();
+        let clock = Arc::new(ManualClock::new(7000 + 6 * MIN));
+        let j = journal_at(&dir, &clock);
+        assert_eq!(j.phase("$old"), Some(Phase::Open));
+        assert_eq!(j.get("$old").unwrap().obligation.unwrap().received_at_ms, 7000);
+        assert_eq!(j.open_stats(), (1, 6 * MIN));
+        // Past its answer deadline with no turn: re-engaged.
+        assert!(matches!(j.sweep()[..], [SweepAction::Reengage { attempt: 1, .. }]));
+    }
+
+    /// T3: the process dies mid-turn. The next process finds the obligation in
+    /// the journal with no turn running (that flag is never persisted), hands
+    /// it back to the handler, and keeps the attempt count.
+    #[test]
+    fn t3_restart_reengages_an_open_obligation() {
+        let dir = tmp_dir("t3");
+        let clock = Arc::new(ManualClock::new(100));
+        {
+            let j = journal_at(&dir, &clock);
+            j.enqueue(item("$mid-turn"));
+            assert!(j.begin_turn("$mid-turn"));
+            assert!(j.startable_work().is_empty(), "this process is running it");
+        } // killed
+        let j2 = journal_at(&dir, &clock);
+        let again = j2.startable_work();
+        assert_eq!(again.len(), 1, "the obligation was lost");
+        assert_eq!(again[0].event_id, "$mid-turn");
+        assert_eq!(again[0].obligation.as_ref().unwrap().attempts, 1);
+        assert!(j2.begin_turn("$mid-turn"));
+        assert_eq!(j2.get("$mid-turn").unwrap().obligation.unwrap().attempts, 2);
+    }
+
+    #[test]
+    fn begin_turn_is_exclusive_and_end_turn_releases_it() {
+        let dir = tmp_dir("turns");
+        let j = journal_at(&dir, &Arc::new(ManualClock::new(0)));
+        j.enqueue(item("$a"));
+        assert!(j.begin_turn("$a"));
+        assert!(!j.begin_turn("$a"), "one turn at a time");
+        j.end_turn("$a");
+        assert_eq!(j.startable_work().len(), 1);
+        assert!(!j.begin_turn("$gone"));
+    }
+
+    /// The watchdog table with a fake clock (defaults: answer 5 min, fallback 10).
+    #[test]
+    fn sweep_liveness_once_then_reengage_twice_then_fallback() {
+        let dir = tmp_dir("sweep");
+        let clock = Arc::new(ManualClock::new(0));
+        let j = journal_at(&dir, &clock);
+        j.enqueue(item("$a"));
+        assert!(j.begin_turn("$a"));
+
+        clock.set(5 * MIN - 1);
+        assert!(j.sweep().is_empty(), "before the answer deadline: nothing");
+        clock.set(5 * MIN);
+        assert!(matches!(j.sweep()[..], [SweepAction::Liveness { .. }]));
+        assert!(j.sweep().is_empty(), "liveness is posted once");
+
+        // The turn dies (no answer): re-engage, at most twice.
+        j.end_turn("$a");
+        assert!(matches!(j.sweep()[..], [SweepAction::Reengage { attempt: 1, .. }]));
+        assert!(j.begin_turn("$a"));
+        j.end_turn("$a");
+        assert!(matches!(j.sweep()[..], [SweepAction::Reengage { attempt: 2, .. }]));
+        assert!(j.begin_turn("$a"));
+        j.end_turn("$a");
+        let a = j.sweep();
+        assert!(
+            matches!(a[..], [SweepAction::Fallback { notify_operator: true, unsupported: false, .. }]),
+            "{a:?}"
+        );
+        // Repeated until it is posted; the operator is told once.
+        j.mark_operator_notified("$a");
+        assert!(matches!(
+            j.sweep()[..],
+            [SweepAction::Fallback { notify_operator: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn sweep_falls_back_at_ten_minutes_even_if_a_turn_still_runs() {
+        let dir = tmp_dir("sweep10");
+        let clock = Arc::new(ManualClock::new(0));
+        let j = journal_at(&dir, &clock);
+        j.enqueue(item("$a"));
+        j.begin_turn("$a");
+        clock.set(10 * MIN);
+        assert!(matches!(j.sweep()[..], [SweepAction::Fallback { .. }]));
+    }
+
+    #[test]
+    fn unsupported_message_gets_its_fallback_at_once_and_no_turn() {
+        let dir = tmp_dir("unsupported");
+        let j = journal_at(&dir, &Arc::new(ManualClock::new(0)));
+        j.enqueue(item("$odd"));
+        j.mark_unsupported("$odd");
+        assert!(j.startable_work().is_empty(), "no turn can answer it");
+        assert!(matches!(
+            j.sweep()[..],
+            [SweepAction::Fallback { unsupported: true, notify_operator: false, .. }]
+        ));
+    }
+
+    /// Close on proof: a recorded-but-unproven post keeps the obligation open
+    /// and the sweep only verifies (never re-runs or re-posts) it; the echo, by
+    /// event id or by transaction id, closes it.
+    #[test]
+    fn unproven_post_is_verified_not_rerun_and_the_echo_closes_it() {
+        let dir = tmp_dir("proof");
+        let clock = Arc::new(ManualClock::new(0));
+        let j = journal_at(&dir, &clock);
+        j.enqueue(item("$a"));
+        j.declare_chunks("$a", PostKind::Answer, 1);
+        assert!(!j.record_post("$a", 0, "$mine", false));
+        assert_eq!(j.phase("$a"), Some(Phase::Answered { event_id: "$mine".into() }));
+        clock.set(11 * MIN);
+        assert!(matches!(j.sweep()[..], [SweepAction::Verify { .. }]));
+        assert_eq!(j.unproven_posts(), vec![("$a".into(), 0, "$mine".into())]);
+        assert!(j.observe_own_event("$unrelated", None).is_empty());
+        assert_eq!(j.observe_own_event("$mine", None), vec!["$a".to_string()]);
+        assert!(j.is_empty());
+
+        // By transaction id when the response (and so the event id) was lost.
+        j.enqueue(item("$b"));
+        j.declare_chunks("$b", PostKind::Answer, 1);
+        assert_eq!(
+            j.observe_own_event("$echo", Some(&crate::txn_id("$b", 0))),
+            vec!["$b".to_string()]
+        );
+        assert!(j.is_empty());
+    }
+
+    #[test]
+    fn multi_chunk_answer_closes_only_when_every_chunk_is_proven() {
+        let dir = tmp_dir("chunks");
+        let j = journal_at(&dir, &Arc::new(ManualClock::new(0)));
+        j.enqueue(item("$a"));
+        j.declare_chunks("$a", PostKind::Answer, 2);
+        j.record_post("$a", 0, "$c0", true);
+        assert!(j.contains("$a"), "chunk 1 still owed");
+        j.record_post("$a", 1, "$c1", true);
+        assert!(!j.contains("$a"));
+    }
+
+    #[test]
+    fn obligation_state_survives_a_restart() {
+        let dir = tmp_dir("persist-ob");
+        let clock = Arc::new(ManualClock::new(50));
+        {
+            let j = journal_at(&dir, &clock);
+            j.enqueue(item("$a"));
+            j.begin_turn("$a");
+            j.record_post("$a", 0, "$posted", false);
+        }
+        let o = journal_at(&dir, &clock).get("$a").unwrap().obligation.unwrap();
+        assert_eq!((o.received_at_ms, o.attempts), (50, 1));
+        assert_eq!(o.posts[&0].event_id, "$posted");
+        assert!(o.turn_started_ms.is_none());
+    }
 }
