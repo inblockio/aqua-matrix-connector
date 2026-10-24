@@ -59,6 +59,8 @@ N1  No deploy of its own: it lands on main and ships with the next regular fleet
 N2  No "seen" guarantee: delivered means in the room timeline, not read or decrypted on the peer device.
 N3  No change to the single-peer firewall or to who may talk to an agent.
 N4  Paige's broker outbox moves onto the journal in the Paige track (after rebasing its branch), not here.
+N5  Scribe's call-room broadcasts are not obligations (they answer no peer message); Scribe's replies to
+    peers who message it are.
 ```
 
 ## Hypotheses
@@ -86,3 +88,30 @@ D3  (Tim, 2026-10-24) "ensure you're doing the automated tests required to quali
     script above runs as automated tests, plus each repo's CI and its integration harness where one
     exists.
 ```
+
+## Spike S0 (2026-10-24, connector 4ee7c96, aqua-agents bee500f)
+
+H0 FALSIFIED: the consultants share `run_daemon` + relay; Scribe (`aqua_transcript_agent.rs`, crate
+aqua-call-agent) runs its own `sync_once` poll loop with no handler and no journal, and many `.ok()` sends.
+Design adjustment (loop decision, within D1): the obligation journal, txn ids and own-event closing live
+in `aqua-matrix-agent` (`WorkItem`/`WorkJournal`, `AgentClient`), callable from `run_daemon` and from
+Scribe's loop. H1 partly confirmed: matrix-sdk 0.17 `Room::send(..).with_transaction_id(..)` exists and
+is unused; `retry_finalize` (lib.rs:2574) mints a fresh id per retry, so a lost response duplicates today;
+rotation keeps the device except on the store-wipe path. H2 confirmed with gaps (backfill cap of 4 pages,
+undecryptable pre-wipe events): close on the echo OR on the send response confirmed by an event fetch.
+H3 partly confirmed: the raw-TCP fake homeserver (lib.rs:4133) and a fake `claude` make T1 to T5 hermetic.
+Silent-drop paths on main to close: watermark advanced before enqueue (relay lib.rs:1672); ts <= watermark
+drops out-of-order events (:1636); unknown msgtypes vanish (:1660); replay once per process (:677);
+`reply_text == None` marked delivered (claude-p main.rs:787); IDLE_TIMEOUT error text; Scribe `.ok()`.
+Qualification: no connector CI; aqua-agents CI runs only aqua-call-agent and aqua-agent-refs: add claude-p
+and template to ci.yml; quote clean-checkout runs in each PR.
+
+## Plan (tier H, budget 60M, checkpoint per issue)
+
+| ID | What | Repo | Depends |
+|---|---|---|---|
+| GD-1 | Obligation journal, deterministic txn ids on every reliable send (fixes retry_finalize), close on echo or confirmed send, watchdog sweep API with injected clock, the relay silent-drop fixes, fake homeserver 502 and lost-response modes; tests T2, T3, T6 | connector | S0 |
+| GD-2 | claude-p on the obligation API: re-engage re-runs the turn, IDLE_TIMEOUT -> liveness + re-engage, no-reply -> re-engage/fallback, fallback + operator DM, status file (open count, oldest age); fake claude for T1, T4; CI job adds claude-p + template | aqua-agents | GD-1 |
+| GD-3 | Scribe: peer-message replies through the journal and reliable sends (no `.ok()` on peer replies) | aqua-agents | GD-1 |
+| GD-A | Fresh Opus audit + grok on GD-1..3, fix wave, re-audit of the fixed findings | both | GD-2, GD-3 |
+| GD-M | PRs with clean-checkout evidence; merge connector first, then aqua-agents; no fleet roll (D2) | both | GD-A |
