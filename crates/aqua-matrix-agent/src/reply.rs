@@ -130,6 +130,7 @@ impl crate::AgentClient {
         let room = self.joined_room(room_id)?;
         let thread_root = reply.and_then(|r| r.thread_root.clone());
         let mut last = String::new();
+        let key = crate::fresh_send_key();
         for (i, chunk) in crate::split_for_matrix(message, crate::STREAM_ROLLOVER_BYTES)
             .into_iter()
             .enumerate()
@@ -139,12 +140,13 @@ impl crate::AgentClient {
                 (0, None) => None,
                 _ => continuation_relation(thread_root.as_deref(), &last)?,
             };
-            last = crate::retry_finalize("send-room-reply", || {
+            last = crate::retry_finalize("send-room-reply", crate::keyed_txn_id(&key, i as u32), |txn| {
                 let content = markdown_with(&chunk, relation.clone());
                 let room = room.clone();
                 async move {
                     let resp = room
                         .send(content)
+                        .with_transaction_id(matrix_sdk::ruma::OwnedTransactionId::from(txn))
                         .await
                         .context("failed to send room message")?;
                     Ok(resp.response.event_id.to_string())

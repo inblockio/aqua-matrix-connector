@@ -21,7 +21,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+
+use crate::obligation::{
+    Clock, Obligation, ObligationPolicy, Phase, PostKind, SweepAction, SystemClock,
+};
 
 /// State of a [`WorkItem`] in its lifecycle. `Pending` means the handler still
 /// owes an answer (a restart must re-run it); `ToDeliver` means the answer/error
@@ -56,6 +62,23 @@ pub struct WorkItem {
     /// as sent by `target`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
+    /// Obligation state of the accepted peer message (deadline, attempts, posted
+    /// event ids; see [`crate::obligation`]). `None` is a legacy item: the
+    /// journal fills it in on load, so every item reaches the sweep with one.
+    ///
+    /// Compatibility, both directions. NEW reads OLD: absent field, defaults
+    /// apply (`serde(default)`), the item becomes an open obligation received
+    /// at its `ts_ms`. OLD reads NEW: the old `WorkItem` has no
+    /// `deny_unknown_fields`, so a journal carrying this field still loads and
+    /// `state` still means what it did (`Pending` = re-run, `ToDeliver` =
+    /// resend); the old binary drops the field on its next rewrite, which only
+    /// costs the obligation bookkeeping (attempts, posted ids): its resend then
+    /// uses a random transaction id, so a rollback while an answer is posted
+    /// but unproven can duplicate that one answer. `state` is deliberately NOT
+    /// extended with new variants: an old binary could not parse them and
+    /// would start with an EMPTY journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation: Option<Obligation>,
 }
 
 /// Durable, process-shared journal of [`WorkItem`]s for one target. Cloneable via
@@ -63,6 +86,8 @@ pub struct WorkItem {
 pub struct WorkJournal {
     path: PathBuf,
     items: Mutex<Vec<WorkItem>>,
+    clock: Arc<dyn Clock>,
+    policy: ObligationPolicy,
 }
 
 impl WorkJournal {
@@ -73,6 +98,12 @@ impl WorkJournal {
     /// rather than crashing the daemon — the worst case is replaying nothing,
     /// never a crash loop.
     pub fn load_or_empty(store_dir: &Path) -> Self {
+        Self::load_with(store_dir, Arc::new(SystemClock), ObligationPolicy::default())
+    }
+
+    /// [`load_or_empty`](Self::load_or_empty) with an injected clock and policy
+    /// (tests; a caller with other deadlines).
+    pub fn load_with(store_dir: &Path, clock: Arc<dyn Clock>, policy: ObligationPolicy) -> Self {
         let path = store_dir.join(Self::FILE_NAME);
         let items = match std::fs::read_to_string(&path) {
             Ok(s) => match serde_json::from_str::<Vec<WorkItem>>(&s) {
@@ -96,10 +127,23 @@ impl WorkJournal {
             },
             Err(_) => Vec::new(),
         };
+        let mut items = items;
+        for it in items.iter_mut() {
+            if it.obligation.is_none() {
+                it.obligation = Some(Obligation::open(it.ts_ms, &policy));
+            }
+        }
         Self {
             path,
             items: Mutex::new(items),
+            clock,
+            policy,
         }
+    }
+
+    /// The policy (deadlines, fallback texts) this journal sweeps with.
+    pub fn policy(&self) -> &ObligationPolicy {
+        &self.policy
     }
 
     /// Atomic best-effort write: temp file + rename in the same dir, so a crash
@@ -122,10 +166,13 @@ impl WorkJournal {
     /// Append a new `Pending` item. Idempotent: a duplicate `event_id` (the relay
     /// re-seeing the same event, or a startup replay racing a fresh sync) is
     /// ignored. Returns `true` if it was newly enqueued.
-    pub fn enqueue(&self, item: WorkItem) -> bool {
+    pub fn enqueue(&self, mut item: WorkItem) -> bool {
         let mut items = self.items.lock().unwrap();
         if items.iter().any(|i| i.event_id == item.event_id) {
             return false;
+        }
+        if item.obligation.is_none() {
+            item.obligation = Some(Obligation::open(self.clock.now_ms(), &self.policy));
         }
         items.push(item);
         Self::persist(&self.path, &items);
@@ -140,6 +187,9 @@ impl WorkJournal {
             it.state = WorkState::ToDeliver {
                 text: text.to_string(),
             };
+            if let Some(o) = it.obligation.as_mut() {
+                o.turn_started_ms = None;
+            }
             Self::persist(&self.path, &items);
         }
     }
@@ -177,6 +227,309 @@ impl WorkJournal {
             .collect()
     }
 
+
+    // ---------------------------------------------------------------------
+    // Obligation API. One concept over the same items: an accepted peer
+    // message is OWED a delivered answer or a delivered fallback; it leaves the
+    // journal (closed) only on proof the agent's own post reached the room.
+    // ---------------------------------------------------------------------
+
+    /// Run `f` on the item `event_id`, persist if it returns `true`, and close
+    /// (remove) the item when its obligation is settled. `None` if absent.
+    fn with_item<R>(
+        &self,
+        event_id: &str,
+        f: impl FnOnce(&mut WorkItem, u64) -> (R, bool),
+    ) -> Option<R> {
+        let now = self.clock.now_ms();
+        let mut items = self.items.lock().unwrap();
+        let idx = items.iter().position(|i| i.event_id == event_id)?;
+        let (r, changed) = f(&mut items[idx], now);
+        let settled = items[idx].obligation.as_ref().is_some_and(|o| o.settled());
+        if settled {
+            items.remove(idx);
+        }
+        if changed || settled {
+            Self::persist(&self.path, &items);
+        }
+        Some(r)
+    }
+
+    /// A snapshot of one item.
+    pub fn get(&self, event_id: &str) -> Option<WorkItem> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.event_id == event_id)
+            .cloned()
+    }
+
+    /// Whether `event_id` is an obligation still open in this journal.
+    pub fn contains(&self, event_id: &str) -> bool {
+        self.get(event_id).is_some()
+    }
+
+    /// The obligation's phase (`None` once closed).
+    pub fn phase(&self, event_id: &str) -> Option<Phase> {
+        self.get(event_id)
+            .and_then(|i| i.obligation.map(|o| o.phase()))
+    }
+
+    /// A turn for `event_id` starts now: counts an attempt and marks the turn
+    /// running (in memory only: after a restart no turn runs). Returns `false`
+    /// when the obligation is gone, already answered, or a turn already runs.
+    pub fn begin_turn(&self, event_id: &str) -> bool {
+        self.with_item(event_id, |it, now| {
+            let o = it.obligation.get_or_insert_with(Obligation::default);
+            if o.turn_started_ms.is_some() || !matches!(o.phase(), Phase::Open) {
+                return (false, false);
+            }
+            o.turn_started_ms = Some(now);
+            o.attempts += 1;
+            (true, true)
+        })
+        .unwrap_or(false)
+    }
+
+    /// The running turn for `event_id` ended without an answer (it failed): the
+    /// watchdog may now re-engage it.
+    pub fn end_turn(&self, event_id: &str) {
+        self.with_item(event_id, |it, _| {
+            if let Some(o) = it.obligation.as_mut() {
+                o.turn_started_ms = None;
+            }
+            ((), false)
+        });
+    }
+
+    /// `Pending` items no turn is running for: what a (re)start or a cycle
+    /// start must hand to the handler. Replaces "pending_work, once per
+    /// process": a turn still running in THIS process is skipped, so replaying
+    /// every cycle cannot double-run it. Unsupported-message obligations are
+    /// excluded (they are answered by the fallback, not a turn).
+    pub fn startable_work(&self) -> Vec<WorkItem> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.state == WorkState::Pending)
+            .filter(|i| {
+                i.obligation.as_ref().is_some_and(|o| {
+                    o.turn_started_ms.is_none() && !o.unsupported && !o.fallback_due
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Mark `event_id` as a message no turn can answer (an unknown msgtype): the
+    /// next sweep emits its fallback at once.
+    pub fn mark_unsupported(&self, event_id: &str) {
+        self.with_item(event_id, |it, _| {
+            if let Some(o) = it.obligation.as_mut() {
+                o.unsupported = true;
+                o.fallback_due = true;
+            }
+            ((), true)
+        });
+    }
+
+    /// Declare how many chunks the `kind` post of `event_id` has, so the
+    /// obligation knows when every one is proven.
+    pub(crate) fn declare_chunks(&self, event_id: &str, kind: PostKind, n: u32) {
+        self.with_item(event_id, |it, _| {
+            if let Some(o) = it.obligation.as_mut() {
+                match kind {
+                    PostKind::Answer => o.answer_chunks = n,
+                    PostKind::Fallback => o.fallback_chunks = n,
+                    PostKind::Liveness => {}
+                }
+            }
+            ((), true)
+        });
+    }
+
+    /// The event id already posted for `(event_id, ordinal)`: the FIRST
+    /// duplicate check of every send (the transaction id is the second).
+    pub fn posted(&self, event_id: &str, ordinal: u32) -> Option<String> {
+        self.get(event_id)?
+            .obligation?
+            .posts
+            .get(&ordinal)
+            .map(|p| p.event_id.clone())
+    }
+
+    /// Whether `(event_id, ordinal)` is posted AND proven.
+    pub(crate) fn is_proven(&self, event_id: &str, ordinal: u32) -> bool {
+        self.get(event_id)
+            .and_then(|i| i.obligation)
+            .and_then(|o| o.posts.get(&ordinal).map(|p| p.proven))
+            .unwrap_or(false)
+    }
+
+    /// Record that `(event_id, ordinal)` was posted as `posted_id`. `proven`
+    /// when the post is already confirmed. Closes the obligation if that was
+    /// the last unproven post. Returns whether the obligation is now closed.
+    pub fn record_post(&self, event_id: &str, ordinal: u32, posted_id: &str, proven: bool) -> bool {
+        self.with_item(event_id, |it, _| {
+            let o = it.obligation.get_or_insert_with(Obligation::default);
+            let p = o.posts.entry(ordinal).or_default();
+            p.event_id = posted_id.to_string();
+            p.proven |= proven;
+            ((), true)
+        });
+        !self.contains(event_id)
+    }
+
+    /// Prove a recorded post (the event was fetched, or its echo came back).
+    pub fn prove_post(&self, event_id: &str, ordinal: u32) {
+        self.with_item(event_id, |it, _| {
+            if let Some(p) = it
+                .obligation
+                .as_mut()
+                .and_then(|o| o.posts.get_mut(&ordinal))
+            {
+                p.proven = true;
+            }
+            ((), true)
+        });
+    }
+
+    /// Close on the own-event echo: the agent's sync timeline carried its own
+    /// event `posted_id`, and/or an event whose `unsigned.transaction_id` is
+    /// `txn_id` (which proves a post whose send response was lost). Returns the
+    /// obligation event ids that closed.
+    pub fn observe_own_event(&self, posted_id: &str, txn_id: Option<&str>) -> Vec<String> {
+        let candidates: Vec<(String, Vec<(u32, bool)>)> = self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|i| {
+                let o = i.obligation.as_ref()?;
+                let hits = o
+                    .posts
+                    .iter()
+                    .map(|(ord, p)| (*ord, p.event_id == posted_id))
+                    .chain(
+                        txn_id
+                            .filter(|t| t.starts_with(crate::obligation::TXN_PREFIX))
+                            .into_iter()
+                            .flat_map(|t| {
+                                crate::obligation::candidate_ordinals()
+                                    .filter(move |ord| {
+                                        crate::obligation::txn_id(&i.event_id, *ord) == t
+                                    })
+                                    .map(|ord| (ord, true))
+                                    .collect::<Vec<_>>()
+                            }),
+                    )
+                    .filter(|(_, hit)| *hit)
+                    .collect::<Vec<_>>();
+                (!hits.is_empty()).then(|| (i.event_id.clone(), hits))
+            })
+            .collect();
+        let mut closed = Vec::new();
+        for (event_id, hits) in candidates {
+            self.with_item(&event_id, |it, _| {
+                if let Some(o) = it.obligation.as_mut() {
+                    for (ord, _) in &hits {
+                        let p = o.posts.entry(*ord).or_default();
+                        if p.event_id.is_empty() {
+                            p.event_id = posted_id.to_string();
+                        }
+                        p.proven = true;
+                    }
+                }
+                ((), true)
+            });
+            if !self.contains(&event_id) {
+                closed.push(event_id);
+            }
+        }
+        closed
+    }
+
+    /// Unproven posts, as `(obligation event id, ordinal, posted event id)`:
+    /// what a sweep re-verifies by fetching the event.
+    pub fn unproven_posts(&self) -> Vec<(String, u32, String)> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|i| {
+                i.obligation.iter().flat_map(move |o| {
+                    o.posts
+                        .iter()
+                        .filter(|(ord, p)| !p.proven && PostKind::of_ordinal(**ord).closes())
+                        .map(move |(ord, p)| (i.event_id.clone(), *ord, p.event_id.clone()))
+                })
+            })
+            .collect()
+    }
+
+    /// The operator DM for `event_id`'s fallback went out.
+    pub fn mark_operator_notified(&self, event_id: &str) {
+        self.with_item(event_id, |it, _| {
+            if let Some(o) = it.obligation.as_mut() {
+                o.operator_notified = true;
+            }
+            ((), true)
+        });
+    }
+
+    /// The watchdog sweep (run it every ~30 s). Pure bookkeeping against the
+    /// journal's clock: it returns what the CALLER must do and never touches
+    /// the network. Per open obligation, with `age` = now - received:
+    ///
+    /// * unsupported message: `Fallback` at once;
+    /// * `age >= fallback_deadline` (10 min), or past the answer deadline with
+    ///   no turn running and the re-engage budget (2) spent: `Fallback`
+    ///   (repeated each sweep until the fallback is posted; the txn id makes the
+    ///   repeat the same event; `notify_operator` until the DM went out);
+    /// * past the answer deadline (5 min) with a turn running: `Liveness`,
+    ///   once (it never closes anything);
+    /// * past the answer deadline with no turn running: `Reengage` (counted
+    ///   when emitted; the caller runs the turn and calls
+    ///   [`begin_turn`](Self::begin_turn));
+    /// * a post recorded but unproven for over a minute: `Verify`.
+    pub fn sweep(&self) -> Vec<SweepAction> {
+        let now = self.clock.now_ms();
+        let mut items = self.items.lock().unwrap();
+        let mut out = Vec::new();
+        let mut changed = false;
+        for it in items.iter_mut() {
+            let (event_id, room_id) = (it.event_id.clone(), it.room_id.clone());
+            let Some(o) = it.obligation.as_mut() else {
+                continue;
+            };
+            let before = o.clone();
+            if let Some(a) = o.sweep_one(now, &self.policy, &event_id, &room_id) {
+                out.push(a);
+            }
+            changed |= *o != before;
+        }
+        if changed {
+            Self::persist(&self.path, &items);
+        }
+        out
+    }
+
+    /// Open obligations and the age (ms) of the oldest, for the status file and
+    /// the probe.
+    pub fn open_stats(&self) -> (usize, u64) {
+        let now = self.clock.now_ms();
+        let items = self.items.lock().unwrap();
+        let oldest = items
+            .iter()
+            .filter_map(|i| i.obligation.as_ref())
+            .map(|o| now.saturating_sub(o.received_at_ms))
+            .max()
+            .unwrap_or(0);
+        (items.len(), oldest)
+    }
+
     /// Whether the inbox is fully drained.
     pub fn is_empty(&self) -> bool {
         self.items.lock().unwrap().is_empty()
@@ -211,6 +564,7 @@ mod tests {
             body: format!("body of {id}"),
             state: WorkState::Pending,
             sender: None,
+            obligation: None,
         }
     }
 
@@ -292,37 +646,35 @@ mod tests {
             serde_json::to_string(&item("$a")).unwrap(),
             r#"{"event_id":"$a","room_id":"!room:server","ts_ms":1,"msgtype":"m.text","body":"body of $a","state":"Pending"}"#
         );
+        // Through the journal the item gains ONLY the `obligation` key (the
+        // sender key stays absent): every other byte of the old format holds.
         let dir = tmp_dir("format");
-        let j = WorkJournal::load_or_empty(&dir);
+        let j = WorkJournal::load_with(
+            &dir,
+            Arc::new(crate::ManualClock::new(5_000)),
+            ObligationPolicy::default(),
+        );
         j.enqueue(item("$a"));
         j.enqueue(item("$b"));
         j.set_to_deliver("$b", "the answer");
         let on_disk = std::fs::read_to_string(dir.join(WorkJournal::FILE_NAME)).unwrap();
-        assert_eq!(
-            on_disk,
-            r#"[
-  {
-    "event_id": "$a",
-    "room_id": "!room:server",
-    "ts_ms": 1,
-    "msgtype": "m.text",
-    "body": "body of $a",
-    "state": "Pending"
-  },
-  {
-    "event_id": "$b",
-    "room_id": "!room:server",
-    "ts_ms": 1,
-    "msgtype": "m.text",
-    "body": "body of $b",
-    "state": {
-      "ToDeliver": {
-        "text": "the answer"
-      }
-    }
-  }
-]"#
-        );
+        let v: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        let keys = |i: usize| -> Vec<String> {
+            let mut k: Vec<String> = v[i].as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let old = ["body", "event_id", "msgtype", "room_id", "state", "ts_ms"];
+        for i in 0..2 {
+            let mut want: Vec<String> = old.iter().map(|s| s.to_string()).collect();
+            want.push("obligation".into());
+            want.sort();
+            assert_eq!(keys(i), want, "{on_disk}");
+        }
+        assert_eq!(v[0]["state"], "Pending");
+        assert_eq!(v[1]["state"]["ToDeliver"]["text"], "the answer");
+        assert_eq!(v[0]["obligation"]["received_at_ms"], 5_000);
+        assert_eq!(v[0]["obligation"]["deadline_ms"], 5_000 + 300_000);
     }
 
     /// A recorded sender is written, survives a restart and comes back as-is.

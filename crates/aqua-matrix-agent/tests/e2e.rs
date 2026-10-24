@@ -691,6 +691,7 @@ async fn durable_journal_redelivers_reply_to_peer() {
             body: "the original question".to_string(),
             state: WorkState::Pending,
             sender: None,
+            obligation: None,
         });
         journal.set_to_deliver(&format!("$evt_{tag}"), &reply);
     }

@@ -9,6 +9,12 @@ mod device_role;
 mod dm;
 mod durable;
 mod media;
+mod deliver;
+#[cfg(test)]
+mod delivery_red_tests;
+#[cfg(test)]
+mod fake_hs;
+pub mod obligation;
 pub mod net_retry;
 mod recovery;
 mod registry;
@@ -17,7 +23,12 @@ mod rtc_keys;
 mod rtc_member;
 
 pub use device_role::DeviceRole;
+pub use deliver::Dest;
 pub use durable::{WorkItem, WorkJournal, WorkState};
+pub use obligation::{
+    keyed_txn_id, txn_id, Clock, ManualClock, Obligation, ObligationPolicy, Phase, PostKind,
+    SweepAction, SystemClock,
+};
 pub use media::{MediaHandle, MediaKind};
 pub use net_retry::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
@@ -40,7 +51,8 @@ use matrix_sdk::{
             room::message::{MessageType, ReplacementMetadata, RoomMessageEventContent},
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         },
-        OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt, UserId,
+        OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, UInt,
+        UserId,
     },
     Client, RoomState, SessionMeta, SessionTokens,
 };
@@ -1869,6 +1881,17 @@ impl AgentClient {
         target: &str,
         content: RoomMessageEventContent,
     ) -> Result<String> {
+        self.send_dm_content_txn(target, content, None).await
+    }
+
+    /// [`send_dm_content`](Self::send_dm_content) with an explicit Matrix
+    /// transaction id (`None` lets matrix-sdk mint one, for single-attempt sends).
+    pub async fn send_dm_content_txn(
+        &self,
+        target: &str,
+        content: RoomMessageEventContent,
+        txn: Option<&str>,
+    ) -> Result<String> {
         let target: &UserId = target
             .try_into()
             .map_err(|e| anyhow!("invalid target: {e}"))?;
@@ -1876,7 +1899,11 @@ impl AgentClient {
         // chat. Shared with every media send via `ensure_dm_room` (see media.rs)
         // so text and attachments always land in the same Megolm session.
         let room = self.ensure_dm_room(target).await?;
-        let resp = room.send(content).await.context("failed to send message")?;
+        let mut send = room.send(content);
+        if let Some(t) = txn {
+            send = send.with_transaction_id(OwnedTransactionId::from(t));
+        }
+        let resp = send.await.context("failed to send message")?;
         Ok(resp.response.event_id.to_string())
     }
 
@@ -1887,7 +1914,31 @@ impl AgentClient {
     /// failed attempt means nothing landed (`room.send` only yields an event id
     /// on persistence), so retrying cannot duplicate a delivered message.
     pub async fn send_dm_reliable(&self, target: &str, message: &str) -> Result<String> {
-        retry_finalize("send-dm", || self.send_dm(target, message)).await
+        self.send_dm_reliable_keyed(target, message, &fresh_send_key(), 0)
+            .await
+    }
+
+    /// [`send_dm_reliable`](Self::send_dm_reliable) with a caller-given `key`
+    /// (and the `chunk` index inside it): the transaction id is
+    /// `keyed_txn_id(key, chunk)`, so the same key is the same event on any
+    /// retry, token rotation or restart. Use a key you can derive again (an
+    /// outbox item id).
+    pub async fn send_dm_reliable_keyed(
+        &self,
+        target: &str,
+        message: &str,
+        key: &str,
+        chunk: u32,
+    ) -> Result<String> {
+        retry_finalize("send-dm", keyed_txn_id(key, chunk), |txn| async move {
+            self.send_dm_content_txn(
+                target,
+                RoomMessageEventContent::text_markdown(message),
+                Some(&txn),
+            )
+            .await
+        })
+        .await
     }
 
     /// Reliably send `message`, splitting it at clean boundaries into as many
@@ -1896,9 +1947,26 @@ impl AgentClient {
     /// Each chunk is sent with [`send_dm_reliable`](Self::send_dm_reliable); the
     /// last delivered event id is returned. See [`split_for_matrix`].
     pub async fn send_dm_chunked(&self, target: &str, message: &str) -> Result<String> {
+        self.send_dm_chunked_keyed(target, message, &fresh_send_key())
+            .await
+    }
+
+    /// [`send_dm_chunked`](Self::send_dm_chunked) under a caller-given `key`
+    /// (chunk `i` has transaction id `keyed_txn_id(key, i)`).
+    pub async fn send_dm_chunked_keyed(
+        &self,
+        target: &str,
+        message: &str,
+        key: &str,
+    ) -> Result<String> {
         let mut last = String::new();
-        for chunk in split_for_matrix(message, STREAM_ROLLOVER_BYTES) {
-            last = self.send_dm_reliable(target, &chunk).await?;
+        for (i, chunk) in split_for_matrix(message, STREAM_ROLLOVER_BYTES)
+            .into_iter()
+            .enumerate()
+        {
+            last = self
+                .send_dm_reliable_keyed(target, &chunk, key, i as u32)
+                .await?;
         }
         Ok(last)
     }
@@ -1925,7 +1993,9 @@ impl AgentClient {
         target: &str,
         message: &str,
     ) -> Result<String> {
-        match self.send_dm_reliable(target, message).await {
+        // One key for both passes: the post-reauth pass is the same event.
+        let key = fresh_send_key();
+        match self.send_dm_reliable_keyed(target, message, &key, 0).await {
             Ok(id) => Ok(id),
             Err(e) if is_unknown_token(&e) => {
                 tracing::warn!(
@@ -1935,7 +2005,7 @@ impl AgentClient {
                 self.reauth_token_only()
                     .await
                     .context("token refresh after M_UNKNOWN_TOKEN failed")?;
-                self.send_dm_reliable(target, message)
+                self.send_dm_reliable_keyed(target, message, &key, 0)
                     .await
                     .context("DM send still failed after token refresh")
             }
@@ -1951,7 +2021,8 @@ impl AgentClient {
         target: &str,
         message: &str,
     ) -> Result<String> {
-        match self.send_dm_chunked(target, message).await {
+        let key = fresh_send_key();
+        match self.send_dm_chunked_keyed(target, message, &key).await {
             Ok(id) => Ok(id),
             Err(e) if is_unknown_token(&e) => {
                 tracing::warn!(
@@ -1961,7 +2032,7 @@ impl AgentClient {
                 self.reauth_token_only()
                     .await
                     .context("token refresh after M_UNKNOWN_TOKEN failed")?;
-                self.send_dm_chunked(target, message)
+                self.send_dm_chunked_keyed(target, message, &key)
                     .await
                     .context("chunked DM send still failed after token refresh")
             }
@@ -1977,8 +2048,12 @@ impl AgentClient {
     /// opt-out/in **in the call room** where everyone (not just the owner) sees
     /// it. Returns the persisted event id.
     pub async fn send_to_room(&self, room_id: &str, message: &str) -> Result<String> {
-        self.send_content_once(room_id, RoomMessageEventContent::text_markdown(message))
-            .await
+        self.send_content_once(
+            room_id,
+            RoomMessageEventContent::text_markdown(message),
+            None,
+        )
+        .await
     }
 
     /// Send a prepared `m.room.message` content (for example an `m.replace`
@@ -1991,9 +2066,15 @@ impl AgentClient {
         room_id: &str,
         content: RoomMessageEventContent,
     ) -> Result<String> {
-        retry_finalize("send-room-content", || {
-            self.send_content_once(room_id, content.clone())
-        })
+        retry_finalize(
+            "send-room-content",
+            keyed_txn_id(&fresh_send_key(), 0),
+            |txn| {
+                let this = &*self;
+                let content = content.clone();
+                async move { this.send_content_once(room_id, content, Some(&txn)).await }
+            },
+        )
         .await
     }
 
@@ -2001,6 +2082,7 @@ impl AgentClient {
         &self,
         room_id: &str,
         content: RoomMessageEventContent,
+        txn: Option<&str>,
     ) -> Result<String> {
         let room_id: &RoomId = room_id
             .try_into()
@@ -2009,10 +2091,11 @@ impl AgentClient {
             .client
             .get_room(room_id)
             .ok_or_else(|| anyhow!("room {room_id} not found (agent not joined?)"))?;
-        let resp = room
-            .send(content)
-            .await
-            .context("failed to send room message")?;
+        let mut send = room.send(content);
+        if let Some(t) = txn {
+            send = send.with_transaction_id(OwnedTransactionId::from(t));
+        }
+        let resp = send.await.context("failed to send room message")?;
         Ok(resp.response.event_id.to_string())
     }
 
@@ -2025,9 +2108,28 @@ impl AgentClient {
     /// (a group room, or a DM it resolved under its own rules) gets exactly
     /// that room. Returns the last delivered event id.
     pub async fn send_to_room_chunked(&self, room_id: &str, message: &str) -> Result<String> {
+        self.send_to_room_chunked_keyed(room_id, message, &fresh_send_key())
+            .await
+    }
+
+    /// [`send_to_room_chunked`](Self::send_to_room_chunked) under a
+    /// caller-given `key` (chunk `i` has transaction id `keyed_txn_id(key, i)`).
+    pub async fn send_to_room_chunked_keyed(
+        &self,
+        room_id: &str,
+        message: &str,
+        key: &str,
+    ) -> Result<String> {
         let mut last = String::new();
-        for chunk in split_for_matrix(message, STREAM_ROLLOVER_BYTES) {
-            last = retry_finalize("send-room", || self.send_to_room(room_id, &chunk)).await?;
+        for (i, chunk) in split_for_matrix(message, STREAM_ROLLOVER_BYTES)
+            .into_iter()
+            .enumerate()
+        {
+            last = retry_finalize("send-room", keyed_txn_id(key, i as u32), |txn| {
+                let content = RoomMessageEventContent::text_markdown(&chunk);
+                async move { self.send_content_once(room_id, content, Some(&txn)).await }
+            })
+            .await?;
         }
         Ok(last)
     }
@@ -2058,13 +2160,19 @@ impl AgentClient {
         let chunks = split_for_matrix(message, STREAM_ROLLOVER_BYTES);
         let n = chunks.len();
         let mut last = String::new();
+        // One key for the whole message: the post-reauth pass of a chunk is the
+        // same event, never a second copy.
+        let key = fresh_send_key();
         for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_txn = keyed_txn_id(&key, i as u32);
             let content = match mention {
                 Some(m) if i + 1 == n => mention_content(chunk, m)?,
                 _ => RoomMessageEventContent::text_markdown(chunk),
             };
-            let first = retry_finalize("send-room", || {
-                self.send_content_once(room_id, content.clone())
+            let first = retry_finalize("send-room", chunk_txn.clone(), |txn| {
+                let this = &*self;
+                let content = content.clone();
+                async move { this.send_content_once(room_id, content, Some(&txn)).await }
             })
             .await;
             last = match first {
@@ -2077,8 +2185,10 @@ impl AgentClient {
                     self.reauth_token_only()
                         .await
                         .context("token refresh after M_UNKNOWN_TOKEN failed")?;
-                    retry_finalize("send-room", || {
-                        self.send_content_once(room_id, content.clone())
+                    retry_finalize("send-room", chunk_txn, |txn| {
+                        let this = &*self;
+                        let content = content.clone();
+                        async move { this.send_content_once(room_id, content, Some(&txn)).await }
                     })
                     .await
                     .context("room send still failed after token refresh")?
@@ -2154,9 +2264,13 @@ impl AgentClient {
         &self,
         target: &str,
         content: RoomMessageEventContent,
+        txn: &str,
     ) -> Result<String> {
-        match tokio::time::timeout(SEND_ATTEMPT_TIMEOUT, self.send_dm_content(target, content))
-            .await
+        match tokio::time::timeout(
+            SEND_ATTEMPT_TIMEOUT,
+            self.send_dm_content_txn(target, content, Some(txn)),
+        )
+        .await
         {
             Ok(res) => res,
             Err(_) => Err(anyhow!(
@@ -2203,6 +2317,8 @@ impl AgentClient {
         mention: Option<&RoomMention<'_>>,
     ) -> Result<String> {
         let content = dm_content(message, mention)?;
+        // Both passes (before and after a reauth) are one logical send: one id.
+        let txn = keyed_txn_id(&fresh_send_key(), 0);
 
         // 1. Proactive refresh: never send on a token that is about to expire.
         if self.token_seconds_left() < TOKEN_REFRESH_MARGIN {
@@ -2221,7 +2337,7 @@ impl AgentClient {
         }
 
         // 2. First send attempt (bounded).
-        match self.send_dm_bounded(target, content.clone()).await {
+        match self.send_dm_bounded(target, content.clone(), &txn).await {
             Ok(id) => return Ok(id),
             Err(e) if is_server_internal_error(&e) => {
                 return Err(e).context(
@@ -2242,7 +2358,7 @@ impl AgentClient {
         }
 
         // 3. Post-reauth retry (only reached on a token rejection above).
-        match self.send_dm_bounded(target, content).await {
+        match self.send_dm_bounded(target, content, &txn).await {
             Ok(id) => Ok(id),
             Err(e) if is_server_internal_error(&e) => Err(e).context(
                 "homeserver still returns a 5xx after re-authentication — server-side send fault",
@@ -2564,21 +2680,47 @@ const FINALIZE_RETRY_BASE: Duration = Duration::from_millis(500);
 /// mid-request. See [`AgentClient::send_dm_self_healing`].
 const TOKEN_REFRESH_MARGIN: u64 = 60;
 
+/// A key for ONE logical send that has no obligation: unique per call, so two
+/// different messages never share a transaction id, and constant across the
+/// retries and the post-reauth pass of that call (`txn_id(key, chunk)`).
+pub fn fresh_send_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(std::process::id().to_be_bytes());
+    h.update(SEQ.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    h.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .to_be_bytes(),
+    );
+    format!("send-{}", hex::encode(&h.finalize()[..12]))
+}
+
 /// Retry `op` until it returns `Ok` (the send was acknowledged by the server)
 /// or [`FINALIZE_MAX_ATTEMPTS`] is exhausted, with linear backoff. `op`'s `Ok`
 /// value is the homeserver's confirmation (an event id), so a success here is a
 /// *programmatic guarantee the message was transmitted*, not a hopeful
 /// fire-and-forget. On exhaustion the last error is returned so the caller can
-/// surface it. Safe to retry: `room.send` only yields an event id once the
-/// event is persisted, so a failed attempt means nothing landed.
-async fn retry_finalize<T, F, Fut>(what: &str, mut op: F) -> Result<T>
+/// surface it.
+///
+/// Safe to retry ONLY because every attempt carries the same transaction id
+/// `txn` (`op` receives it and must pass it to `Room::send(..).with_transaction_id`):
+/// a failed attempt does not prove nothing landed (the homeserver may have
+/// persisted the event and lost the response), and a fresh id per attempt, as
+/// this loop used to mint, then posts the message twice. With one id the
+/// homeserver answers the retry with the event it already has.
+async fn retry_finalize<T, F, Fut>(what: &str, txn: String, mut op: F) -> Result<T>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut last_err = None;
     for attempt in 1..=FINALIZE_MAX_ATTEMPTS {
-        match op().await {
+        match op(txn.clone()).await {
             Ok(v) => {
                 if attempt > 1 {
                     tracing::info!("{what}: transmission confirmed on attempt {attempt}");
@@ -2859,13 +3001,23 @@ impl ReplyStream {
         // first send) the first chunk is sent as a brand-new message so it still
         // lands and notifies meaningfully. The rest are fresh messages. All must
         // land — retry each until the homeserver acknowledges it.
+        let key = fresh_send_key();
         if self.event_id.is_some() {
-            retry_finalize("reply-finalize", || self.edit(&first)).await?;
+            retry_finalize("reply-finalize", keyed_txn_id(&key, 0), |txn| {
+                self.edit(&first, Some(txn))
+            })
+            .await?;
         } else {
-            retry_finalize("reply-finalize", || self.send_plain(&first)).await?;
+            retry_finalize("reply-finalize", keyed_txn_id(&key, 0), |txn| {
+                self.send_plain(&first, Some(txn))
+            })
+            .await?;
         }
-        for chunk in chunks.iter().skip(1) {
-            retry_finalize("reply-continuation", || self.send_plain(chunk)).await?;
+        for (i, chunk) in chunks.iter().enumerate().skip(1) {
+            retry_finalize("reply-continuation", keyed_txn_id(&key, i as u32), |txn| {
+                self.send_plain(chunk, Some(txn))
+            })
+            .await?;
         }
         Ok(())
     }
@@ -2900,7 +3052,12 @@ impl ReplyStream {
         };
         // Freeze the current message at the clean head (no cursor). Retried, but
         // best-effort: a frozen message is never re-edited, so don't abort on it.
-        if let Err(e) = retry_finalize("reply-rollover", || self.edit(&head_final)).await {
+        if let Err(e) = retry_finalize(
+            "reply-rollover",
+            keyed_txn_id(&fresh_send_key(), 0),
+            |txn| self.edit(&head_final, Some(txn)),
+        )
+        .await {
             tracing::warn!("reply-rollover: failed to finalize a rolled-over message: {e:#}");
         }
         self.event_id = Some(new_ev);
@@ -2927,12 +3084,12 @@ impl ReplyStream {
     /// A best-effort in-place edit: logs and swallows any send error so a
     /// throttled streaming update can never abort the run producing the reply.
     async fn edit_best_effort(&self, body: &str) {
-        if let Err(e) = self.edit(body).await {
+        if let Err(e) = self.edit(body, None).await {
             tracing::warn!("reply-stream: dropped a best-effort streaming edit: {e:#}");
         }
     }
 
-    async fn edit(&self, body: &str) -> Result<()> {
+    async fn edit(&self, body: &str, txn: Option<String>) -> Result<()> {
         // Only valid once a live message exists; callers (throttled edit, rollover
         // freeze, finish-with-event) ensure that. Defensive no-op otherwise.
         let Some(event_id) = self.event_id.clone() else {
@@ -2944,22 +3101,24 @@ impl ReplyStream {
         // We are the author and already hold the event id, so this is safe.
         let content = RoomMessageEventContent::text_markdown(body)
             .make_replacement(ReplacementMetadata::new(event_id, None));
-        self.room
-            .send(content)
-            .await
-            .context("failed to send streaming edit")?;
+        let mut send = self.room.send(content);
+        if let Some(t) = txn {
+            send = send.with_transaction_id(OwnedTransactionId::from(t));
+        }
+        send.await.context("failed to send streaming edit")?;
         Ok(())
     }
 
     /// Send `body` as a brand-new message (not an edit). Used for continuation
     /// messages: a fresh `m.room.message` carries no `m.new_content` copy, so it
     /// is far smaller on the wire than the equivalent edit.
-    async fn send_plain(&self, body: &str) -> Result<()> {
+    async fn send_plain(&self, body: &str, txn: Option<String>) -> Result<()> {
         let content = RoomMessageEventContent::text_markdown(body);
-        self.room
-            .send(content)
-            .await
-            .context("failed to send continuation message")?;
+        let mut send = self.room.send(content);
+        if let Some(t) = txn {
+            send = send.with_transaction_id(OwnedTransactionId::from(t));
+        }
+        send.await.context("failed to send continuation message")?;
         Ok(())
     }
 }
