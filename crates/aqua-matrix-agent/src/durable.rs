@@ -495,6 +495,14 @@ impl WorkJournal {
     ///   [`begin_turn`](Self::begin_turn));
     /// * a post recorded but unproven for over a minute: `Verify`.
     pub fn sweep(&self) -> Vec<SweepAction> {
+        self.sweep_where(|_| true)
+    }
+
+    /// [`sweep`](Self::sweep) restricted to the actions `keep` accepts. An
+    /// action `keep` rejects leaves its obligation exactly as it was (a
+    /// re-engage is not counted, a liveness not marked sent), so a caller that
+    /// executes only some kinds never consumes the others.
+    pub fn sweep_where(&self, keep: impl Fn(&SweepAction) -> bool) -> Vec<SweepAction> {
         let now = self.clock.now_ms();
         let mut items = self.items.lock().unwrap();
         let mut out = Vec::new();
@@ -504,11 +512,15 @@ impl WorkJournal {
             let Some(o) = it.obligation.as_mut() else {
                 continue;
             };
-            let before = o.clone();
-            if let Some(a) = o.sweep_one(now, &self.policy, &event_id, &room_id) {
-                out.push(a);
+            let mut next = o.clone();
+            match next.sweep_one(now, &self.policy, &event_id, &room_id) {
+                Some(a) if keep(&a) => {
+                    changed |= next != *o;
+                    *o = next;
+                    out.push(a);
+                }
+                _ => {}
             }
-            changed |= *o != before;
         }
         if changed {
             Self::persist(&self.path, &items);

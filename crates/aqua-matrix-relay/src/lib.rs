@@ -75,11 +75,16 @@ pub use aqua_matrix_agent::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
     is_unknown_token, load_dotenv, ConnectErrorClass, ConnectOutcome, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
     RoomMention, TypingGuard, WorkItem, WorkJournal, WorkState,
+    // The obligation API (guaranteed delivery): a handler or poll loop closes
+    // its obligations through these.
+    Clock, Dest, ManualClock, Obligation, ObligationPolicy, Phase, PostKind, SweepAction,
+    SystemClock,
 };
 pub use async_trait::async_trait;
 
 use aqua_matrix_agent::PendingInvite;
 
+mod admit;
 mod media;
 
 /// Rotate the client `REFRESH_GUARD_SECS` before the access token expires. 30 s
@@ -583,7 +588,6 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
     // not at the next scheduled rotation.
     let journal = Arc::new(WorkJournal::load_or_empty(&config.store_dir));
     let recycle = Arc::new(Notify::new());
-    let mut replay_pending = true;
 
     // Trap SIGTERM/SIGINT once and fan it out via a Notify so every cycle can
     // unwind cleanly. `podman stop`/`systemctl stop` send SIGTERM and SIGKILL
@@ -670,14 +674,19 @@ pub async fn run_daemon<H: MessageHandler>(config: AgentConfig, target: &str, ha
         // the promise: a reply can never be silently dropped.
         drain_deliveries(&agent, &target, &journal, handler.role(), &bound_rooms).await;
 
-        // Once per process: replay inbound messages that were accepted but never
-        // answered (crash/restart mid-turn). The watermark prevents sync from
-        // re-delivering them, so the journal is the only thing that can — this is
-        // the inbox promise surviving a restart.
-        if replay_pending {
-            replay_pending = false;
-            replay_inbox(&agent, &target, &handler, &journal).await;
-        }
+        // Every cycle: replay inbound messages that were accepted but never
+        // answered (crash/restart mid-turn, or a turn that ended without an
+        // answer). The watermark prevents sync from re-delivering them, so the
+        // journal is the only thing that can. A turn still running in this
+        // process is skipped (`startable_work`), which is what makes a replay per
+        // cycle safe; it used to run once per process, so an obligation orphaned
+        // after the first cycle waited for the next restart.
+        replay_inbox(&agent, &target, &handler, &journal).await;
+        // Obligations that need no turn: the fallback for a message nothing can
+        // read, and the proof check for a post whose fetch failed. (The full
+        // watchdog, liveness and re-engage, belongs to the handler that owns the
+        // turn.)
+        sweep_without_turns(&agent, &journal).await;
 
         let now = unix_now_secs();
         let ttl = agent
@@ -1623,15 +1632,35 @@ async fn dispatch<H: MessageHandler>(
     // message from such a peer. Room-aware: the default `authorize_in_room` is
     // exactly `authorize`; only an override admits another sender, and only in
     // the rooms it names.
+    //
+    // The agent's OWN events come first: one is the echo that proves a post
+    // (by event id, or by the transaction id when the send response was lost)
+    // and closes its obligation.
+    if ev.sender.as_str() == agent.user_id() {
+        let txn = ev.unsigned.transaction_id.as_ref().map(|t| t.as_str());
+        for closed in agent.observe_own_event(ev.event_id.as_str(), txn) {
+            tracing::info!("{}: obligation {closed} closed on its own-event echo", handler.role());
+        }
+        return;
+    }
     if !handler.authorize_in_room(ev.sender.as_str(), room.room_id().as_str(), target) {
         warn_on_case_only_drop(ev.sender.as_str(), target, handler.role(), "message");
         return;
     }
     // A bound room's messages are gated on (and advance) that room's own
-    // watermark, every other message the global one.
+    // watermark, every other message the global one. The gate itself is the
+    // event id (see [`admit`]): the timestamp alone dropped an event that
+    // arrived out of order.
     let watermark = watermarks.for_room(room.room_id().as_str());
     let ts_ms = u64::from(ev.origin_server_ts.0);
-    if ts_ms <= watermark.get() {
+    if journal.contains(ev.event_id.as_str())
+        || watermarks.seen.is_duplicate(
+            ev.event_id.as_str(),
+            room.room_id().as_str(),
+            ts_ms,
+            watermark.get(),
+        )
+    {
         return;
     }
 
@@ -1649,68 +1678,87 @@ async fn dispatch<H: MessageHandler>(
 
     // Text → body only. Media (image/audio/voice/video/file) → an `InboundMedia`
     // plus the caption as `body` (so a captioned image reads naturally). Other
-    // msgtypes (notice, emote, location, verification…) carry nothing actionable
-    // for a handler; ignore them without advancing the watermark (the ts check
-    // still prevents reprocessing).
-    let (body, media) = match &ev.content.msgtype {
-        MessageType::Text(t) => (t.body.trim().to_string(), None),
+    // msgtypes (notice, emote, location, verification…) carry nothing a handler
+    // can act on, but the peer sent them and is owed an answer: they open an
+    // obligation that ends in a polite fallback (`supported: false`).
+    let (body, media, supported) = match &ev.content.msgtype {
+        MessageType::Text(t) => (t.body.trim().to_string(), None, true),
         MessageType::Image(c) => (
             c.caption().unwrap_or("").trim().to_string(),
             Some(media::from_image(c)),
+            true,
         ),
         MessageType::Audio(c) => (
             c.caption().unwrap_or("").trim().to_string(),
             Some(media::from_audio(c)),
+            true,
         ),
         MessageType::Video(c) => (
             c.caption().unwrap_or("").trim().to_string(),
             Some(media::from_video(c)),
+            true,
         ),
         MessageType::File(c) => (
             c.caption().unwrap_or("").trim().to_string(),
             Some(media::from_file(c)),
+            true,
         ),
-        _ => return,
+        _ => (String::new(), None, false),
     };
 
-    // Advance (and persist) the watermark BEFORE dispatching: if the handler
-    // (or the process) dies mid-work we must not re-trigger on the same
-    // message after restart.
-    watermark.advance(ts_ms);
-
     // Drop only a truly empty message: an attachment with no caption still has
-    // `media`, so it must dispatch even though `body` is empty.
-    if body.is_empty() && media.is_none() {
+    // `media`, so it must dispatch even though `body` is empty. (An unreadable
+    // msgtype has no body either, and is NOT dropped.)
+    if supported && body.is_empty() && media.is_none() {
         return;
     }
 
-    // Durable inbox: record the message BEFORE handling so a crash/restart
-    // mid-turn replays it (the watermark above stops sync from re-delivering it,
-    // so the journal is the only thing that can). `enqueue` is idempotent on
-    // event_id and returns `false` if the event is already tracked — a rare
-    // re-sync race where it is already in-flight (`Pending`) or answered and
-    // awaiting delivery (`ToDeliver`). In that case do NOT re-dispatch: the
-    // existing handler run / the cycle drain already owns it; re-running would
-    // double-process (a duplicate answer).
-    let newly_enqueued = journal.enqueue(WorkItem {
-        event_id: ev.event_id.to_string(),
-        room_id: room.room_id().to_string(),
-        ts_ms,
-        msgtype: ev.content.msgtype.msgtype().to_string(),
-        body: body.clone(),
-        state: WorkState::Pending,
-        sender: journal_sender(
-            ev.sender.as_str(),
-            watermarks.is_bound(room.room_id().as_str()),
-            target,
-        ),
-    });
-    if !newly_enqueued {
+    // Admit: journal the message (an open obligation) BEFORE the watermark
+    // advances. A crash between the two used to lose the message for good (the
+    // watermark already stopped sync from re-delivering it, and nothing was
+    // journalled to replay). `Duplicate` is a re-sync race where the event is
+    // already tracked, in flight (`Pending`) or answered and awaiting delivery
+    // (`ToDeliver`): do NOT re-dispatch, the existing run / the cycle drain owns
+    // it, and re-running would double-process.
+    let admission = admit::admit(
+        journal,
+        &watermarks.seen,
+        watermark,
+        admit::Candidate {
+            event_id: ev.event_id.to_string(),
+            room_id: room.room_id().to_string(),
+            ts_ms,
+            msgtype: ev.content.msgtype.msgtype().to_string(),
+            body: body.clone(),
+            sender: journal_sender(
+                ev.sender.as_str(),
+                watermarks.is_bound(room.room_id().as_str()),
+                target,
+            ),
+            supported,
+        },
+        || watermark.advance(ts_ms),
+    );
+    if admission == admit::Admission::Duplicate {
         tracing::debug!(
-            "{}: event {} already tracked in the work-journal; not re-dispatching",
+            "{}: event {} already tracked; not re-dispatching",
             handler.role(),
             ev.event_id
         );
+        return;
+    }
+
+    if !supported {
+        // No handler can read it: say so politely now (a failed send is retried
+        // by the next cycle's sweep, idempotently).
+        tracing::info!(
+            "{}: unsupported {} from {} (event {}); answering with the fallback",
+            handler.role(),
+            ev.content.msgtype.msgtype(),
+            ev.sender,
+            ev.event_id
+        );
+        sweep_without_turns(agent, journal).await;
         return;
     }
 
@@ -1747,6 +1795,8 @@ async fn dispatch<H: MessageHandler>(
 
     // The relay never unwinds on a handler error: log it at `warn` and keep
     // serving. (Errors are the handler's domain; the transport stays up.)
+    // The obligation's turn runs from here; recording the reply ends it.
+    journal.begin_turn(ev.event_id.as_str());
     if let Err(e) = handler.handle_message(agent, target, &msg).await {
         tracing::warn!("{}: handle_message failed: {e:#}", handler.role());
     }
@@ -1759,6 +1809,24 @@ async fn dispatch<H: MessageHandler>(
     //    Auto-completing here would erase the inbox item before it is answered.
     if !handler.owns_completion() {
         journal.mark_done(ev.event_id.as_str());
+    }
+}
+
+/// Run the watchdog actions that need no turn: the fallback for a message no
+/// handler can read, and the proof check of a post whose event fetch failed.
+/// Liveness and re-engage belong to the handler that owns the turn; they are
+/// neither executed nor consumed here (`sweep_where` leaves their obligations
+/// untouched).
+async fn sweep_without_turns(agent: &AgentClient, journal: &WorkJournal) {
+    let actions: Vec<SweepAction> = journal
+        .sweep_where(|a| {
+            matches!(
+                a,
+                SweepAction::Fallback { unsupported: true, .. } | SweepAction::Verify { .. }
+            )
+        });
+    if !actions.is_empty() {
+        agent.execute_sweep(actions, None).await;
     }
 }
 
@@ -1784,13 +1852,20 @@ async fn drain_deliveries(
         let WorkState::ToDeliver { text } = &item.state else {
             continue;
         };
-        let sent = match redelivery_target(&item.room_id, bound_rooms) {
-            Redelivery::TargetDm => agent.send_dm_chunked(target, text).await,
-            Redelivery::Room(room_id) => agent.send_to_room_chunked(room_id, text).await,
+        // Idempotent: a post already recorded for this obligation is not sent
+        // again (it is only verified), and a repeat is the same Matrix event
+        // (deterministic transaction id). The obligation closes inside
+        // `deliver_obligation` ON PROOF (event fetched or own-event echo), not
+        // on the bare send response.
+        let dest = match redelivery_target(&item.room_id, bound_rooms) {
+            Redelivery::TargetDm => Dest::Dm(target),
+            Redelivery::Room(room_id) => Dest::Room(room_id),
         };
-        match sent {
+        match agent
+            .deliver_obligation(&item.event_id, dest, PostKind::Answer, text)
+            .await
+        {
             Ok(_) => {
-                journal.mark_done(&item.event_id);
                 tracing::info!("{role}: redelivered journalled reply for {}", item.event_id);
             }
             Err(e) => tracing::warn!(
@@ -1815,7 +1890,7 @@ async fn replay_inbox<H: MessageHandler>(
     handler: &Arc<H>,
     journal: &WorkJournal,
 ) {
-    let pending = journal.pending_work();
+    let pending = journal.startable_work();
     if pending.is_empty() {
         return;
     }
@@ -1857,6 +1932,7 @@ async fn replay_inbox<H: MessageHandler>(
             body: &item.body,
             media: None,
         };
+        journal.begin_turn(&item.event_id);
         if let Err(e) = handler.handle_message(agent, target, &msg).await {
             tracing::warn!("{}: replay handle_message failed: {e:#}", handler.role());
         }
@@ -2053,6 +2129,8 @@ impl Watermark {
 struct InboundWatermarks {
     global: Watermark,
     rooms: HashMap<String, Watermark>,
+    /// Event-id dedupe next to the watermarks (see [`admit`]).
+    seen: admit::SeenLog,
 }
 
 impl InboundWatermarks {
@@ -2066,7 +2144,11 @@ impl InboundWatermarks {
                 rooms.insert(room_id.clone(), Watermark::load_or_seed_file(path));
             }
         }
-        Self { global, rooms }
+        Self {
+            global,
+            rooms,
+            seen: admit::SeenLog::load(store_dir),
+        }
     }
 
     /// The watermark that gates a message in `room_id`: the room's own when it
@@ -2922,6 +3004,7 @@ mod restart_path_tests {
             body: "b".to_string(),
             state: WorkState::Pending,
             sender: sender.map(str::to_string),
+            obligation: None,
         }
     }
 

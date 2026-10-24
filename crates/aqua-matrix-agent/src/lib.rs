@@ -2072,9 +2072,8 @@ impl AgentClient {
             "send-room-content",
             keyed_txn_id(&fresh_send_key(), 0),
             |txn| {
-                let this = &*self;
                 let content = content.clone();
-                async move { this.send_content_once(room_id, content, Some(&txn)).await }
+                async move { self.send_content_once(room_id, content, Some(&txn)).await }
             },
         )
         .await

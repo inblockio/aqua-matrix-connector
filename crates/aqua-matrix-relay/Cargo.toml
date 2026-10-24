@@ -13,6 +13,8 @@ tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # The echo_agent example wires its own runtime.

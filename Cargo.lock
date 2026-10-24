@@ -233,6 +233,8 @@ dependencies = [
  "aqua-matrix-agent",
  "async-trait",
  "matrix-sdk",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
