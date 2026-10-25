@@ -1435,11 +1435,16 @@ impl AgentClient {
             // server-side backup) and persist the generated recovery key to disk if
             // it isn't there yet. Best-effort: never fails connect().
             recovery::enable_and_persist_if_absent(&client, &config.store_dir).await;
-        } else {
-            // The restore signs this device; repeat it if that step failed, so
-            // recipients see a device the identity vouches for.
-            sign_own_device_if_needed(&client).await;
         }
+        // Keys being present does not mean this device is signed (e.g. a failed
+        // restore), and Element then warns "device not verified by its owner" on
+        // every message it sends. Sign it, so recipients see a device the
+        // identity vouches for. Limit: Synapse skips a signature upload for a
+        // device that already carries one from the same self-signing key, so a
+        // device whose keys changed under the same device_id (a store wipe that
+        // kept it) stays unsigned and needs a new device_id; see
+        // docs/RECOVERY.md.
+        sign_own_device_if_needed(&client).await;
 
         // If we just re-bootstrapped onto a NEW device_id (store wipe), the peer's
         // client may still be encrypting to our previous, now-dead devices (whose
