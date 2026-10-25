@@ -138,7 +138,7 @@ What this means per scenario:
 | State on cold start | Outcome |
 |---|---|
 | Store intact (tier 1/2) | Nothing to do — cross-signing already in the store |
-| Store wiped, `recovery.key` present | SSSS restore — same cross-signing identity, no re-verify |
+| Store wiped, `recovery.key` present | SSSS restore — same cross-signing identity, no re-verify. But if the device_id stayed the same, the device now has new keys and stays "not verified by its owner" (see the decision tree) |
 | Store wiped, `recovery.key` absent | Fresh cross-signing bootstrap — Tim sees one re-verification |
 
 **SECURITY NOTE.** The recovery key sits at rest, unencrypted, on the host at
@@ -216,6 +216,12 @@ Should NOT happen if refresh tokens are working. Check:
 1. `grep refresh_token ~/.aqua-matrix-claude-channel/config.toml`: if missing, the daemon authenticated against an old siwx-oidc that did not issue refresh tokens. Next fresh auth (against the new server) fixes it.
 2. `grep '^did' ~/.aqua-matrix-claude-channel/config.toml`: must also be present for the refresh-grant call.
 3. Journal: `refresh grant failed` → most likely refresh token expired (>24h since last refresh). Fresh auth runs and mints a new device. One-time event, not a recurring problem unless restarts happen with >24h gaps.
+
+**Element shows the agent's messages as "Encrypted by a device not verified by its owner"**
+
+The sending device is not signed by the identity's self-signing key. Check from the published keys with `cargo run --example cross_signing_probe` (env as the one-shot CLI, plus `AGENT_DEVICE_ID` if the identity pins one; stop a daemon that owns the store first). `signed by owner: false` on its own device confirms it.
+- Every connect signs the own device if it is unsigned (`signed own device with the identity's self-signing key` in the log), which fixes a device that never got a signature.
+- If that line appears on every connect and the probe still says `false`, the device's keys changed under the same device_id (a crypto-store wipe that kept the derived or pinned id). Synapse keeps the signature made over the old keys and skips any new one from the same key (`_process_self_signatures`: "we already have a signature on this device"), so re-signing cannot fix it. Move the identity to a new device_id (`AGENT_DEVICE_ID=<new id>`): the next connect wipes the store, restores cross-signing from `recovery.key`, signs the new device and prunes the old one. Seen 2026-10-25 on the host notifier (device `AQUA_b8b77e4439fb`, re-keyed by a wipe on 2026-10-07).
 
 **"The daemon is running but Tim still does not see it in Element"**
 
