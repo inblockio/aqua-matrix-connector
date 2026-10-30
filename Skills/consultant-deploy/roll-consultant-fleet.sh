@@ -7,6 +7,9 @@
 # config is used VERBATIM (never re-rendered from the template). One opt-in exception:
 # --refresh-prompt adopts the template's system_prompt/description/ref_mounts into each
 # kept config, preserving everything else (hello, homeserver, identity).
+# NOTE (2026-10-30): the fleet runs on agentic since the A2A move, and spawn-consultant.sh defaults to
+# --host agentic, which refuses --replace. A roll therefore fails closed at the first consultant until
+# image rolls on agentic have their own path; it never restarts a moved agent on nuc10.
 #
 # This replaces the old "rm -f each container, then run each recreate-<label>.sh by hand"
 # procedure (and the easy-to-get-wrong manual recreate of the generic container).

@@ -184,7 +184,7 @@ runp() {   # runp <name> <spawn args...>: --print-run; stdout/stderr/rc in $SB/o
 }
 runs() {   # runs <name> <spawn args...>: a REAL spawn with podman shimmed (SHIM_MODE=spawn)
   local name="$1"; shift; local rc=0; reset_logs
-  env -i HOME="$FAKE_HOME" PATH="$BASE_PATH" SHIM_MODE=spawn CONSULTANT_TEST_DIR="$TEST_DIR" \
+  env -i HOME="$FAKE_HOME" CONSULTANT_HOST=nuc10 PATH="$BASE_PATH" SHIM_MODE=spawn CONSULTANT_TEST_DIR="$TEST_DIR" \
     AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$AL" \
     AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" STUB_LOG="$STUB_LOG" \
     ${RUN_ENV[@]+"${RUN_ENV[@]}"} \
@@ -681,11 +681,11 @@ check "NEW consultant: one /refs mount only (the placeholder view), no x-extra /
 
 echo "== print modes that exit early never run the tool"
 reset_logs
-rc=0; env -i HOME="$FAKE_HOME" PATH="$BASE_PATH" CONSULTANT_TEST_DIR="$TEST_DIR" AGENT_REFS_BIN="$STUB" \
+rc=0; env -i HOME="$FAKE_HOME" CONSULTANT_HOST=nuc10 PATH="$BASE_PATH" CONSULTANT_TEST_DIR="$TEST_DIR" AGENT_REFS_BIN="$STUB" \
   AGENT_REFS_ROOT="$STUB_ROOT" STUB_LOG="$STUB_LOG" AQUA_SYSTEM_ALLOWLIST="$AL" \
   bash "$SPAWN" --print-onboarding --label alpha --target "$TARGET" --persona Thalia --name Tester > "$SB/out/o1.out" 2> "$SB/out/o1.err" || rc=$?
 check "--print-onboarding: exit 0, tool not run" bash -c '[ "$1" -eq 0 ] && [ ! -s "$2" ]' _ "$rc" "$STUB_LOG"
-rc=0; env -i HOME="$FAKE_HOME" PATH="$BASE_PATH" CONSULTANT_TEST_DIR="$TEST_DIR" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" STUB_LOG="$STUB_LOG" \
+rc=0; env -i HOME="$FAKE_HOME" CONSULTANT_HOST=nuc10 PATH="$BASE_PATH" CONSULTANT_TEST_DIR="$TEST_DIR" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" STUB_LOG="$STUB_LOG" \
   bash "$SPAWN" --print-mxid --label nosession > "$SB/out/o2.out" 2> "$SB/out/o2.err" || rc=$?
 check "--print-mxid: exit 1 (no session), tool not run" bash -c '[ "$1" -eq 1 ] && [ ! -s "$2" ]' _ "$rc" "$STUB_LOG"
 

@@ -168,6 +168,19 @@
 # confirmed" (retry: podman restart). A marker that already existed before launch (a roll of an
 # already-greeted consultant) -> nothing is sent. Never fails the spawn.
 #
+# Host (Tim, 2026-10-30): consultants run on agentic.inblock.io, and every new one is deployed there. --host agentic
+# (the default; CONSULTANT_HOST overrides) renders and prepares everything here on nuc10 as before (Owner, refs view,
+# config, avatar, registry row, activity watcher), then, instead of `podman run`: writes the run shape and env file in
+# the format of the A2A move (agentic-manifest.py, into ~/.cache/agents-to-agentic/carry/meta), rsyncs them, the
+# config, the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
+# (agentic-refs-push.service), and starts the container with aqua-ops tools/host-move/agents.py place + run (root,
+# through skh-run). The MXID read-back and --onboard read the agent's store, marker and log on agentic. Real spawns on
+# agentic are for NEW consultants only: --replace, --fresh, --generic, a local identity (store/agent.pem) or an existing
+# container of the name on agentic are refused; a running agentic agent is stopped and started with agents.py. nuc10's
+# activity watcher gets the agent's lines through agentic-feeds. --host nuc10 is the old podman path, kept for the
+# tests; it refuses an agent whose nuc10 copy was moved (a2a-moved-<rest> exists). --print-run and --print-onboarding
+# read nuc10 only; --print-mxid reads the agent's store on agentic (the user_id line, through docker exec).
+#
 # --print-onboarding: print the consultant's hello as a spawn with the same flags would render it,
 # plus both Tim notices, to stdout and exit 0, before any token, network, config write, container
 # or DM (offline copy review), plus a read-only preview of the Owner allow-list step on stderr.
@@ -186,6 +199,9 @@
 #   ONBOARD_WAIT            seconds --onboard waits for the welcome to be confirmed (default 180)
 #   AQUA_SYSTEM_ALLOWLIST   Aqua System allow-list the Owner step ensures (default ~/.aqua-system-bridge/allowlist.toml)
 #   CONSULTANT_NOTIFY       notifier used for Tim's DMs (default ~/.aqua-matrix-notify/notify-tim.sh; tests)
+#   CONSULTANT_HOST         agentic (default) or nuc10, as --host
+#   AQUA_OPS_DIR            the aqua-ops checkout holding skh-run and agents.py (default ~/aqua-ops)
+#   AGENTIC_SSH             ssh destination of agentic's deploy shell (default agentic.inblock.io, from ~/.ssh/config)
 #
 # Examples:
 #   # new consultant (fresh identity) with a female persona; tell Tim once her welcome is delivered:
@@ -244,6 +260,12 @@ PRINT_RUN=0           # --print-run: print the podman run argument vector and ex
 PRINT_MXID=0          # --print-mxid: print the consultant's own MXID from its persisted session, exit
 SIWX_URL_ARG=""       # --siwx-url: siwx-oidc base URL for the agent + DID lookup; empty = image default (prod)
 MATRIX_URL_ARG=""     # --matrix-url: homeserver base URL for the agent; empty = image default (prod)
+HOST="${CONSULTANT_HOST:-agentic}"   # --host: where the container runs (see "Host" above)
+AQUA_OPS_DIR="${AQUA_OPS_DIR:-$HOME/aqua-ops}"
+AGENTIC_SSH="${AGENTIC_SSH:-agentic.inblock.io}"
+CARRY_LOCAL="$HOME/.cache/agents-to-agentic/carry"   # nuc10's mirror of the shapes agentic's agents.py reads
+CARRY_REMOTE="/mnt/scribe-data/carry"
+SRV_REMOTE="/srv/agents/home"
 # Host state dir: per-instance configs, persist volumes, avatars, and the config template.
 # Overridable so the arg-rendering tests can run in a sandbox without touching live state.
 TEST_DIR="${CONSULTANT_TEST_DIR:-/home/waldknoten-01/.aqua-matrix-test}"
@@ -296,6 +318,7 @@ while [ $# -gt 0 ]; do
     --print-mxid) PRINT_MXID=1; shift ;;
     --siwx-url) SIWX_URL_ARG="$2"; shift 2 ;;
     --matrix-url) MATRIX_URL_ARG="$2"; shift 2 ;;
+    --host)    HOST="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "!! unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -310,6 +333,17 @@ case "$VOICE" in
   ""|on|off) : ;;
   *) echo "!! --voice takes exactly 'on' or 'off' (got '$VOICE')" >&2; exit 2 ;;
 esac
+case "$HOST" in
+  agentic|nuc10) : ;;
+  *) echo "!! --host takes exactly 'agentic' or 'nuc10' (got '$HOST')" >&2; exit 2 ;;
+esac
+REAL_SPAWN=0
+[ "$PRINT_RUN$PRINT_ONBOARDING$PRINT_MXID" = 000 ] && REAL_SPAWN=1
+if [ "$HOST" = agentic ] && [ "$REAL_SPAWN" -eq 1 ] && [ $((REPLACE + FRESH + GENERIC)) -gt 0 ]; then
+  echo "!! --host agentic deploys NEW consultants only; --replace, --fresh and --generic are refused (nothing changed)." >&2
+  echo "   A running agentic agent: aqua-ops tools/host-move/agents.py stop|run|logs <container> (skh-run --sudo --dir / prod)." >&2
+  exit 2
+fi
 # The siwx-oidc the DID lookup asks: the one the agent will sign in with. Default = the image's
 # own default (prod). CONSULTANT_SIWX_URL overrides for tests.
 LOOKUP_SIWX_URL="${SIWX_URL_ARG:-${CONSULTANT_SIWX_URL:-https://siwx-oidc.inblock.io}}"
@@ -363,12 +397,60 @@ print(u)
 PY
 }
 
+# agentic: deploy's shell (docker group); NAME is slug-built, so it is safe inside the remote command line.
+agentic() { ssh -o BatchMode=yes -o ConnectTimeout=15 "$AGENTIC_SSH" "$@"; }
+# Only the user_id line of the store's config.toml leaves the container (the file holds tokens too).
+agentic_mxid() {
+  agentic "docker exec $NAME grep -o -m1 'user_id = \"@[^\"]*\"' /agent/store/config.toml" 2>/dev/null \
+    | sed -n 's/^user_id = "\(@[^"]*:[^"]*\)"$/\1/p' | grep . || return 1
+}
+agentic_has_container() { agentic "docker container inspect $NAME >/dev/null 2>&1"; }
+if [ "$HOST" = agentic ] && [ "$PRINT_RUN$PRINT_ONBOARDING" = 00 ]; then
+  agent_mxid_from_store() { agentic_mxid; }
+fi
+
 if [ "$PRINT_MXID" -eq 1 ]; then
   if MXID_NOW="$(agent_mxid_from_store)"; then
     printf '%s\n' "$MXID_NOW"; exit 0
   fi
   echo "!! no persisted session in $STORE/config.toml yet (agent never logged in?)" >&2
   exit 1
+fi
+
+# ---------------------------------------------------------------- host preflight (real spawns, nothing changed yet)
+MOVED="a2a-moved-${NAME#aqua-agent-}"   # carry.py's name for a nuc10 copy whose agent runs on agentic
+if [ "$HOST" = agentic ]; then RESTART_CMD="ssh $AGENTIC_SSH docker restart $NAME"; else RESTART_CMD="podman restart $NAME"; fi
+moved_copy_here() {  # nuc10 holds the moved copy of this agent (its live one runs on agentic)
+  [ "$(XDG_RUNTIME_DIR="/run/user/$(id -u)" podman ps -a --filter "name=^${MOVED}\$" --format '{{.Names}}' 2>/dev/null)" = "$MOVED" ]
+}
+if [ "$REAL_SPAWN" -eq 1 ] && [ "$HOST" = agentic ]; then
+  SKH_RUN="$AQUA_OPS_DIR/tools/key-rotation/skh-run"
+  AGENTS_PY="$AQUA_OPS_DIR/tools/host-move/agents.py"
+  AGENTIC_MANIFEST="$(dirname "$PERSONA_HELPER")/agentic-manifest.py"
+  for f in "$SKH_RUN" "$AGENTS_PY" "$AGENTIC_MANIFEST"; do
+    [ -f "$f" ] || { echo "!! --host agentic needs $f (nothing changed)" >&2; exit 2; }
+  done
+  case "$PERSIST" in
+    "$HOME/.aqua-matrix-test/"*) : ;;
+    *) echo "!! --host agentic needs the persist dir below $HOME/.aqua-matrix-test, the layout agentic mirrors (got $PERSIST; nothing changed)" >&2; exit 2 ;;
+  esac
+  case "${AVATAR:-$HOME/}" in
+    "$HOME/"*) : ;;
+    *) echo "!! --host agentic needs --avatar below $HOME (got $AVATAR; nothing changed)" >&2; exit 2 ;;
+  esac
+  if [ -n "$(ls -A "$STORE" "$MEM" 2>/dev/null)" ]; then
+    echo "!! $PERSIST holds an identity or state on nuc10; a consultant with nuc10 state moves with carry.py, not a new spawn (nothing changed)" >&2
+    exit 2
+  fi
+  if XDG_RUNTIME_DIR="/run/user/$(id -u)" podman container exists "$NAME" >/dev/null 2>&1 || moved_copy_here; then
+    echo "!! nuc10 has a container for $NAME ($NAME or $MOVED); refusing a second identity on agentic (nothing changed)" >&2
+    exit 2
+  fi
+  agentic true || { echo "!! cannot reach $AGENTIC_SSH as deploy (nothing changed)" >&2; exit 2; }
+  if agentic_has_container; then
+    echo "!! $NAME already exists on agentic; manage it with agents.py stop|run|logs (nothing changed)" >&2
+    exit 2
+  fi
 fi
 
 # ---------------------------------------------------------------- resolve id/target/display
@@ -484,7 +566,7 @@ render_notice_unconfirmed() {
   [ -n "$NOTICE_PERSONA" ] && who="${NOTICE_PERSONA}'s"
   printf '⚠️ %s welcome to %s was not confirmed within %s s.\n\n' "$who" "${NOTICE_PERSON:-the peer}" "$1"
   [ -z "${2:-}" ] || printf '%s\n\n' "$2"
-  printf 'It retries on the next process start: podman restart %s.\n' "$NAME"
+  printf 'It retries on the next process start: %s.\n' "$RESTART_CMD"
 }
 
 if [ "$PRINT_ONBOARDING" -eq 1 ]; then
@@ -1080,6 +1162,10 @@ wipe_persist() {
   mkdir -p "$STORE" "$MEM"
 }
 
+if [ "$HOST" = nuc10 ] && moved_copy_here; then
+  echo "!! $NAME runs on agentic (nuc10 holds its moved copy $MOVED); refusing to start it on nuc10 too (no container changed)." >&2
+  exit 2
+fi
 [ "$FRESH" -eq 1 ] && preflight_fresh
 
 if podman container exists "$NAME"; then
@@ -1130,22 +1216,65 @@ echo ">> launching $NAME bound single-target to $TARGET"
 # The view was verified after the sync; verify it once more right before `podman run` (the last check, after any
 # --replace removal and --fresh wipe above), so a swap in between never reaches the mount.
 if [ "$REFS_MODE" = list ]; then refs_view_ok "right before podman run; with --replace the old container is already removed, fix the view and re-run"; fi
+# launch_agentic: the same run on agentic. The mounts and env names come from RUN_ARGS, so both hosts run one shape;
+# -e NAME=value pairs are not secret (target, config path, URLs), bare -e NAMEs reach the helper only through the
+# environment. stdout: the container id, or on failure the reason (one line); progress goes to stderr.
+launch_agentic() {
+  local i=0 a v s out line verb mounts=() envs=() envset=() srcs=()
+  while [ "$i" -lt "${#RUN_ARGS[@]}" ]; do
+    a="${RUN_ARGS[$i]}"; v="${RUN_ARGS[$((i + 1))]:-}"
+    case "$a" in
+      -v) case "$v" in *:ro) mounts+=(--mount "$v") ;; *:U) mounts+=(--mount "${v%:U}:rw") ;; *) mounts+=(--mount "$v:rw") ;; esac
+          s="${v%%:*}"; [ "$s" = "$REFS_VIEW" ] || srcs+=("$HOME/./${s#"$HOME"/}"); i=$((i + 2)) ;;
+      -e) envs+=(--env "${v%%=*}"); case "$v" in *=*) envset+=("$v") ;; esac; i=$((i + 2)) ;;
+      *) i=$((i + 1)) ;;
+    esac
+  done
+  env "${envset[@]}" python3 "$AGENTIC_MANIFEST" --out "$CARRY_LOCAL/meta" --name "$NAME" --image "$IMAGE" \
+    --home "$HOME" "${mounts[@]}" "${envs[@]}" >&2 || { echo "agentic-manifest.py refused the shape"; return 1; }
+  echo ">> agentic: config, avatar and the empty persist dirs, then the shape, into $AGENTIC_SSH:$CARRY_REMOTE" >&2
+  rsync -aL --relative -e "ssh -o BatchMode=yes" "${srcs[@]}" "$AGENTIC_SSH:$CARRY_REMOTE/home/" >&2 \
+    || { echo "rsync of the mount sources to $AGENTIC_SSH failed"; return 1; }
+  rsync -a -e "ssh -o BatchMode=yes" "$CARRY_LOCAL/meta/$NAME.json" "$CARRY_LOCAL/meta/$NAME.env" \
+    "$AGENTIC_SSH:$CARRY_REMOTE/meta/" >&2 || { echo "rsync of the shape to $AGENTIC_SSH failed"; return 1; }
+  echo ">> agentic: pushing the refs views (agentic-refs-push.service)" >&2
+  systemctl --user start agentic-refs-push.service >&2 \
+    || { echo "the refs push failed (systemctl --user status agentic-refs-push.service)"; return 1; }
+  agentic "test -d $SRV_REMOTE/${REFS_VIEW#"$HOME"/}" || { echo "the refs view is not on agentic after the push"; return 1; }
+  for verb in place run; do
+    echo ">> agentic: agents.py $verb $NAME" >&2
+    out="$("$SKH_RUN" --sudo --dir / prod "$AGENTS_PY" "$verb" "$NAME" 2>&1)"
+    printf '%s\n' "$out" | sed 's/^/   /' >&2
+    line="$(printf '%s\n' "$out" | grep -E '^SKH agents (placed|started) ' | tail -n1)"
+    case "$verb:$line" in
+      place:"SKH agents placed "*|run:"SKH agents started "*" state=running "*) : ;;
+      *) echo "agents.py $verb: $(printf '%s' "$out" | tail -n1)"; return 1 ;;
+    esac
+  done
+  agentic "docker inspect -f '{{.Id}}' $NAME"
+}
+
 set +e
-CID="$(PODMAN_DETACHED_LABEL="$NAME" "$PODMAN_DETACHED" run -d "${RUN_ARGS[@]}" 2>&1)"
+if [ "$HOST" = agentic ]; then
+  CID="$(launch_agentic)"
+else
+  CID="$(PODMAN_DETACHED_LABEL="$NAME" "$PODMAN_DETACHED" run -d "${RUN_ARGS[@]}" 2>&1)"
+fi
 run_rc=$?
 set -e
+if [ "$HOST" = agentic ]; then RUN_HOST="$AGENTIC_SSH"; RUN_VERB="agentic launch"; else RUN_HOST="$(hostname)"; RUN_VERB="podman run"; fi
 
 if [ "$run_rc" -ne 0 ]; then
-  echo "!! podman run failed (rc=$run_rc):" >&2
+  echo "!! $RUN_VERB failed (rc=$run_rc):" >&2
   printf '%s\n' "$CID" >&2
   notify -s CRITICAL -t "spawn FAILED: $NAME" \
-    "podman run rc=$run_rc launching '$NAME' (peer $TARGET) on $(hostname): $(printf '%s' "$CID" | tail -n1)"
+    "$RUN_VERB rc=$run_rc launching '$NAME' (peer $TARGET) on $RUN_HOST: $(printf '%s' "$CID" | tail -n1)"
   exit "$run_rc"
 fi
 
 CID_SHORT="$(printf '%s' "$CID" | tail -n1 | cut -c1-12)"
 notify -s INFO -t "channel up: $NAME" \
-  "agent '$NAME' launched, single-target peer $TARGET, $IDENTITY_NOTE, container $CID_SHORT, on $(hostname)."
+  "agent '$NAME' launched, single-target peer $TARGET, $IDENTITY_NOTE, container $CID_SHORT, on $RUN_HOST."
 
 ensure_activity_watch || true
 
@@ -1173,8 +1302,13 @@ fi
 # but the wait continues (a crash restart under --restart on-failure retries the hello); on the
 # timeout Tim's WARN carries the last such line. Every outcome is non-fatal for the spawn.
 ONB_FAIL_RE='initiate-DM hello failed|no DM room yet; deferring hello|hello send failed'
+container_logs() { if [ "$HOST" = agentic ]; then agentic "docker logs $NAME 2>&1"; else podman logs "$NAME" 2>&1; fi; }
+marker_exists() {  # the greeted marker; on agentic seen from inside the container (the memory tree is the agent's)
+  if [ "$HOST" = agentic ]; then agentic "docker exec $NAME sh -c '[ -e /agent/memory${ONB_MARKER#"$MEM"} ]'"
+  else [ -e "$ONB_MARKER" ]; fi
+}
 relay_hello_failure() {  # last relay hello-failure line of this container, ANSI-stripped, capped
-  podman logs "$NAME" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$ONB_FAIL_RE" | tail -n1 \
+  container_logs | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$ONB_FAIL_RE" | tail -n1 \
     | cut -c1-300 | tr '`' "'" || true
 }
 if [ "$ONBOARD" -eq 1 ]; then
@@ -1195,14 +1329,14 @@ if [ "$ONBOARD" -eq 1 ]; then
     echo ">> onboarding: waiting up to ${ONB_WAIT}s for ${NOTICE_PERSONA:-the consultant}'s welcome to be delivered (marker $ONB_MARKER)"
     ONB_START=$SECONDS; ONB_DONE=""; ONB_LOGLINE=""; ONB_SEEN=""
     while :; do
-      if [ -e "$ONB_MARKER" ]; then ONB_DONE=delivered; break; fi
+      if marker_exists; then ONB_DONE=delivered; break; fi
       ONB_LOGLINE="$(relay_hello_failure)"
       if [ -n "$ONB_LOGLINE" ] && [ "$ONB_LOGLINE" != "$ONB_SEEN" ]; then
         echo "!! onboarding: the relay reports a failed hello (still waiting, a restart retries): $ONB_LOGLINE" >&2
         ONB_SEEN="$ONB_LOGLINE"
       fi
       [ $((SECONDS - ONB_START)) -lt "$ONB_WAIT" ] || break
-      sleep 1
+      if [ "$HOST" = agentic ]; then sleep 4; else sleep 1; fi
     done
     if [ "$ONB_DONE" = delivered ]; then
       echo ">> onboarding: welcome delivered after $((SECONDS - ONB_START))s; telling Tim"
@@ -1210,7 +1344,7 @@ if [ "$ONBOARD" -eq 1 ]; then
     else
       ONB_DETAIL=""
       [ -z "$ONB_LOGLINE" ] || ONB_DETAIL="Last relay log line: \`${ONB_LOGLINE}\`"
-      echo "!! onboarding: welcome not confirmed within ${ONB_WAIT}s; it retries on the next process start: podman restart $NAME" >&2
+      echo "!! onboarding: welcome not confirmed within ${ONB_WAIT}s; it retries on the next process start: $RESTART_CMD" >&2
       notify -s WARN -t "welcome NOT confirmed: ${ONB_TITLE}" \
         "$(render_notice_unconfirmed "$ONB_WAIT" "$ONB_DETAIL")"
     fi
@@ -1220,7 +1354,8 @@ fi
 echo
 echo ">> container started: $CID_SHORT"
 echo ">> done. verify with:"
-echo "   podman logs -f $NAME    # watch it connect + self-mint its DID + set display name"
+if [ "$HOST" = agentic ]; then LOGS_CMD="ssh $AGENTIC_SSH docker logs -f $NAME"; else LOGS_CMD="podman logs -f $NAME"; fi
+echo "   $LOGS_CMD    # watch it connect + self-mint its DID + set display name"
 if [ -n "$MXID" ]; then
   echo "   # the consultant invites the peer itself; its MXID is $MXID"
 else

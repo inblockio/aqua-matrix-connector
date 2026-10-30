@@ -267,7 +267,7 @@ check "delivered notice: quoted blank lines are bare >" bash -c 'grep -qx ">" "$
 check "delivered notice: voice line quoted" has "$SB/out/a.delivered" "> - You can type, or send me a voice message."
 check "delivered notice: ends with the What's new marker" bash -c '[ "$(grep -v "^$" "$1" | tail -n1)" = "> *(followed by the \"What'"'"'s new\" list)*" ]' _ "$SB/out/a.delivered"
 check "unconfirmed notice head" has "$SB/out/a.unconfirmed" "⚠️ Pelagia's welcome to Andreas was not confirmed within 180 s."
-check "unconfirmed notice: retry hint" has "$SB/out/a.unconfirmed" "It retries on the next process start: podman restart aqua-agent-andreas-aqua-consultant-1."
+check "unconfirmed notice: retry hint (agentic, the default host)" has "$SB/out/a.unconfirmed" "It retries on the next process start: ssh agentic.inblock.io docker restart aqua-agent-andreas-aqua-consultant-1."
 check "section titles" bash -c 'grep -qF "INFO \"welcome delivered: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1" && grep -qF "WARN \"welcome NOT confirmed: Andreas (aqua-agent-andreas-aqua-consultant-1)\"" "$1"' _ "$SB/out/a.out"
 check "print-onboarding previews the Owner step (already present)" has "$SB/out/a.err" "owner allow-list: Owner $TARGET already present as 'peer'"
 check "no em/en dash" no_dashes "$SB/out/a.out"
@@ -301,7 +301,7 @@ spawn_onb() {
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
   rm -f "$NOTIFY_LOG"
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" SHIM_MODE=spawn \
+  env -i HOME="$FAKE_HOME" CONSULTANT_HOST=nuc10 PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$AL" ONBOARD_WAIT=10 "${envs[@]}" \
     bash "$SPAWN" --label "$label" --target "$TARGET" --no-refresh-refs "$@" \
@@ -383,7 +383,7 @@ spawn_owner() {
   mkdir -p "$TEST_DIR/$label-aqua-consultant-persist/store"
   printf '[session]\nuser_id = "%s"\n' "$AGENT_MXID" > "$TEST_DIR/$label-aqua-consultant-persist/store/config.toml"
   rm -f "$SIDE_EFFECTS"
-  env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" SHIM_MODE=spawn \
+  env -i HOME="$FAKE_HOME" CONSULTANT_HOST=nuc10 PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" AGENT_REFS_ROOT="$STUB_ROOT" SHIM_MODE=spawn \
     CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$al" \
     bash "$SPAWN" --label "$label" --target "$OWNER" --persona Pelagia --name Andreas --no-refresh-refs "$@" \

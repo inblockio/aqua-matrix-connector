@@ -60,6 +60,22 @@ One command. Renders the config from the template, launches with the hardened po
 a systemd activity-watcher, and (`--onboard`) tells the operator once the consultant's own welcome
 has reached the peer (see "Onboarding" below).
 
+**Where it runs: agentic (Tim, 2026-10-30).** Every new consultant is deployed on agentic.inblock.io,
+where the whole fleet runs since the A2A move of 2026-10-27; `--host agentic` is the default. The
+script prepares everything on nuc10 as before (Owner, refs view, config, avatar, registry row,
+activity watcher), then writes the run shape and env file in the A2A move's format
+(`agentic-manifest.py`, into `~/.cache/agents-to-agentic/carry/meta`), rsyncs them with the config,
+the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
+(`agentic-refs-push.service`) and starts the container with aqua-ops `tools/host-move/agents.py place`
++ `run` (root, through `tools/key-rotation/skh-run --sudo --dir / prod`). The MXID read-back and
+`--onboard` read the store, the greeted marker and the log on agentic; nuc10's activity watcher is fed
+by `agentic-feeds`. On agentic the script deploys NEW consultants only: `--replace`, `--fresh`,
+`--generic`, nuc10 state in the persist dir and an existing container of the name are refused, so
+`roll-consultant-fleet.sh` fails closed until image rolls on agentic get their own path. A running
+agentic consultant is stopped, started and inspected with `agents.py stop|run|logs <container>`.
+`--host nuc10` keeps the old podman path (tests); it refuses an agent whose moved copy
+(`a2a-moved-<rest>`) nuc10 holds, so the same identity never runs twice.
+
 **The consultant initiates the connection.** The template sets `"initiate_dm": true`, so on first
 connect (when no DM room exists yet) the agent creates the room, invites the peer, and delivers
 her greeting (the config's `hello`) into it; the peer just accepts the invite. That greeting IS
@@ -391,6 +407,11 @@ bash ~/spawn-consultant.sh --print-run --replace --keep-config --label zdnaez --
 Fleet-wide enablement is a separate decision (third-party processing disclosure to peers).
 
 ### Tests (no live side effects)
+
+`tests/spawn-consultant-agentic.sh` covers `--host agentic` with ssh, rsync, systemctl, podman and
+skh-run shimmed: the refusals, the shape and env file (the token only in the 0600 env file), the call
+order (sources, shape, refs push, place, run), Tim's notices, the read-backs on agentic, and
+`agentic-manifest.py` on its own. The other suites pin `CONSULTANT_HOST=nuc10` for their real spawns.
 
 `tests/podman-detached.sh` checks the launch wrapper with shims (scope argv, exit status and
 stdout passthrough, fail-closed refusal, plain podman only without systemd-run, the restore script
