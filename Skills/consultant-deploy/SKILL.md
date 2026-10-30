@@ -62,7 +62,7 @@ has reached the peer (see "Onboarding" below).
 
 **Where it runs: agentic (Tim, 2026-10-30).** Every new consultant is deployed on agentic.inblock.io,
 where the whole fleet runs since the A2A move of 2026-10-27; `--host agentic` is the default. The
-script prepares everything on nuc10 as before (Owner, refs view, config, avatar, registry row,
+script prepares everything on nuc10 as before (Owner, refs view, config, avatar,
 activity watcher), then writes the run shape and env file in the A2A move's format
 (`agentic-manifest.py`, into `~/.cache/agents-to-agentic/carry/meta`), rsyncs them with the config,
 the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
