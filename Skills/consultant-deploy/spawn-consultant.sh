@@ -170,7 +170,7 @@
 #
 # Host (Tim, 2026-10-30): consultants run on agentic.inblock.io, and every new one is deployed there. --host agentic
 # (the default; CONSULTANT_HOST overrides) renders and prepares everything here on nuc10 as before (Owner, refs view,
-# config, avatar, registry row, activity watcher), then, instead of `podman run`: writes the run shape and env file in
+# config, avatar, activity watcher), then, instead of `podman run`: writes the run shape and env file in
 # the format of the A2A move (agentic-manifest.py, into ~/.cache/agents-to-agentic/carry/meta), rsyncs them, the
 # config, the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
 # (agentic-refs-push.service), and starts the container with aqua-ops tools/host-move/agents.py place + run (root,
