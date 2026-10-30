@@ -6,7 +6,8 @@
 #     the order rsync sources -> rsync shape -> refs push -> agents.py place -> run, no podman run, Tim's notices
 #     name agentic, the MXID and the greeted marker are read on agentic, nuc10's activity watcher is wired
 #   - agents.py run failing: CRITICAL notice, non-zero exit
-#   - preflight refusals: nuc10 state in the persist dir, a container of the name on agentic
+#   - preflight refusals: nuc10 state in the persist dir; agentic holding a container, persist trees, or no docker;
+#     state appearing before the launch; empty nuc10 persist dirs (a retry) are not state
 #   - --host nuc10 refuses an agent whose moved copy nuc10 holds (a2a-moved-<rest>), no podman run
 #   - agentic-manifest.py: owners by mode, carry.py's key set, sources outside HOME refused
 set -uo pipefail
@@ -52,7 +53,9 @@ cat > "$SHIM_BIN/ssh" <<'EOF'
 cmd="${!#}"; echo "ssh $cmd" >> "@SIDE@"
 case "$cmd" in
   true) exit 0 ;;
-  "docker container inspect "*) [ -n "${SHIM_AGENTIC_HAS:-}" ]; exit $? ;;
+  "if ! docker info"*)   # agentic_probe; SHIM_PROBE="<1st> <2nd>" answers per call, default absent
+    n=$(( $(cat "@SB@/probes" 2>/dev/null || echo 0) + 1 )); echo "$n" > "@SB@/probes"
+    set -- ${SHIM_PROBE:-absent absent}; eval "echo \${$n:-absent}" ;;
   "test -d "*) exit 0 ;;
   "docker exec "*" grep "*) echo 'user_id = "@AGENT@"' ;;
   "docker exec "*" sh -c "*) exit 0 ;;
@@ -90,7 +93,7 @@ case "$verb" in
 esac
 EOF
 touch "$OPS/tools/host-move/agents.py"
-sed -i "s|@SIDE@|$SIDE|; s|@AGENT@|$AGENT_MXID|" "$SHIM_BIN"/* "$OPS/tools/key-rotation/skh-run"
+sed -i "s|@SIDE@|$SIDE|; s|@AGENT@|$AGENT_MXID|; s|@SB@|$SB|g" "$SHIM_BIN"/* "$OPS/tools/key-rotation/skh-run"
 chmod +x "$STUB" "$SHIM_BIN"/* "$OPS/tools/key-rotation/skh-run"
 cat > "$SB/notify" <<EOF
 #!/usr/bin/env python3
@@ -103,7 +106,7 @@ chmod +x "$SB/notify"
 spawn() {
   local name="$1"; shift; local rc=0 envs=()
   while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
-  rm -f "$SIDE" "$NOTIFY_LOG"
+  rm -f "$SIDE" "$NOTIFY_LOG" "$SB/probes"
   env -i HOME="$FAKE_HOME" PATH="$SHIM_BIN:/usr/local/bin:/usr/bin:/bin" AGENT_REFS_BIN="$STUB" \
     AGENT_REFS_ROOT="$REFS_ROOT" CONSULTANT_TEST_DIR="$TEST_DIR" AQUA_CLAUDE_TOKEN_FILE="$TOKEN_FILE" \
     CONSULTANT_NOTIFY="$SB/notify" AQUA_SYSTEM_ALLOWLIST="$AL" AQUA_OPS_DIR="$OPS" ONBOARD_WAIT=10 \
@@ -189,10 +192,19 @@ spawn local -- --label gamma --persona Pelagia
 check "nuc10 identity in the persist dir: exit 2, nothing sent" bash -c \
   '[ "$(cat "$1")" = 2 ] && grep -q "holds an identity or state on nuc10" "$2"' _ "$SB/out/local.rc" "$SB/out/local.err"
 check "  ... and nothing reached agentic" quiet
-spawn exists SHIM_AGENTIC_HAS=1 -- --label delta --persona Pelagia
-check "a container of the name on agentic: exit 2" bash -c \
-  '[ "$(cat "$1")" = 2 ] && grep -q "already exists on agentic" "$2"' _ "$SB/out/exists.rc" "$SB/out/exists.err"
-check "  ... no rsync, no agents.py" bash -c '! grep -qE "^(rsync|skh-run)" "$1"' _ "$SIDE"
+for p in "container:already exists on agentic" "state:its identity lives there" "docker_down:cannot tell what agentic holds"; do
+  spawn "probe-${p%%:*}" "SHIM_PROBE=${p%%:*}" -- --label delta --persona Pelagia
+  check "agentic holds ${p%%:*}: exit 2, named" bash -c '[ "$(cat "$1")" = 2 ] && grep -q "$3" "$2"' \
+    _ "$SB/out/probe-${p%%:*}.rc" "$SB/out/probe-${p%%:*}.err" "${p#*:}"
+  check "  ... no rsync, no agents.py" bash -c '! grep -qE "^(rsync|skh-run)" "$1"' _ "$SIDE"
+done
+spawn reprobe "SHIM_PROBE=absent state" -- --label zeta --persona Pelagia
+check "state appearing between the preflight and the launch: refused, nothing sent" bash -c \
+  '[ "$(cat "$1")" != 0 ] && grep -q "it held nothing at the preflight" "$2" && ! grep -qE "^(rsync|skh-run)" "$3"' \
+  _ "$SB/out/reprobe.rc" "$SB/out/reprobe.err" "$SIDE"
+mkdir -p "$TEST_DIR/eta-aqua-consultant-persist/store" "$TEST_DIR/eta-aqua-consultant-persist/memory"
+spawn retry -- --label eta --persona Pelagia
+check "empty persist dirs on nuc10 (a retry): not refused, exit 0" rc_is retry 0
 spawn moved SHIM_MOVED=a2a-moved-eps-aqua-consultant-1 CONSULTANT_HOST=nuc10 -- --label eps --persona Pelagia
 check "--host nuc10 with a moved copy: exit 2, no podman run" bash -c \
   '[ "$(cat "$1")" = 2 ] && grep -q "runs on agentic" "$2" && ! grep -q "^podman run" "$3"' _ "$SB/out/moved.rc" "$SB/out/moved.err" "$SIDE"

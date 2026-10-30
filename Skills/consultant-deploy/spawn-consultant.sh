@@ -175,9 +175,9 @@
 # config, the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
 # (agentic-refs-push.service), and starts the container with aqua-ops tools/host-move/agents.py place + run (root,
 # through skh-run). The MXID read-back and --onboard read the agent's store, marker and log on agentic. Real spawns on
-# agentic are for NEW consultants only: --replace, --fresh, --generic, a local identity (store/agent.pem) or an existing
-# container of the name on agentic are refused; a running agentic agent is stopped and started with agents.py. nuc10's
-# activity watcher gets the agent's lines through agentic-feeds. --host nuc10 is the old podman path, kept for the
+# agentic are for NEW consultants only: --replace, --fresh, --generic, nuc10 state in the persist dir, and anything
+# agentic holds for the name (a container, persist trees) or a docker it cannot ask are refused; a running agentic
+# agent is stopped and started with agents.py. nuc10's activity watcher gets the agent's lines through agentic-feeds. --host nuc10 is the old podman path, kept for the
 # tests; it refuses an agent whose nuc10 copy was moved (a2a-moved-<rest> exists). --print-run and --print-onboarding
 # read nuc10 only; --print-mxid reads the agent's store on agentic (the user_id line, through docker exec).
 #
@@ -404,7 +404,13 @@ agentic_mxid() {
   agentic "docker exec $NAME grep -o -m1 'user_id = \"@[^\"]*\"' /agent/store/config.toml" 2>/dev/null \
     | sed -n 's/^user_id = "\(@[^"]*:[^"]*\)"$/\1/p' | grep . || return 1
 }
-agentic_has_container() { agentic "docker container inspect $NAME >/dev/null 2>&1"; }
+# agentic_probe: what agentic holds for this consultant, one word: absent (nothing: a new consultant may go there),
+# container, state (persist trees in /srv/agents/home: agents.py place would rsync --delete over them) or docker_down.
+# Anything but "absent", an ssh failure included, refuses the spawn.
+agentic_probe() {
+  local prel="${PERSIST#"$HOME"/}"
+  agentic "if ! docker info >/dev/null 2>&1; then echo docker_down; elif docker container inspect $NAME >/dev/null 2>&1; then echo container; elif [ -e '$SRV_REMOTE/$prel' ]; then echo state; else echo absent; fi"
+}
 if [ "$HOST" = agentic ] && [ "$PRINT_RUN$PRINT_ONBOARDING" = 00 ]; then
   agent_mxid_from_store() { agentic_mxid; }
 fi
@@ -438,7 +444,7 @@ if [ "$REAL_SPAWN" -eq 1 ] && [ "$HOST" = agentic ]; then
     "$HOME/"*) : ;;
     *) echo "!! --host agentic needs --avatar below $HOME (got $AVATAR; nothing changed)" >&2; exit 2 ;;
   esac
-  if [ -n "$(ls -A "$STORE" "$MEM" 2>/dev/null)" ]; then
+  if [ -n "$(find "$STORE" "$MEM" -mindepth 1 -print -quit 2>/dev/null)" ]; then
     echo "!! $PERSIST holds an identity or state on nuc10; a consultant with nuc10 state moves with carry.py, not a new spawn (nothing changed)" >&2
     exit 2
   fi
@@ -446,11 +452,13 @@ if [ "$REAL_SPAWN" -eq 1 ] && [ "$HOST" = agentic ]; then
     echo "!! nuc10 has a container for $NAME ($NAME or $MOVED); refusing a second identity on agentic (nothing changed)" >&2
     exit 2
   fi
-  agentic true || { echo "!! cannot reach $AGENTIC_SSH as deploy (nothing changed)" >&2; exit 2; }
-  if agentic_has_container; then
-    echo "!! $NAME already exists on agentic; manage it with agents.py stop|run|logs (nothing changed)" >&2
-    exit 2
-  fi
+  AGENTIC_HOLDS="$(agentic_probe)" || AGENTIC_HOLDS="unreachable"
+  case "$AGENTIC_HOLDS" in
+    absent) : ;;
+    container) echo "!! $NAME already exists on agentic; manage it with agents.py stop|run|logs (nothing changed)" >&2; exit 2 ;;
+    state) echo "!! agentic holds persist trees for $NAME but no container: its identity lives there; start it with agents.py run, never a new spawn (nothing changed)" >&2; exit 2 ;;
+    *) echo "!! cannot tell what agentic holds for $NAME ($AGENTIC_HOLDS); refusing (nothing changed)" >&2; exit 2 ;;
+  esac
 fi
 
 # ---------------------------------------------------------------- resolve id/target/display
@@ -1230,6 +1238,9 @@ launch_agentic() {
       *) i=$((i + 1)) ;;
     esac
   done
+  # Again right before anything is sent: place rsyncs --delete, so it must never meet an existing identity.
+  v="$(agentic_probe)" || v=unreachable
+  [ "$v" = absent ] || { echo "agentic holds '$v' for $NAME now (it held nothing at the preflight); nothing sent"; return 1; }
   env "${envset[@]}" python3 "$AGENTIC_MANIFEST" --out "$CARRY_LOCAL/meta" --name "$NAME" --image "$IMAGE" \
     --home "$HOME" "${mounts[@]}" "${envs[@]}" >&2 || { echo "agentic-manifest.py refused the shape"; return 1; }
   echo ">> agentic: config, avatar and the empty persist dirs, then the shape, into $AGENTIC_SSH:$CARRY_REMOTE" >&2
