@@ -2466,6 +2466,12 @@ impl AgentClient {
     /// minutes, the access token lives 300 s), so it re-authenticates itself:
     /// a send refused with `M_UNKNOWN_TOKEN` mints a fresh session once and is
     /// repeated on it. See [`ReplyStream`] for what happens when that fails.
+    ///
+    /// The refresh belongs to the stream: it does NOT give this `AgentClient` (or
+    /// its clones) a new token, because matrix-sdk cannot swap a token in place.
+    /// A caller that keeps sending from the same clone after the reply (a voice
+    /// note, a file) must still refresh it itself (`reauth_token_only`, or the
+    /// `*_with_refresh` sends) when `expires_at_unix` is close.
     pub async fn reply_stream(&self, target: &str) -> Result<ReplyStream> {
         let target_uid: &UserId = target
             .try_into()
@@ -2827,9 +2833,9 @@ impl Drop for TypingGuard {
 /// **When sends fail.** Streaming is best-effort, [`finish`](Self::finish) is
 /// authoritative:
 /// - opening a message (the first one, a rollover continuation) that fails is
-///   retried with an exponential backoff ([`OpenGate`]), never once per chunk;
+///   retried with an exponential backoff (`OpenGate`), never once per chunk;
 /// - a send refused with `M_UNKNOWN_TOKEN` mints a fresh session once and is
-///   repeated on it ([`Self::deliver`]); if that cannot be done, or the fresh
+///   repeated on it (`ReplyStream::deliver`); if that cannot be done, or the fresh
 ///   token is refused too, streaming stops and `push` / `set` only buffer;
 /// - `finish` still makes its own bounded attempts (it ignores the backoff and
 ///   the stop) and returns the error, which `is_unknown_token` classifies for
