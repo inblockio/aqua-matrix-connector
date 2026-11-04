@@ -13,6 +13,8 @@ pub mod net_retry;
 mod recovery;
 mod registry;
 pub mod reply;
+#[cfg(test)]
+mod reply_stream_tests;
 mod rtc_keys;
 mod rtc_member;
 
@@ -2459,6 +2461,17 @@ impl AgentClient {
     /// edit that same message in place (Matrix `m.replace`), so an answer
     /// appears to type out instead of landing as one block. Errors if no DM room
     /// exists yet — callers should fall back to [`AgentClient::send_dm`].
+    ///
+    /// The stream outlives the client cycle it was opened in (a turn can run for
+    /// minutes, the access token lives 300 s), so it re-authenticates itself:
+    /// a send refused with `M_UNKNOWN_TOKEN` mints a fresh session once and is
+    /// repeated on it. See [`ReplyStream`] for what happens when that fails.
+    ///
+    /// The refresh belongs to the stream: it does NOT give this `AgentClient` (or
+    /// its clones) a new token, because matrix-sdk cannot swap a token in place.
+    /// A caller that keeps sending from the same clone after the reply (a voice
+    /// note, a file) must still refresh it itself (`reauth_token_only`, or the
+    /// `*_with_refresh` sends) when `expires_at_unix` is close.
     pub async fn reply_stream(&self, target: &str) -> Result<ReplyStream> {
         let target_uid: &UserId = target
             .try_into()
@@ -2467,7 +2480,8 @@ impl AgentClient {
             .find_dm_room(target_uid)
             .await
             .ok_or_else(|| anyhow!("no DM room with {target} for a streaming reply"))?;
-        ReplyStream::start(room).await
+        let refresher = room_refresher(self.config.clone(), room.room_id().to_owned());
+        ReplyStream::start(room, Some(refresher)).await
     }
 
     /// Resolve `room_id` to a room this agent has **joined**. Unlike
@@ -2495,7 +2509,8 @@ impl AgentClient {
     /// `room_id`; callers fall back to [`AgentClient::send_to_room`].
     pub async fn reply_stream_in_room(&self, room_id: &str) -> Result<ReplyStream> {
         let room = self.joined_room(room_id)?;
-        ReplyStream::start(room).await
+        let refresher = room_refresher(self.config.clone(), room.room_id().to_owned());
+        ReplyStream::start(room, Some(refresher)).await
     }
 }
 
@@ -2569,6 +2584,109 @@ const FINALIZE_RETRY_BASE: Duration = Duration::from_millis(500);
 /// mid-request. See [`AgentClient::send_dm_self_healing`].
 const TOKEN_REFRESH_MARGIN: u64 = 60;
 
+/// First wait after a failed attempt to OPEN a streamed message (the first
+/// message of a reply, or a rollover continuation). Each further failure doubles
+/// it up to [`OPEN_RETRY_MAX`].
+///
+/// Without a wait, an un-started stream retried the open on every `push`, which
+/// is once per streamed chunk: a homeserver that refused the send turned one
+/// reply into hundreds of requests in seconds (2026-11-03: about 450 attempts in
+/// 20 s against a rejected token). The retry is only a nicety, because
+/// [`ReplyStream::finish`] delivers the whole reply whatever happened while
+/// streaming, so a slow retry costs nothing.
+const OPEN_RETRY_BASE: Duration = Duration::from_secs(1);
+/// Ceiling of the open-retry wait.
+const OPEN_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// After a stream has swapped to a fresh session, a second `M_UNKNOWN_TOKEN`
+/// inside this window is not answered with another refresh: a token minted
+/// moments ago that is still refused means the account is signed out, which no
+/// further refresh grant fixes. The stream then gives up streaming and leaves
+/// delivery to [`ReplyStream::finish`] and the caller's fallback.
+const STREAM_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Backoff state for opening a streamed message: how many times in a row an
+/// open failed, and the earliest instant the next attempt is allowed. Pure
+/// (the caller passes `now`), so the schedule is unit-testable without a clock.
+#[derive(Debug, Default)]
+struct OpenGate {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl OpenGate {
+    /// Whether an open attempt may run at `now`.
+    fn ready(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// The wait after `failures` consecutive failures: base, 2x, 4x ... capped.
+    fn backoff(failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        OPEN_RETRY_BASE
+            .saturating_mul(1u32 << doublings)
+            .min(OPEN_RETRY_MAX)
+    }
+
+    /// Record a failed attempt at `now`; returns how long the next one waits.
+    fn failed(&mut self, now: Instant) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let wait = Self::backoff(self.failures);
+        self.retry_at = Some(now + wait);
+        wait
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Builds a [`matrix_sdk::Room`] handle on a freshly minted session, for a
+/// [`ReplyStream`] whose access token was rejected. Production wiring is
+/// [`room_refresher`]; tests inject their own.
+type RoomRefreshFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<matrix_sdk::Room>> + Send>>;
+type RoomRefresher = std::sync::Arc<dyn Fn() -> RoomRefreshFuture + Send + Sync>;
+
+/// Mint a new session for the agent behind `config` (refresh grant, persisted to
+/// `config.toml` under the per-store lock, the same call `reauth_inner` makes),
+/// restore a matrix-sdk `Client` on it WITHOUT syncing, and return its handle on
+/// `room_id`. No sync, because the relay's cycle client owns the one sync of the
+/// device (H9 single-sync) and the room, its encryption state and the Megolm
+/// sessions are in the shared on-disk store it keeps current.
+///
+/// Unlike `reauth_inner` this never wipes the crypto store on a device mismatch:
+/// a reply stream must not be able to destroy the device's keys, so a mismatch is
+/// an error and the caller falls back.
+async fn fresh_room(config: &AgentConfig, room_id: &RoomId) -> Result<matrix_sdk::Room> {
+    let (access_token, user_id, device_id, _expires_at) = mint_session_token(config, None).await?;
+    let user_id: OwnedUserId = user_id
+        .try_into()
+        .map_err(|e| anyhow!("stream refresh: invalid user_id: {e}"))?;
+    let device_id: OwnedDeviceId = device_id.into();
+    let client = build_and_restore(
+        &config.matrix_url,
+        &config.store_dir,
+        &user_id,
+        &device_id,
+        &access_token,
+    )
+    .await
+    .context("stream refresh: could not restore the session")?;
+    client
+        .get_room(room_id)
+        .ok_or_else(|| anyhow!("stream refresh: room {room_id} not known to the new session"))
+}
+
+/// The [`RoomRefresher`] for streams of `config`'s agent into `room_id`.
+fn room_refresher(config: AgentConfig, room_id: OwnedRoomId) -> RoomRefresher {
+    std::sync::Arc::new(move || {
+        let config = config.clone();
+        let room_id = room_id.clone();
+        Box::pin(async move { fresh_room(&config, &room_id).await })
+    })
+}
+
 /// Retry `op` until it returns `Ok` (the send was acknowledged by the server)
 /// or [`FINALIZE_MAX_ATTEMPTS`] is exhausted, with linear backoff. `op`'s `Ok`
 /// value is the homeserver's confirmation (an event id), so a success here is a
@@ -2576,6 +2694,11 @@ const TOKEN_REFRESH_MARGIN: u64 = 60;
 /// fire-and-forget. On exhaustion the last error is returned so the caller can
 /// surface it. Safe to retry: `room.send` only yields an event id once the
 /// event is persisted, so a failed attempt means nothing landed.
+///
+/// A rejected access token ([`is_unknown_token`]) ends the loop at once: the
+/// same dead token is refused the same way 0.5 s later, and the stream's own
+/// refresh already ran inside `op`. Spending the other attempts only delays the
+/// caller's recovery (a token refresh and a plain DM).
 async fn retry_finalize<T, F, Fut>(what: &str, mut op: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -2594,7 +2717,11 @@ where
                 tracing::warn!(
                     "{what}: transmission attempt {attempt}/{FINALIZE_MAX_ATTEMPTS} failed: {e:#}"
                 );
+                let rejected_token = is_unknown_token(&e);
                 last_err = Some(e);
+                if rejected_token {
+                    break;
+                }
                 if attempt < FINALIZE_MAX_ATTEMPTS {
                     tokio::time::sleep(FINALIZE_RETRY_BASE * attempt as u32).await;
                 }
@@ -2702,8 +2829,36 @@ impl Drop for TypingGuard {
 /// onto a new message at a clean boundary, so an arbitrarily long answer is
 /// delivered as a sequence of readable messages and no single edit can ever
 /// exceed Matrix's event-size cap (the `413 M_TOO_LARGE` failure mode).
+///
+/// **When sends fail.** Streaming is best-effort, [`finish`](Self::finish) is
+/// authoritative:
+/// - opening a message (the first one, a rollover continuation) that fails is
+///   retried with an exponential backoff (`OpenGate`), never once per chunk;
+/// - a send refused with `M_UNKNOWN_TOKEN` mints a fresh session once and is
+///   repeated on it (`ReplyStream::deliver`); if that cannot be done, or the fresh
+///   token is refused too, streaming stops and `push` / `set` only buffer;
+/// - `finish` still makes its own bounded attempts (it ignores the backoff and
+///   the stop) and returns the error, which `is_unknown_token` classifies for
+///   the caller's fallback (refresh the agent's token, send a plain DM).
 pub struct ReplyStream {
-    room: matrix_sdk::Room,
+    /// The room the reply goes to. Behind a lock because a rejected access token
+    /// swaps in a handle from a freshly minted session ([`Self::refresh_room`]);
+    /// the lock is only ever held to clone the handle, never across an await.
+    room: std::sync::Mutex<matrix_sdk::Room>,
+    /// How to get a room handle on a fresh session. `None` for a stream with no
+    /// way to re-authenticate: a rejected token then ends streaming at once.
+    refresher: Option<RoomRefresher>,
+    /// When the session was last swapped (or a swap last attempted), so a token
+    /// that is refused again right after a refresh is not refreshed in a loop.
+    last_refresh: std::sync::Mutex<Option<Instant>>,
+    /// Set once the account's token is refused and a refresh did not cure it.
+    /// From then on the intermediate paths (`push`, `set`, `set_now`, rollover,
+    /// throttled edits) send nothing and only buffer; [`finish`](Self::finish)
+    /// still makes its own bounded attempts, then reports the error so the caller
+    /// can fall back (refresh the agent's token, plain DM).
+    gave_up: std::sync::atomic::AtomicBool,
+    /// Backoff for opening a message (the first one, or a rollover continuation).
+    open_gate: OpenGate,
     /// The *current* (still editable) message; rollover advances this. `None`
     /// until the first message is actually sent — we hold it back (see
     /// [`FIRST_MESSAGE_MIN_BYTES`]) so the receiver's push notification previews
@@ -2721,13 +2876,17 @@ pub struct ReplyStream {
 }
 
 impl ReplyStream {
-    async fn start(room: matrix_sdk::Room) -> Result<Self> {
+    async fn start(room: matrix_sdk::Room, refresher: Option<RoomRefresher>) -> Result<Self> {
         // Deliberately send NOTHING yet: a placeholder "…" would fire a push
         // notification with no content. The first real message is sent by `push`
         // once the buffer is meaningful, or by `finish` for a short reply. The
         // caller shows a typing indicator until then.
         Ok(Self {
-            room,
+            room: std::sync::Mutex::new(room),
+            refresher,
+            last_refresh: std::sync::Mutex::new(None),
+            gave_up: std::sync::atomic::AtomicBool::new(false),
+            open_gate: OpenGate::default(),
             event_id: None,
             buf: String::new(),
             last_edit: Instant::now(),
@@ -2743,18 +2902,106 @@ impl ReplyStream {
         self.event_id.is_some()
     }
 
+    /// Whether streaming was given up on because the token was refused and a
+    /// refresh did not help (see [`Self::gave_up`]).
+    fn gave_up(&self) -> bool {
+        self.gave_up.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The current room handle (cheap clone; the lock is not held afterwards).
+    fn room(&self) -> matrix_sdk::Room {
+        self.room.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Swap in a room handle from a freshly minted session. Returns `true` when
+    /// the swap happened and the rejected send is worth one retry; `false` when
+    /// there is no refresher, a refresh ran less than [`STREAM_REFRESH_COOLDOWN`]
+    /// ago (the new token is refused too: refreshing again cannot help), or the
+    /// refresh itself failed.
+    async fn refresh_room(&self) -> bool {
+        let Some(refresher) = self.refresher.clone() else {
+            return false;
+        };
+        {
+            let mut last = self.last_refresh.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|at| at.elapsed() < STREAM_REFRESH_COOLDOWN) {
+                return false;
+            }
+            *last = Some(Instant::now());
+        }
+        tracing::warn!(
+            "reply-stream: access token rejected (M_UNKNOWN_TOKEN); minting a fresh session and retrying once"
+        );
+        match refresher().await {
+            Ok(room) => {
+                *self.room.lock().unwrap_or_else(|p| p.into_inner()) = room;
+                tracing::info!("reply-stream: continuing on a refreshed session");
+                true
+            }
+            Err(e) => {
+                tracing::warn!("reply-stream: token refresh failed: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// Send `content` to the room and return the event id. A rejected access
+    /// token ([`is_unknown_token`]) is not final: the relay rotates its client's
+    /// token on its own cycle (about every 270 s), while a reply streams through
+    /// a handle taken from the client that was current when it began, so a long
+    /// turn outlives that token. The stream mints a fresh session once
+    /// ([`Self::refresh_room`]) and repeats the send once. If that cannot be
+    /// done, or the fresh token is refused too, streaming stops
+    /// ([`Self::gave_up`]) and the error is returned for the caller to handle.
+    async fn deliver(&self, content: RoomMessageEventContent) -> Result<OwnedEventId> {
+        let err = match self.room().send(content.clone()).await {
+            Ok(resp) => return Ok(resp.response.event_id.clone()),
+            Err(e) => anyhow::Error::from(e),
+        };
+        if !is_unknown_token(&err) {
+            return Err(err);
+        }
+        if !self.refresh_room().await {
+            self.gave_up
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(err);
+        }
+        match self.room().send(content).await {
+            Ok(resp) => Ok(resp.response.event_id.clone()),
+            Err(e) => {
+                let e = anyhow::Error::from(e);
+                if is_unknown_token(&e) {
+                    self.gave_up
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Send the first message as a NEW message carrying the buffer so far, so the
     /// receiver's notification previews the first lines. Best-effort: on failure
-    /// we stay un-started and retry on the next `push` / `finish`.
+    /// we stay un-started and try again on a later `push` / `finish`, but not on
+    /// every chunk: attempts are spaced by [`OpenGate`]'s backoff, and a refused
+    /// token that a refresh does not cure ends streaming ([`Self::gave_up`]).
     async fn send_first(&mut self) {
+        if self.gave_up() || !self.open_gate.ready(Instant::now()) {
+            return;
+        }
         match self.send_new(&render_streaming(&self.buf)).await {
             Ok(ev) => {
                 self.event_id = Some(ev);
                 self.messages = 1;
                 self.last_edit = Instant::now();
                 self.pending = false;
+                self.open_gate.succeeded();
             }
-            Err(e) => tracing::warn!("reply-stream: first message send failed (will retry): {e:#}"),
+            Err(e) => {
+                let wait = self.open_gate.failed(Instant::now());
+                tracing::warn!(
+                    "reply-stream: first message send failed (next try in {wait:?}, or at finish): {e:#}"
+                );
+            }
         }
     }
 
@@ -2880,6 +3127,11 @@ impl ReplyStream {
     /// continuation message can't be opened, so the caller can degrade instead
     /// of looping. An open code fence is carried across the split.
     async fn roll_over(&mut self) -> bool {
+        // Same backoff as the first message: a continuation that cannot be
+        // opened must not be retried on every following chunk.
+        if self.gave_up() || !self.open_gate.ready(Instant::now()) {
+            return false;
+        }
         let cut = pick_boundary(&self.buf, STREAM_ROLLOVER_BYTES);
         let raw_head = &self.buf[..cut];
         let head = match raw_head.trim_end() {
@@ -2899,10 +3151,14 @@ impl ReplyStream {
         let new_ev = match self.send_new(&render_streaming(&new_buf)).await {
             Ok(ev) => ev,
             Err(e) => {
-                tracing::warn!("reply-rollover: cannot open continuation message: {e:#}");
+                let wait = self.open_gate.failed(Instant::now());
+                tracing::warn!(
+                    "reply-rollover: cannot open continuation message (next try in {wait:?}): {e:#}"
+                );
                 return false;
             }
         };
+        self.open_gate.succeeded();
         // Freeze the current message at the clean head (no cursor). Retried, but
         // best-effort: a frozen message is never re-edited, so don't abort on it.
         if let Err(e) = retry_finalize("reply-rollover", || self.edit(&head_final)).await {
@@ -2921,17 +3177,18 @@ impl ReplyStream {
     /// message). Used to open a rollover continuation and the first message —
     /// always with real content so it never notifies as a bare placeholder.
     async fn send_new(&self, body: &str) -> Result<OwnedEventId> {
-        let resp = self
-            .room
-            .send(RoomMessageEventContent::text_markdown(body))
+        self.deliver(RoomMessageEventContent::text_markdown(body))
             .await
-            .context("failed to open continuation message")?;
-        Ok(resp.response.event_id.clone())
+            .context("failed to open continuation message")
     }
 
     /// A best-effort in-place edit: logs and swallows any send error so a
     /// throttled streaming update can never abort the run producing the reply.
+    /// Sends nothing once streaming was given up on ([`Self::gave_up`]).
     async fn edit_best_effort(&self, body: &str) {
+        if self.gave_up() {
+            return;
+        }
         if let Err(e) = self.edit(body).await {
             tracing::warn!("reply-stream: dropped a best-effort streaming edit: {e:#}");
         }
@@ -2949,8 +3206,7 @@ impl ReplyStream {
         // We are the author and already hold the event id, so this is safe.
         let content = RoomMessageEventContent::text_markdown(body)
             .make_replacement(ReplacementMetadata::new(event_id, None));
-        self.room
-            .send(content)
+        self.deliver(content)
             .await
             .context("failed to send streaming edit")?;
         Ok(())
@@ -2961,8 +3217,7 @@ impl ReplyStream {
     /// is far smaller on the wire than the equivalent edit.
     async fn send_plain(&self, body: &str) -> Result<()> {
         let content = RoomMessageEventContent::text_markdown(body);
-        self.room
-            .send(content)
+        self.deliver(content)
             .await
             .context("failed to send continuation message")?;
         Ok(())
