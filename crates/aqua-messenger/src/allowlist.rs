@@ -389,6 +389,12 @@ impl AllowList {
         Self::build(Some(path), Vec::new(), "Aqua System", "Tim")
     }
 
+    /// [`AllowList::new`] that also refuses these MXIDs as observers (the
+    /// bridge's own account, read from its persisted session). STUB: ignored.
+    pub fn new_with_reserved(path: PathBuf, _reserved: Vec<String>) -> Self {
+        Self::new(path)
+    }
+
     /// The embedded-agent default: ONLY the owner. More people or rooms need
     /// an explicit `extra_file` (same TOML: `[[recipients]]` + `[[rooms]]`),
     /// merged on top and hot-reloaded. A missing extra file is simply
@@ -584,6 +590,12 @@ impl AllowList {
     /// The loaded `[[observers]]` rows.
     pub fn observers(&self) -> &[Observer] {
         &self.observers
+    }
+
+    /// True when an observer row has named `room_id` since this list was
+    /// built, even if the row is gone now. STUB: never.
+    pub fn was_observed(&self, _room_id: &str) -> bool {
+        false
     }
 
     /// The observers bound to `room_id` (owned, for use across an await).
@@ -1192,4 +1204,82 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         assert!(a.resolve("owner").is_some());
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
+
+    // ---- fix pass: review findings B3, B4, B8 and the stale snapshot -------
+
+    #[test]
+    fn two_observers_for_one_room_are_refused() {
+        let two = format!(
+            "{WITH_OBSERVER}\n[[observers]]\nname = \"second\"\nmxid = \"@other:matrix.inblock.io\"\nroom_id = \"{TIM_DM}\"\n"
+        );
+        let err = parse_all(&two).unwrap_err();
+        assert!(
+            err.starts_with("observer second:") && err.contains(TIM_DM) && err.contains("voice-inbox"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_observer_name_may_not_reuse_a_person_or_room_name() {
+        for name in ["tim", "TIM", "daily-updates"] {
+            let text = format!(
+                "{WITH_ROOMS}\n[[observers]]\nname = \"{name}\"\nmxid = \"@reader:x\"\nroom_id = \"!dm:x\"\n"
+            );
+            let err = parse_all(&text).unwrap_err();
+            assert!(err.starts_with(&format!("observer {name}:")), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_bridges_own_account_cannot_be_an_observer() {
+        let own = "@bridge:matrix.inblock.io";
+        let text = format!(
+            "[[recipients]]\nname = \"tim\"\nmxid = \"@abc123:matrix.inblock.io\"\n\n[[observers]]\nname = \"me\"\nmxid = \"@BRIDGE:matrix.inblock.io\"\nroom_id = \"{TIM_DM}\"\n"
+        );
+        let p = cache_file("obs-reserved", &text);
+        let a = AllowList::new_with_reserved(p.clone(), vec![own.to_string()]);
+        let why = a.observer_error().expect("the row is refused");
+        assert!(why.starts_with("observer me:") && why.contains("own account"), "{why}");
+        assert!(a.observers().is_empty());
+        // the same file is fine for a list that reserves nothing
+        let open = AllowList::new(p.clone());
+        assert_eq!(open.observers().len(), 1);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn an_owner_only_file_error_wins_over_an_observer_error() {
+        // The extra file re-points the owner's name AND carries a bad observer.
+        let text = "[[recipients]]\nname = \"owner\"\nmxid = \"@evil:x\"\n\n[[observers]]\nname = \"o\"\nmxid = \"bad\"\nroom_id = \"!r:x\"\n";
+        let p = cache_file("obs-owner-order", text);
+        let a = AllowList::owner_only(owner(), Some(p.clone()), "M");
+        let why = a.load_error().expect("the recipient error closes the list");
+        assert!(why.contains("built-in name") && why.contains("owner"), "{why}");
+        assert!(a.observer_error().is_none(), "the observer row is not blamed");
+        assert_eq!(a.resolve("owner").unwrap().mxid, "@own:x");
+        assert!(a.by_mxid("@evil:x").is_none());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn a_room_stays_observed_after_its_row_is_gone() {
+        let p = cache_file("obs-ever", GOOD_OBSERVER_FILE);
+        let mut a = AllowList::new(p.clone());
+        assert!(a.was_observed(TIM_DM));
+        assert!(!a.was_observed("!elsewhere:x"));
+        // the row is removed: the room still needs a live member count
+        std::fs::write(&p, WITH_ROOMS).unwrap();
+        at(&p, 10);
+        assert!(a.reload(false));
+        assert!(a.observers().is_empty());
+        assert!(a.was_observed(TIM_DM), "its snapshot may be stale");
+        assert!(!a.was_observed("!elsewhere:x"));
+        // a rejected file changes nothing about it either
+        std::fs::write(&p, rejected_file()).unwrap();
+        at(&p, 20);
+        a.reload(false);
+        assert!(a.was_observed(TIM_DM));
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
 }

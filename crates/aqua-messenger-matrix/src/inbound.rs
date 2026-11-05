@@ -132,6 +132,18 @@ pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
     )
 }
 
+/// The group verdict for a room an observer row has named (`tracked`) or not.
+/// STUB (red commit): the old rule for every room.
+pub fn group_verdict(_tracked: bool, snapshot: Option<u64>, current: u64) -> bool {
+    group_from_counts(snapshot, current)
+}
+
+/// The observers that may be applied: a row naming `own` (this client's own
+/// account) is dropped, a client is never its own observer. STUB: keeps all.
+pub fn usable_observers(observers: &[Observer], _own: &str) -> Vec<Observer> {
+    observers.to_vec()
+}
+
 /// The group verdict from the last connect's snapshot and a current count.
 pub fn group_from_counts(snapshot: Option<u64>, current: u64) -> bool {
     snapshot.unwrap_or(0).max(current) > 2
@@ -283,6 +295,48 @@ pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obs(mxid: &str, room: &str) -> Observer {
+        Observer {
+            name: "o".into(),
+            mxid: mxid.into(),
+            room_id: room.into(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn a_tracked_room_ignores_its_stale_snapshot() {
+        // row added after a snapshot of 3: the live count (2) decides
+        assert!(!group_verdict(true, Some(3), 2));
+        // row removed while the reader is joined: snapshot 2 is stale, live 3 decides
+        assert!(group_verdict(true, Some(2), 3));
+        assert!(!group_verdict(true, Some(9), 2));
+        assert!(!group_verdict(true, None, 2));
+    }
+
+    #[test]
+    fn an_untracked_room_keeps_the_old_rule() {
+        assert!(group_verdict(false, Some(3), 0));
+        assert!(group_verdict(false, None, 3));
+        assert!(group_verdict(false, Some(2), 3));
+        assert!(!group_verdict(false, Some(2), 0));
+        assert!(!group_verdict(false, None, 2));
+    }
+
+    #[test]
+    fn the_clients_own_account_is_never_an_observer() {
+        let rows = [
+            obs("@bridge:x", "!dm:x"),
+            obs("@Reader:x", "!dm:x"),
+            obs("@BRIDGE:x", "!group:x"),
+        ];
+        let kept = usable_observers(&rows, "@bridge:x");
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].mxid, "@Reader:x");
+        // no row names the client: nothing is dropped
+        assert_eq!(usable_observers(&rows, "@someone:x").len(), 3);
+    }
 
     #[test]
     fn group_verdict_is_the_larger_of_snapshot_and_current_count() {

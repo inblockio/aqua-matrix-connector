@@ -19,6 +19,7 @@ mod rtc_keys;
 mod rtc_member;
 
 pub use device_role::DeviceRole;
+pub use dm::{DmObserver, DmObservers};
 pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
 pub use net_retry::{
@@ -359,6 +360,9 @@ pub struct AgentClient {
     /// with a fresh token to redeliver the journalled reply within seconds rather
     /// than waiting for the next scheduled cycle.
     recycle: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Members that do not count when this client decides whether a room is a
+    /// 1:1 DM (the bridge allow-list's observers). Shared by clones.
+    dm_observers: DmObservers,
 }
 
 impl AgentClient {
@@ -1218,6 +1222,12 @@ fn partition_dm_rooms(
     (kept, left, not_dm)
 }
 
+/// The device to keep when pruning must be this client's own current device.
+/// STUB (red commit): accepts anything.
+fn ensure_keep_is_own(_own: Option<&str>, _keep: &str) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 /// Best-effort: after a store-wipe re-bootstrap minted a NEW device_id, delete the
 /// agent's OTHER server-side devices, so peers stop encrypting to dead devices
 /// whose Megolm keys this device can never read. Under MSC3861/OIDC delegated auth
@@ -1466,7 +1476,15 @@ impl AgentClient {
             config,
             journal: None,
             recycle: None,
+            dm_observers: DmObservers::default(),
         })
+    }
+
+    /// Replace the set of members that do not count when deciding whether a
+    /// room is a 1:1 DM (`find_dm_room`, `dm_room_id`, `mark_dm`,
+    /// `is_one_to_one_dm`, `reconcile_owner_dms`). Empty by default.
+    pub fn set_dm_observers(&self, observers: Vec<DmObserver>) {
+        self.dm_observers.set(observers);
     }
 
     /// Re-mint the Matrix session non-interactively and rebuild the inner
@@ -3381,6 +3399,21 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::ensure_keep_is_own;
+
+    #[test]
+    fn prune_keeps_only_the_clients_own_device() {
+        assert_eq!(ensure_keep_is_own(Some("DEV1"), "DEV1"), Ok(()));
+        let wrong = ensure_keep_is_own(Some("DEV1"), "DEV2").unwrap_err();
+        assert!(
+            wrong.contains("not this client's own device") && wrong.contains("DEV1") && wrong.contains("DEV2"),
+            "{wrong}"
+        );
+        // a client with no session device id cannot say what to keep
+        let none = ensure_keep_is_own(None, "DEV1").unwrap_err();
+        assert!(none.contains("not this client's own device"), "{none}");
+    }
+
     use super::*;
     use std::fs;
 

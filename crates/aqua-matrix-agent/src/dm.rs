@@ -25,6 +25,44 @@ use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::RoomMemberships;
 
+/// A member that does not count when deciding whether `room_id` is a 1:1 DM:
+/// a read-only observer (the bridge allow-list's `[[observers]]`). Bound to ONE
+/// room; in any other room the same user is an ordinary member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmObserver {
+    pub room_id: String,
+    pub user_id: String,
+}
+
+/// The observers an [`AgentClient`] currently knows. Clones of the client
+/// share it, and the owner of the allow-list replaces it ([`DmObservers::set`])
+/// whenever it reads the list. STUB (red commit): nothing is ever found.
+#[derive(Debug, Clone, Default)]
+pub struct DmObservers(std::sync::Arc<std::sync::RwLock<Vec<DmObserver>>>);
+
+impl DmObservers {
+    /// Replace the whole set.
+    pub fn set(&self, observers: Vec<DmObserver>) {
+        *self.0.write().unwrap() = observers;
+    }
+
+    /// The observer user ids bound to `room_id` (ASCII case as given).
+    pub fn members_in(&self, _room_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// The room's active members without the observers bound to it. Never drops
+/// `own` or `target`, whatever the observer list says. STUB: drops nothing.
+pub(crate) fn without_observed(
+    active: Vec<(OwnedUserId, MembershipState)>,
+    _own: &UserId,
+    _target: &UserId,
+    _observed: &[String],
+) -> Vec<(OwnedUserId, MembershipState)> {
+    active
+}
+
 /// What one joined room is with respect to a DM with `target`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DmVerdict {
@@ -236,6 +274,90 @@ impl AgentClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observed_dm(extra: &[(&str, MembershipState)], observed: &[&str]) -> DmVerdict {
+        let mut active = vec![
+            (uid(ME), MembershipState::Join),
+            (uid(OWNER), MembershipState::Join),
+        ];
+        active.extend(extra.iter().map(|(u, m)| (uid(u), m.clone())));
+        let observed: Vec<String> = observed.iter().map(|s| s.to_string()).collect();
+        let active = without_observed(active, &uid(ME), &uid(OWNER), &observed);
+        classify_dm_room(&uid(ME), &uid(OWNER), &active)
+    }
+
+    const READER: &str = "@reader:matrix.inblock.io";
+
+    #[test]
+    fn an_observer_does_not_make_the_dm_a_group() {
+        // owner + agent + the listed observer is still the owner's DM
+        assert_eq!(
+            observed_dm(&[(READER, MembershipState::Join)], &[READER]),
+            DmVerdict::Joined
+        );
+        // an observer that is only invited is ignored as well
+        assert_eq!(
+            observed_dm(&[(READER, MembershipState::Invite)], &[READER]),
+            DmVerdict::Joined
+        );
+        // user ids compare in ASCII case, as Synapse lowercases localparts
+        assert_eq!(
+            observed_dm(&[(READER, MembershipState::Join)], &["@READER:matrix.inblock.io"]),
+            DmVerdict::Joined
+        );
+    }
+
+    #[test]
+    fn a_stranger_next_to_the_observer_still_makes_a_group() {
+        assert_eq!(
+            observed_dm(
+                &[(READER, MembershipState::Join), (OTHER, MembershipState::Join)],
+                &[READER]
+            ),
+            DmVerdict::NotOneToOne
+        );
+        // and with no observer listed the third member is a stranger
+        assert_eq!(
+            observed_dm(&[(READER, MembershipState::Join)], &[]),
+            DmVerdict::NotOneToOne
+        );
+    }
+
+    #[test]
+    fn the_observer_list_can_never_hide_self_or_the_target() {
+        let both = [OWNER, ME];
+        assert_eq!(observed_dm(&[], &both), DmVerdict::Joined);
+        // the agent alone with the target gone stays "target absent"
+        let active = vec![(uid(ME), MembershipState::Join)];
+        let kept = without_observed(active, &uid(ME), &uid(OWNER), &[OWNER.to_string()]);
+        assert_eq!(
+            classify_dm_room(&uid(ME), &uid(OWNER), &kept),
+            DmVerdict::TargetAbsent
+        );
+    }
+
+    #[test]
+    fn observers_are_bound_to_their_room() {
+        let reg = DmObservers::default();
+        assert!(reg.members_in("!dm:x").is_empty());
+        reg.set(vec![
+            DmObserver {
+                room_id: "!dm:x".into(),
+                user_id: READER.into(),
+            },
+            DmObserver {
+                room_id: "!other:x".into(),
+                user_id: "@second:x".into(),
+            },
+        ]);
+        assert_eq!(reg.members_in("!dm:x"), vec![READER.to_string()]);
+        assert_eq!(reg.members_in("!other:x"), vec!["@second:x".to_string()]);
+        assert!(reg.members_in("!third:x").is_empty());
+        // clones share the set; set() replaces it
+        let clone = reg.clone();
+        clone.set(vec![]);
+        assert!(reg.members_in("!dm:x").is_empty());
+    }
 
     fn uid(s: &str) -> OwnedUserId {
         UserId::parse(s).unwrap()
