@@ -57,19 +57,18 @@ Edit the scripts **here in the repo**; the host symlinks pick the change up imme
 ## Add a new consultant
 
 One command. Renders the config from the template, launches with the hardened podman flags, wires
-a systemd activity-watcher, and (`--onboard`) tells the operator once the consultant's own welcome
+a systemd activity-watcher (`--host nuc10` only), and (`--onboard`) tells the operator once the consultant's own welcome
 has reached the peer (see "Onboarding" below).
 
 **Where it runs: agentic (Tim, 2026-10-30).** Every new consultant is deployed on agentic.inblock.io,
 where the whole fleet runs since the A2A move of 2026-10-27; `--host agentic` is the default. The
-script prepares everything on nuc10 as before (Owner, refs view, config, avatar,
-activity watcher), then writes the run shape and env file in the A2A move's format
+script prepares everything on nuc10 as before (Owner, refs view, config, avatar), then writes the run shape and env file in the A2A move's format
 (`agentic-manifest.py`, into `~/.cache/agents-to-agentic/carry/meta`), rsyncs them with the config,
 the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
 (`agentic-refs-push.service`) and starts the container with aqua-ops `tools/host-move/agents.py place`
 + `run` (root, through `tools/key-rotation/skh-run --sudo --dir / prod`). The MXID read-back and
-`--onboard` read the store, the greeted marker and the log on agentic; nuc10's activity watcher is fed
-by `agentic-feeds`. On agentic the script deploys NEW consultants only: `--replace`, `--fresh`,
+`--onboard` read the store, the greeted marker and the log on agentic; no activity watcher is wired on nuc10:
+the activity DMs come from clawi's aqua-ops `probes/agent-alerts`, which finds the agent by itself (nothing to wire). On agentic the script deploys NEW consultants only: `--replace`, `--fresh`,
 `--generic`, nuc10 state in the persist dir and an existing container of the name are refused, so
 `roll-consultant-fleet.sh` fails closed until image rolls on agentic get their own path. A running
 agentic consultant is stopped, started and inspected with `agents.py stop|run|logs <container>`.
@@ -528,7 +527,7 @@ Recovery matrix: [`docs/RECOVERY.md`](../../docs/RECOVERY.md).
 ```bash
 podman ps --filter name=aqua-agent-<label>            # Up, restarts 0
 podman logs aqua-agent-<label>-aqua-consultant-1 | grep -E 'agent DID|connected|display name set|daemon starting'
-systemctl --user is-active aqua-activity-watch-<label>.service   # n/a for --generic (no watcher by design)
+systemctl --user is-active aqua-activity-watch-<label>.service   # --host nuc10 only; n/a for --generic and --host agentic
 podman inspect aqua-agent-<label>-aqua-consultant-1 \
   --format '{{range .Mounts}}{{.Destination}} {{end}}'   # expect exactly one /refs (the view) + config + store + memory
 ```

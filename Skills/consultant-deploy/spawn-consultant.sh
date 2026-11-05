@@ -5,7 +5,7 @@
 # one script, three required parameters (--label / --target / --persona). It renders the
 # per-instance config from ~/.aqua-matrix-test/consultant-config.template.json, launches
 # the container with the SAME hardened podman flags as the original scripts (verbatim -
-# the security posture must not drift), wires the systemd activity-watcher, DMs Tim
+# the security posture must not drift), wires the systemd activity-watcher (--host nuc10 only), DMs Tim
 # "channel up", and (with --onboard) waits for the consultant's own welcome to be delivered and
 # tells Tim the outcome (see "Onboarding" below). Since the template sets "initiate_dm": true,
 # the consultant herself creates the DM room, invites the peer and delivers her
@@ -170,14 +170,15 @@
 #
 # Host (Tim, 2026-10-30): consultants run on agentic.inblock.io, and every new one is deployed there. --host agentic
 # (the default; CONSULTANT_HOST overrides) renders and prepares everything here on nuc10 as before (Owner, refs view,
-# config, avatar, activity watcher), then, instead of `podman run`: writes the run shape and env file in
+# config, avatar), then, instead of `podman run`: writes the run shape and env file in
 # the format of the A2A move (agentic-manifest.py, into ~/.cache/agents-to-agentic/carry/meta), rsyncs them, the
 # config, the avatar and the empty persist dirs into agentic's carry dir as deploy, pushes the refs views
 # (agentic-refs-push.service), and starts the container with aqua-ops tools/host-move/agents.py place + run (root,
 # through skh-run). The MXID read-back and --onboard read the agent's store, marker and log on agentic. Real spawns on
 # agentic are for NEW consultants only: --replace, --fresh, --generic, nuc10 state in the persist dir, and anything
 # agentic holds for the name (a container, persist trees) or a docker it cannot ask are refused; a running agentic
-# agent is stopped and started with agents.py. nuc10's activity watcher gets the agent's lines through agentic-feeds. --host nuc10 is the old podman path, kept for the
+# agent is stopped and started with agents.py. No activity watcher is wired on nuc10: the activity DMs come from clawi's aqua-ops probes/agent-alerts, which finds the
+# agent by itself (nothing to wire). --host nuc10 is the old podman path, kept for the
 # tests; it refuses an agent whose nuc10 copy was moved (a2a-moved-<rest> exists). --print-run and --print-onboarding
 # read nuc10 only; --print-mxid reads the agent's store on agentic (the user_id line, through docker exec).
 #
@@ -963,6 +964,12 @@ ensure_activity_watch() {
     # The generic consultant's peer IS the operator, a watcher would DM Tim about
     # Tim's own messages. Deliberately never wired (also: the unit name is label-derived).
     echo ">> --generic: no activity watcher (peer is the operator; no self-notification)"
+    return 0
+  fi
+  if [ "$HOST" = agentic ]; then
+    # Activity DMs for agentic agents come from clawi's aqua-ops probes/agent-alerts, which
+    # finds the agent by itself; a nuc10 watcher would never see a line.
+    echo ">> --host agentic: no activity watcher on nuc10 (aqua-ops probes/agent-alerts on clawi covers it)"
     return 0
   fi
   command -v systemctl >/dev/null 2>&1 || { echo "watch: systemctl absent; skipping watcher" >&2; return 0; }

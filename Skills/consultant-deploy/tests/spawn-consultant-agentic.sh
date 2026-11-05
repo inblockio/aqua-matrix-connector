@@ -4,7 +4,7 @@
 #   - agentic refuses --replace / --fresh / --generic before any side effect; --host takes agentic|nuc10 only
 #   - a full new spawn: the shape and env file (secret only in the 0600 env file, never in the shape or the output),
 #     the order rsync sources -> rsync shape -> refs push -> agents.py place -> run, no podman run, Tim's notices
-#     name agentic, the MXID and the greeted marker are read on agentic, nuc10's activity watcher is wired
+#     name agentic, the MXID and the greeted marker are read on agentic, no activity watcher is wired on nuc10
 #   - agents.py run failing: CRITICAL notice, non-zero exit
 #   - preflight refusals: nuc10 state in the persist dir; agentic holding a container, persist trees, or no docker;
 #     state appearing before the launch; empty nuc10 persist dirs (a retry) are not state
@@ -179,7 +179,7 @@ assert up and up[0][-1].endswith("on agentic.inblock.io."), calls
 assert any(any(str(x).startswith("welcome delivered") for x in c) for c in calls), calls
 PY
 check "greeted marker read inside the container" has "$SIDE" "ssh docker exec $NAME sh -c '[ -e /agent/memory/.whats_new_seen ]'"
-check "nuc10 activity watcher wired" bash -c 'grep -q "^systemctl --user restart aqua-activity-watch-alpha" "$1"' _ "$SIDE"
+check "no nuc10 activity watcher wired" bash -c '! grep -q "aqua-activity-watch" "$1"' _ "$SIDE"
 check "verify hint is the agentic one" has "$SB/out/full.out" "ssh agentic.inblock.io docker logs -f $NAME"
 
 echo "== failures and refusals"
