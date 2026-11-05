@@ -1129,7 +1129,6 @@ async fn mention_names_one_allowlisted_person_and_survives_edits() {
     let _ = std::fs::remove_dir_all(d);
 }
 
-
 // ---- [[observers]]: a member the bridge does not count ----------------------
 
 const OBSERVED_LIST: &str = "[[recipients]]\nname = \"tim\"\nmxid = \"@tim:localhost\"\n\n[[observers]]\nname = \"voice-inbox\"\nmxid = \"@reader:localhost\"\nroom_id = \"!timdm:localhost\"\n";
@@ -1173,7 +1172,10 @@ async fn the_observer_is_neither_a_target_nor_a_source() {
         assert!(is_err && text.contains("REFUSED"), "{who}: {text}");
     }
     let (text, _) = tool(&e, "list_recipients", json!({})).await;
-    assert!(!text.contains("voice-inbox") && !text.contains("@reader"), "{text}");
+    assert!(
+        !text.contains("voice-inbox") && !text.contains("@reader"),
+        "{text}"
+    );
 }
 
 fn touch_ahead(p: &Path, secs: u64) {
@@ -1196,10 +1198,18 @@ async fn a_rejected_observer_row_is_audited_and_the_lists_stay() {
     touch_ahead(&file, 10);
     // every request path reloads; ask twice, the audit row is written once
     assert!(e.with_allow(|a| a.resolve("mallory").is_none() && a.resolve("tim").is_some()));
-    let (text, is_err) = tool(&e, "send_message", json!({"to": "tim", "markdown": "still reachable"})).await;
+    let (text, is_err) = tool(
+        &e,
+        "send_message",
+        json!({"to": "tim", "markdown": "still reachable"}),
+    )
+    .await;
     assert!(!is_err, "{text}");
     let (listed, _) = tool(&e, "list_recipients", json!({})).await;
-    assert!(listed.contains("observer dup"), "the reason is shown: {listed}");
+    assert!(
+        listed.contains("observer dup"),
+        "the reason is shown: {listed}"
+    );
     assert!(!listed.contains("mallory"));
 
     let audit = std::fs::read_to_string(d.join("audit.jsonl")).unwrap();

@@ -10,10 +10,10 @@ use aqua_matrix_agent::{
     connect_with_outage_retry, is_unknown_token, AgentClient, AgentConfig, ConnectOutcome,
     DeviceRole,
 };
-use aqua_messenger::allowlist::{invite_action, InviteAction};
+use aqua_messenger::allowlist::{invite_action, InviteAction, Observer};
 use aqua_messenger::{Dest, ReplyRef, SeenRoom};
 use aqua_messenger_matrix::inbound::{
-    backfill, joined_member_count, register_message_handler, survey_rooms,
+    backfill, counted_members, register_message_handler, survey_rooms,
 };
 use matrix_sdk::{
     config::SyncSettings,
@@ -363,9 +363,10 @@ async fn handle_invite(
     }
     match room.join().await {
         Ok(()) => {
+            let observers = observers_of(shared);
             let seen = SeenRoom {
                 display_name: room.name(),
-                joined_members: joined_member_count(&room).await,
+                joined_members: counted_members(&room, &observers).await,
                 is_direct: action == InviteAction::JoinAsDm,
             };
             shared.note_joined_room(&room_id, seen);
@@ -463,11 +464,12 @@ async fn dm_room_for(
     let target =
         OwnedUserId::try_from(mxid).map_err(|e| anyhow::anyhow!("invalid MXID {mxid}: {e}"))?;
     let listed = listed_room_ids(shared);
+    let observers = observers_of(shared);
     let connector_pick = agent.dm_room_id(mxid).await.ok().flatten();
     let mut best: Option<((bool, bool, u8, bool), String)> = None;
     for room in agent.client().joined_rooms() {
         let id = room.room_id().to_string();
-        if listed.contains(&id) || joined_member_count(&room).await > 2 {
+        if listed.contains(&id) || counted_members(&room, &observers).await > 2 {
             continue;
         }
         let Some(member) = room.get_member(&target).await.ok().flatten() else {
@@ -529,15 +531,21 @@ fn listed_room_ids(shared: &Shared) -> std::collections::HashSet<String> {
     shared.with_allow(|allow| allow.rooms().iter().map(|r| r.room_id.clone()).collect())
 }
 
+/// The `[[observers]]` rows in force: members that are not counted.
+fn observers_of(shared: &Shared) -> Vec<Observer> {
+    shared.with_allow(|allow| allow.observers().to_vec())
+}
+
 /// Remove group rooms from our `m.direct`: every `[[rooms]]` entry and every
 /// joined room with more than two joined members (2026-09-29 incident: two
 /// group-room invites were recorded as Tim's DMs). Runs on every connect;
 /// writes only when something changed. Best-effort.
 async fn repair_m_direct(agent: &AgentClient, shared: &Shared) {
     let listed = listed_room_ids(shared);
+    let observers = observers_of(shared);
     let mut groups = std::collections::HashSet::new();
     for r in agent.client().joined_rooms() {
-        if joined_member_count(&r).await > 2 {
+        if counted_members(&r, &observers).await > 2 {
             groups.insert(r.room_id().to_string());
         }
     }

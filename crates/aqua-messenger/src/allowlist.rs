@@ -19,10 +19,20 @@
 //! but that is not listed is never sendable and its messages are dropped.
 //! Names are unique across both lists (case-insensitive).
 //!
+//! `[[observers]]` (`name`, `mxid`, `room_id`, optional `note`) name a member
+//! who sits in one room (a person's DM with the bridge) without being counted
+//! as one of its members, so that DM stays a 1:1. An observer is neither a
+//! recipient nor a room. A row that is also a recipient, whose room is a
+//! `[[rooms]]` entry, or that is malformed rejects the whole file; a running
+//! daemon then keeps its last good lists (see [`ParseFailure`]). Older
+//! binaries ignore the section.
+//!
 //! The daemon re-reads the file whenever its modification time changes, so an
 //! edit takes effect on the next request without a restart. A file that is
 //! missing or does not parse yields an EMPTY list (fail closed): nobody can be
-//! messaged and every inbound message is dropped until it is fixed.
+//! messaged and every inbound message is dropped until it is fixed. The one
+//! exception is a rejected `[[observers]]` row once a good file has loaded:
+//! the lists stay as they were and the reason is reported.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -53,7 +63,7 @@ pub struct RoomEntry {
 }
 
 /// A read-only member of one room (`[[observers]]`): joined to a DM or room
-/// the bridge uses, but not counted as one of its members (STUB: red commit).
+/// the bridge uses, but not counted as one of its members.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Observer {
     /// Short handle used in the journal (`observer loaded name=...`).
@@ -67,13 +77,26 @@ pub struct Observer {
     pub note: Option<String>,
 }
 
-/// How many of `joined` (MXIDs) count as members of `room_id` (STUB: counts all).
+impl Observer {
+    /// True when `mxid` is this observer (ASCII case-insensitive, as Synapse
+    /// lowercases localparts) and `room_id` is the room it is bound to.
+    pub fn is(&self, mxid: &str, room_id: &str) -> bool {
+        self.room_id == room_id && self.mxid.eq_ignore_ascii_case(mxid)
+    }
+}
+
+/// How many of the `joined` members (MXIDs) of `room_id` count: all of them
+/// except observers bound to this room. With no observer for the room this is
+/// just the number of joined members.
 pub fn count_joined<'a>(
-    _room_id: &str,
+    room_id: &str,
     joined: impl IntoIterator<Item = &'a str>,
-    _observers: &[Observer],
+    observers: &[Observer],
 ) -> u64 {
-    joined.into_iter().count() as u64
+    joined
+        .into_iter()
+        .filter(|m| !observers.iter().any(|o| o.is(m, room_id)))
+        .count() as u64
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -82,6 +105,10 @@ struct AllowListFile {
     recipients: Vec<Recipient>,
     #[serde(default)]
     rooms: Vec<RoomEntry>,
+    /// Read as raw TOML so a bad row is an OBSERVER error (the running lists
+    /// are kept), not a syntax error of the whole file (fail closed).
+    #[serde(default)]
+    observers: Option<toml::Value>,
 }
 
 /// A parsed allow-list file.
@@ -151,14 +178,53 @@ pub fn parse(text: &str) -> Result<Vec<Recipient>, String> {
     parse_all(text).map(|p| p.recipients)
 }
 
+/// Parse allow-list TOML (see [`parse_checked`]); the error is its message.
+pub fn parse_all(text: &str) -> Result<Parsed, String> {
+    parse_checked(text).map_err(String::from)
+}
+
+/// Why a file was refused. Either way the file is rejected as a whole.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseFailure {
+    /// A syntax error or a bad recipient or room: the lists fail closed.
+    File(String),
+    /// A bad `[[observers]]` row (`observer <name>: <reason>`): a running
+    /// daemon keeps its last good lists.
+    Observer(String),
+}
+
+impl From<ParseFailure> for String {
+    fn from(f: ParseFailure) -> String {
+        match f {
+            ParseFailure::File(m) | ParseFailure::Observer(m) => m,
+        }
+    }
+}
+
 /// Parse allow-list TOML. Invalid entries (bad MXID or room id, empty or
 /// duplicate name, duplicate room id) are an error for the whole file, so a
-/// typo can never silently widen or narrow the list.
-pub fn parse_all(text: &str) -> Result<Parsed, String> {
-    let file: AllowListFile =
-        toml::from_str(text).map_err(|e| format!("allow-list parse error: {e}"))?;
+/// typo can never silently widen or narrow the list. Observer rows are
+/// checked last, so a file error elsewhere wins (fail closed).
+pub fn parse_checked(text: &str) -> Result<Parsed, ParseFailure> {
+    let file: AllowListFile = toml::from_str(text)
+        .map_err(|e| ParseFailure::File(format!("allow-list parse error: {e}")))?;
+    let (recipients, rooms) =
+        people_and_rooms(file.recipients, file.rooms).map_err(ParseFailure::File)?;
+    let observers =
+        parse_observers(file.observers, &recipients, &rooms).map_err(ParseFailure::Observer)?;
+    Ok(Parsed {
+        recipients,
+        rooms,
+        observers,
+    })
+}
+
+fn people_and_rooms(
+    recipients: Vec<Recipient>,
+    rooms: Vec<RoomEntry>,
+) -> Result<(Vec<Recipient>, Vec<RoomEntry>), String> {
     let mut seen = std::collections::HashSet::new();
-    for r in &file.recipients {
+    for r in &recipients {
         if r.name.trim().is_empty() {
             return Err(format!("allow-list entry for {} has an empty name", r.mxid));
         }
@@ -173,7 +239,7 @@ pub fn parse_all(text: &str) -> Result<Parsed, String> {
         }
     }
     let mut seen_ids = std::collections::HashSet::new();
-    for r in &file.rooms {
+    for r in &rooms {
         let name = r.name.trim();
         if name.is_empty() {
             return Err(format!(
@@ -200,8 +266,7 @@ pub fn parse_all(text: &str) -> Result<Parsed, String> {
             return Err(format!("[[rooms]] lists room {:?} twice", r.room_id));
         }
     }
-    let rooms = file
-        .rooms
+    let rooms = rooms
         .into_iter()
         .map(|r| RoomEntry {
             name: r.name.trim().to_string(),
@@ -209,11 +274,84 @@ pub fn parse_all(text: &str) -> Result<Parsed, String> {
             note: r.note,
         })
         .collect();
-    Ok(Parsed {
-        recipients: file.recipients,
-        rooms,
-        observers: Vec::new(),
-    })
+    Ok((recipients, rooms))
+}
+
+/// Validate the `[[observers]]` rows. Errors read `observer <name>: <reason>`.
+fn parse_observers(
+    raw: Option<toml::Value>,
+    recipients: &[Recipient],
+    rooms: &[RoomEntry],
+) -> Result<Vec<Observer>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let toml::Value::Array(rows) = raw else {
+        return Err(
+            "observer section: `observers` must be an array of tables ([[observers]])".into(),
+        );
+    };
+    let mut out: Vec<Observer> = Vec::new();
+    for (i, row) in rows.into_iter().enumerate() {
+        let label = row
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("#{}", i + 1));
+        let fail = |why: String| format!("observer {label}: {why}");
+        let o: Observer = row.try_into().map_err(|e| fail(e.to_string()))?;
+        let name = o.name.trim().to_string();
+        if name.is_empty() {
+            return Err(fail("the name is empty".into()));
+        }
+        if name.starts_with('@') || name.starts_with('!') {
+            return Err(fail(
+                "the name must be a short handle, not an MXID or room id".into(),
+            ));
+        }
+        if !is_valid_mxid(&o.mxid) {
+            return Err(fail(format!(
+                "{:?} is not a valid MXID (@localpart:server)",
+                o.mxid
+            )));
+        }
+        let room_id = o.room_id.trim().to_string();
+        if !is_valid_room_id(&room_id) {
+            return Err(fail(format!(
+                "{:?} is not a valid room id (!opaque:server)",
+                o.room_id
+            )));
+        }
+        if recipients
+            .iter()
+            .any(|r| r.mxid.eq_ignore_ascii_case(&o.mxid))
+        {
+            return Err(fail(format!(
+                "{} is also a recipient; an observer is never a person the bridge messages",
+                o.mxid
+            )));
+        }
+        if rooms.iter().any(|r| r.room_id == room_id) {
+            return Err(fail(format!("its room {room_id} is a [[rooms]] entry")));
+        }
+        if out.iter().any(|x| x.name.eq_ignore_ascii_case(&name)) {
+            return Err(fail("the name is used by another observer".into()));
+        }
+        if out.iter().any(|x| x.is(&o.mxid, &room_id)) {
+            return Err(fail(format!(
+                "{} is listed twice for room {room_id}",
+                o.mxid
+            )));
+        }
+        out.push(Observer {
+            name,
+            mxid: o.mxid,
+            room_id,
+            note: o.note,
+        });
+    }
+    Ok(out)
 }
 
 /// The allow-list plus the file it came from, reloaded on mtime change.
@@ -226,7 +364,18 @@ pub struct AllowList {
     fixed: Vec<Recipient>,
     recipients: Vec<Recipient>,
     rooms: Vec<RoomEntry>,
+    observers: Vec<Observer>,
     load_error: Option<String>,
+    /// Why the last reload was refused because of an `[[observers]]` row.
+    /// With a good list loaded before, the lists were kept (`load_error`
+    /// stays empty); otherwise they failed closed as well.
+    observer_error: Option<String>,
+    /// A file has loaded (or the optional file is absent): there are lists
+    /// worth keeping when a later file is rejected for an observer row.
+    loaded: bool,
+    /// Events the owner of this list should audit (drained with
+    /// [`AllowList::take_audit`]).
+    pending_audit: Vec<serde_json::Value>,
     /// Identity named in refusals ("the Aqua System allow-list").
     label: String,
     /// Who must approve additions ("Tim", "the agent's owner").
@@ -257,7 +406,11 @@ impl AllowList {
             recipients: fixed.clone(),
             fixed,
             rooms: Vec::new(),
+            observers: Vec::new(),
             load_error: None,
+            observer_error: None,
+            loaded: false,
+            pending_audit: Vec::new(),
             label: label.to_string(),
             approver: approver.to_string(),
         };
@@ -291,8 +444,9 @@ impl AllowList {
         self.mtime = mtime;
         let mut recipients = self.fixed.clone();
         let mut rooms = Vec::new();
+        let mut observers = Vec::new();
         match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_all(&text).and_then(|p| self.merge_checked(p)) {
+            Ok(text) => match parse_checked(&text).and_then(|p| self.merge_checked(p)) {
                 Ok(p) => {
                     for e in p.recipients {
                         if !recipients
@@ -303,49 +457,86 @@ impl AllowList {
                         }
                     }
                     rooms = p.rooms;
+                    observers = p.observers;
                     tracing::info!(count = recipients.len(), rooms = rooms.len(), path = %path.display(), "allow-list loaded");
+                    for o in &observers {
+                        tracing::info!(name = %o.name, room = %o.room_id, "observer loaded");
+                    }
                     self.load_error = None;
+                    self.observer_error = None;
+                    self.loaded = true;
                 }
-                Err(e) => {
+                Err(ParseFailure::Observer(e)) => {
+                    tracing::error!(path = %path.display(), "allow-list rejected: {e}");
+                    self.observer_error = Some(e.clone());
+                    // Keep what runs now: this file is refused, the daemon is
+                    // not. Before any good load there is nothing to keep.
+                    let keep = self.loaded && self.load_error.is_none();
+                    self.pending_audit.push(serde_json::json!({
+                        "event": "allowlist_rejected",
+                        "reason": e,
+                        "kept": if keep { "last_good" } else { "none" },
+                    }));
+                    if keep {
+                        return true;
+                    }
+                    self.load_error = Some(e);
+                }
+                Err(ParseFailure::File(e)) => {
                     tracing::error!(path = %path.display(), "allow-list rejected, failing closed: {e}");
+                    self.observer_error = None;
                     self.load_error = Some(e);
                 }
             },
             // An embedded agent's optional extra file may simply not exist.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.fixed.is_empty() => {
                 self.load_error = None;
+                self.observer_error = None;
+                self.loaded = true;
             }
             Err(e) => {
                 tracing::error!(path = %path.display(), "allow-list unreadable, failing closed: {e}");
+                self.observer_error = None;
                 self.load_error = Some(format!("cannot read {}: {e}", path.display()));
             }
         }
         self.recipients = recipients;
         self.rooms = rooms;
+        self.observers = observers;
         true
     }
 
     /// Reject a file that reuses a built-in (owner) name for another MXID or
     /// names a room like the owner.
-    fn merge_checked(&self, p: Parsed) -> Result<Parsed, String> {
+    fn merge_checked(&self, p: Parsed) -> Result<Parsed, ParseFailure> {
         for f in &self.fixed {
             if let Some(c) = p.recipients.iter().find(|e| {
                 e.name.eq_ignore_ascii_case(&f.name) && !e.mxid.eq_ignore_ascii_case(&f.mxid)
             }) {
-                return Err(format!(
+                return Err(ParseFailure::File(format!(
                     "allow-list entry {:?} reuses the built-in name {:?} for a different MXID",
                     c.name, f.name
-                ));
+                )));
             }
             if let Some(r) = p
                 .rooms
                 .iter()
                 .find(|r| r.name.eq_ignore_ascii_case(&f.name))
             {
-                return Err(format!(
+                return Err(ParseFailure::File(format!(
                     "[[rooms]] entry {:?} reuses the built-in name {:?}",
                     r.name, f.name
-                ));
+                )));
+            }
+            if let Some(o) = p
+                .observers
+                .iter()
+                .find(|o| o.mxid.eq_ignore_ascii_case(&f.mxid))
+            {
+                return Err(ParseFailure::Observer(format!(
+                    "observer {}: {} is the built-in recipient {:?}",
+                    o.name, o.mxid, f.name
+                )));
             }
         }
         Ok(p)
@@ -390,14 +581,36 @@ impl AllowList {
         self.load_error.as_deref()
     }
 
-    /// The loaded observers (STUB: none).
+    /// The loaded `[[observers]]` rows.
     pub fn observers(&self) -> &[Observer] {
-        &[]
+        &self.observers
     }
 
-    /// Why the last reload was rejected because of an observer row (STUB: never).
+    /// The observers bound to `room_id` (owned, for use across an await).
+    pub fn observers_in_room(&self, room_id: &str) -> Vec<Observer> {
+        self.observers
+            .iter()
+            .filter(|o| o.room_id == room_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Why the last reload was refused because of an observer row, if so.
+    /// Set both when the running lists were kept and when nothing had loaded
+    /// yet (a start error); cleared by the next good load.
     pub fn observer_error(&self) -> Option<&str> {
-        None
+        self.observer_error.as_deref()
+    }
+
+    /// The error to show for this list: a load failure, else a refused
+    /// observer row.
+    pub fn error_text(&self) -> Option<&str> {
+        self.load_error().or(self.observer_error())
+    }
+
+    /// Events to audit since the last call (a rejected file).
+    pub fn take_audit(&mut self) -> Vec<serde_json::Value> {
+        std::mem::take(&mut self.pending_audit)
     }
 
     /// Resolve a `to`/`from` argument (name or MXID) to an allow-listed
@@ -477,7 +690,11 @@ room_id = " !rvKzMvUBBaewXApthx:matrix.inblock.io "
             fixed: Vec::new(),
             recipients: p.recipients,
             rooms: p.rooms,
+            observers: p.observers,
             load_error: None,
+            observer_error: None,
+            loaded: true,
+            pending_audit: Vec::new(),
             label: "Aqua System".into(),
             approver: "Tim".into(),
         }
@@ -834,7 +1051,11 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         assert_eq!(count_joined(TIM_DM, [tim, bridge, OBS], &observers), 2);
         // the observer, letter case aside
         assert_eq!(
-            count_joined(TIM_DM, [tim, bridge, "@READER:matrix.inblock.io"], &observers),
+            count_joined(
+                TIM_DM,
+                [tim, bridge, "@READER:matrix.inblock.io"],
+                &observers
+            ),
             2
         );
         // the observer plus two others is a group (3)
@@ -843,7 +1064,10 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
             3
         );
         // an observer bound to another room still counts here
-        assert_eq!(count_joined("!elsewhere:x", [tim, bridge, OBS], &observers), 3);
+        assert_eq!(
+            count_joined("!elsewhere:x", [tim, bridge, OBS], &observers),
+            3
+        );
         // an observer that is not joined (an invite) changes nothing
         assert_eq!(count_joined(TIM_DM, [tim, bridge], &observers), 2);
         // one MXID bound to two rooms is left out of each, only there
@@ -851,7 +1075,10 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
             obs("a", OBS, TIM_DM),
             obs("b", OBS, "!second:matrix.inblock.io"),
         ];
-        assert_eq!(count_joined("!second:matrix.inblock.io", [tim, bridge, OBS], &two), 2);
+        assert_eq!(
+            count_joined("!second:matrix.inblock.io", [tim, bridge, OBS], &two),
+            2
+        );
         assert_eq!(count_joined("!third:x", [tim, bridge, OBS], &two), 3);
     }
 
@@ -965,5 +1192,4 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         assert!(a.resolve("owner").is_some());
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
-
 }

@@ -1223,8 +1223,10 @@ fn partition_dm_rooms(
 /// whose Megolm keys this device can never read. Under MSC3861/OIDC delegated auth
 /// the Client-Server device-deletion endpoint may be disabled (device lifecycle
 /// belongs to the OIDC provider) — in that case we log and move on; the stale
-/// devices age out on the server. Never fatal.
-async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
+/// devices age out on the server. Never fatal. Public so a client that rebuilds
+/// its store on purpose (the inbox reader) can run the same prune with the new
+/// device id as `keep_device_id`.
+pub async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
     let devices = match client.devices().await {
         Ok(r) => r.devices,
         Err(e) => {

@@ -209,6 +209,14 @@ async fn main() -> anyhow::Result<()> {
         allow,
         bridge::QueueTransport::new(cmd_tx),
     ));
+    // A file whose `[[observers]]` row is invalid is refused as a whole; with
+    // no good list to keep yet, the daemon does not start on it.
+    if let Some(e) = shared.with_allow(|a| a.observer_error().map(str::to_string)) {
+        anyhow::bail!(
+            "allow-list rejected: {e} (fix {})",
+            state.join("allowlist.toml").display()
+        );
+    }
     tracing::info!(
         max_entries = inbox_policy.max_entries,
         max_age_hours = args.inbox_max_age_hours,

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aqua_matrix_agent::AgentClient;
+use aqua_messenger::allowlist::{count_joined, Observer};
 use aqua_messenger::inbox::NewEntry;
 use aqua_messenger::{Engine, SeenRoom, Transport};
 use matrix_sdk::{
@@ -100,20 +101,56 @@ pub async fn joined_member_count(room: &Room) -> u64 {
     }
 }
 
-/// Members of `room` that count toward "is this a DM": joined members minus
-/// the observers bound to this room (STUB: red commit, counts everyone).
-pub async fn counted_members(
-    room: &Room,
-    _observers: &[aqua_messenger::allowlist::Observer],
-) -> u64 {
-    joined_member_count(room).await
+/// Members of `room` that count toward "is this a DM": the joined members
+/// minus the `observers` bound to this room (read-only members such as the
+/// inbox reader; see `[[observers]]` in the allow-list). Every site that
+/// decides DM versus group counts through here. A room with no observer
+/// bound to it takes exactly the path of [`joined_member_count`].
+///
+/// An observer room needs the real member list. If it cannot be fetched the
+/// cached list is used, and only then the sync summary, which still includes
+/// the observer: that errs toward "group", never toward a stray DM.
+pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
+    let room_id = room.room_id().as_str();
+    if !observers.iter().any(|o| o.room_id == room_id) {
+        return joined_member_count(room).await;
+    }
+    let members = match room.members(RoomMemberships::JOIN).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(room = %room_id, "member list unavailable ({e:#}); trying the cached list");
+            match room.members_no_sync(RoomMemberships::JOIN).await {
+                Ok(m) => m,
+                Err(_) => return room.joined_members_count(),
+            }
+        }
+    };
+    count_joined(
+        room_id,
+        members.iter().map(|m| m.user_id().as_str()),
+        observers,
+    )
+}
+
+/// The group verdict from the last connect's snapshot and a current count.
+pub fn group_from_counts(snapshot: Option<u64>, current: u64) -> bool {
+    snapshot.unwrap_or(0).max(current) > 2
 }
 
 /// Whether a message's room is a group: the member count from the last
-/// connect's snapshot (or the room's summary for a room joined since).
-pub fn is_group<T: Transport>(engine: &Engine<T>, room: &Room) -> bool {
-    let snap = engine.snapshot_members(room.room_id().as_str());
-    snap.unwrap_or(0).max(room.joined_members_count()) > 2
+/// connect's snapshot (or the room's summary for a room joined since). A room
+/// with an observer bound to it is counted from its member list without the
+/// observer; the sync summary cannot tell the observer apart, so it is not
+/// used there.
+pub async fn is_group<T: Transport>(engine: &Engine<T>, room: &Room) -> bool {
+    let room_id = room.room_id().as_str();
+    let bound = engine.with_allow(|a| a.observers_in_room(room_id));
+    let current = if bound.is_empty() {
+        room.joined_members_count()
+    } else {
+        counted_members(room, &bound).await
+    };
+    group_from_counts(engine.snapshot_members(room_id), current)
 }
 
 /// Register the live inbound handler on `agent`'s Client. The caller MUST
@@ -130,7 +167,7 @@ pub fn register_message_handler<T: Transport>(
             let engine = engine.clone();
             let own = own.clone();
             async move {
-                let group = is_group(&engine, &room);
+                let group = is_group(&engine, &room).await;
                 if ingest_event(&engine, &own, &ev, room.room_id().as_str(), group) {
                     let event_id = ev.event_id.clone();
                     tokio::spawn(async move {
@@ -156,7 +193,7 @@ pub async fn backfill<T: Transport>(agent: &AgentClient, engine: &Engine<T>) -> 
         let mut utd = 0usize;
         let mut found: Vec<(u64, String, bool, OriginalSyncRoomMessageEvent)> = Vec::new();
         for room in agent.client().joined_rooms() {
-            let group = is_group(engine, &room);
+            let group = is_group(engine, &room).await;
             let mut opts = MessagesOptions::backward();
             opts.limit = UInt::from(BACKFILL_LIMIT);
             let resp = match room.messages(opts).await {
@@ -214,12 +251,13 @@ pub async fn backfill<T: Transport>(agent: &AgentClient, engine: &Engine<T>) -> 
 /// engine, and log it on the first connect and whenever a room is new, so an
 /// operator can learn which room id is which.
 pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>, log_all: bool) {
+    let observers = engine.with_allow(|a| a.observers().to_vec());
     let mut map = BTreeMap::new();
     for room in agent.client().joined_rooms() {
         let id = room.room_id().to_string();
         let seen = SeenRoom {
             display_name: room.display_name().await.ok().map(|n| n.to_string()),
-            joined_members: joined_member_count(&room).await,
+            joined_members: counted_members(&room, &observers).await,
             is_direct: room.is_direct().await.unwrap_or(false),
         };
         map.insert(id, seen);
@@ -240,4 +278,22 @@ pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>,
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_verdict_is_the_larger_of_snapshot_and_current_count() {
+        // today's rule: more than two joined members is a group
+        assert!(!group_from_counts(None, 0));
+        assert!(!group_from_counts(Some(2), 0));
+        assert!(!group_from_counts(None, 2));
+        assert!(group_from_counts(Some(3), 0));
+        assert!(group_from_counts(None, 3));
+        assert!(group_from_counts(Some(2), 3));
+        // a DM with one observer counts 2 on both sides: not a group
+        assert!(!group_from_counts(Some(2), 2));
+    }
 }
