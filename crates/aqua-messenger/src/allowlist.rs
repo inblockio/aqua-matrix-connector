@@ -52,6 +52,30 @@ pub struct RoomEntry {
     pub note: Option<String>,
 }
 
+/// A read-only member of one room (`[[observers]]`): joined to a DM or room
+/// the bridge uses, but not counted as one of its members (STUB: red commit).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Observer {
+    /// Short handle used in the journal (`observer loaded name=...`).
+    pub name: String,
+    /// Full Matrix user id of the observer.
+    pub mxid: String,
+    /// The one room (exact room id) in which this member is not counted.
+    pub room_id: String,
+    /// Optional human-readable note (purpose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// How many of `joined` (MXIDs) count as members of `room_id` (STUB: counts all).
+pub fn count_joined<'a>(
+    _room_id: &str,
+    joined: impl IntoIterator<Item = &'a str>,
+    _observers: &[Observer],
+) -> u64 {
+    joined.into_iter().count() as u64
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AllowListFile {
     #[serde(default)]
@@ -65,6 +89,7 @@ struct AllowListFile {
 pub struct Parsed {
     pub recipients: Vec<Recipient>,
     pub rooms: Vec<RoomEntry>,
+    pub observers: Vec<Observer>,
 }
 
 /// What a `to` / `from` argument resolved to.
@@ -187,6 +212,7 @@ pub fn parse_all(text: &str) -> Result<Parsed, String> {
     Ok(Parsed {
         recipients: file.recipients,
         rooms,
+        observers: Vec::new(),
     })
 }
 
@@ -362,6 +388,16 @@ impl AllowList {
 
     pub fn load_error(&self) -> Option<&str> {
         self.load_error.as_deref()
+    }
+
+    /// The loaded observers (STUB: none).
+    pub fn observers(&self) -> &[Observer] {
+        &[]
+    }
+
+    /// Why the last reload was rejected because of an observer row (STUB: never).
+    pub fn observer_error(&self) -> Option<&str> {
+        None
     }
 
     /// Resolve a `to`/`from` argument (name or MXID) to an allow-listed
@@ -651,4 +687,283 @@ room_id = " !rvKzMvUBBaewXApthx:matrix.inblock.io "
              (a group room: a [[rooms]] entry) to /nonexistent (no restart needed), and only with Tim's approval."
         );
     }
+
+    // ---- [[observers]] (dev-connector D10 b) ------------------------------
+
+    const TIM_DM: &str = "!timdm:matrix.inblock.io";
+    const OBS: &str = "@reader:matrix.inblock.io";
+
+    const WITH_OBSERVER: &str = r#"
+[[recipients]]
+name = "tim"
+mxid = "@abc123:matrix.inblock.io"
+
+[[rooms]]
+name = "daily-updates"
+room_id = "!HmZvPSoRvkqikWEvwD:matrix.inblock.io"
+
+[[observers]]
+name = "voice-inbox"
+mxid = "@reader:matrix.inblock.io"
+room_id = "!timdm:matrix.inblock.io"
+note = "dev-connector inbox_read (D10): read-only member, not counted"
+"#;
+
+    fn obs(name: &str, mxid: &str, room_id: &str) -> Observer {
+        Observer {
+            name: name.into(),
+            mxid: mxid.into(),
+            room_id: room_id.into(),
+            note: None,
+        }
+    }
+
+    fn bad_observer_row(row: &str) -> String {
+        format!("{}\n[[observers]]\n{row}\n", WITH_ROOMS)
+    }
+
+    #[test]
+    fn observers_section_parses_with_room_and_note() {
+        let p = parse_all(WITH_OBSERVER).unwrap();
+        assert_eq!(p.recipients.len(), 1);
+        assert_eq!(p.rooms.len(), 1);
+        assert_eq!(p.observers.len(), 1);
+        let o = &p.observers[0];
+        assert_eq!(o.name, "voice-inbox");
+        assert_eq!(o.mxid, OBS);
+        assert_eq!(o.room_id, TIM_DM);
+        assert!(o.note.as_deref().unwrap().contains("not counted"));
+    }
+
+    #[test]
+    fn invalid_observer_rows_reject_the_whole_file() {
+        let rows = [
+            // malformed MXID
+            "name = \"o\"\nmxid = \"reader:x\"\nroom_id = \"!r:x\"",
+            "name = \"o\"\nmxid = \"@reader\"\nroom_id = \"!r:x\"",
+            // malformed room id
+            "name = \"o\"\nmxid = \"@reader:x\"\nroom_id = \"#alias:x\"",
+            "name = \"o\"\nmxid = \"@reader:x\"\nroom_id = \"!r\"",
+            // empty name, name that is an MXID or room id
+            "name = \" \"\nmxid = \"@reader:x\"\nroom_id = \"!r:x\"",
+            "name = \"@o:x\"\nmxid = \"@reader:x\"\nroom_id = \"!r:x\"",
+            // also a recipient (the listed person), in any letter case
+            "name = \"o\"\nmxid = \"@abc123:matrix.inblock.io\"\nroom_id = \"!r:x\"",
+            "name = \"o\"\nmxid = \"@ABC123:matrix.inblock.io\"\nroom_id = \"!r:x\"",
+            // its room is a [[rooms]] entry
+            "name = \"o\"\nmxid = \"@reader:x\"\nroom_id = \"!HmZvPSoRvkqikWEvwD:matrix.inblock.io\"",
+            // a required field is missing
+            "name = \"o\"\nmxid = \"@reader:x\"",
+            "name = \"o\"\nroom_id = \"!r:x\"",
+        ];
+        for row in rows {
+            let text = bad_observer_row(row);
+            let err = parse_all(&text).expect_err(row);
+            assert!(err.contains("observer"), "{row}: {err}");
+        }
+        // Two rows with one name, and one (mxid, room) bound twice.
+        let dup_name = format!(
+            "{WITH_OBSERVER}\n[[observers]]\nname = \"VOICE-inbox\"\nmxid = \"@other:x\"\nroom_id = \"!o:x\"\n"
+        );
+        assert!(parse_all(&dup_name).unwrap_err().contains("observer"));
+        let dup_binding = format!(
+            "{WITH_OBSERVER}\n[[observers]]\nname = \"again\"\nmxid = \"@READER:matrix.inblock.io\"\nroom_id = \"{TIM_DM}\"\n"
+        );
+        assert!(parse_all(&dup_binding).unwrap_err().contains("observer"));
+    }
+
+    #[test]
+    fn one_observer_may_watch_two_rooms() {
+        let two = format!(
+            "{WITH_OBSERVER}\n[[observers]]\nname = \"second\"\nmxid = \"{OBS}\"\nroom_id = \"!other:matrix.inblock.io\"\n"
+        );
+        assert_eq!(parse_all(&two).unwrap().observers.len(), 2);
+    }
+
+    #[test]
+    fn an_observer_is_not_a_recipient_or_a_room() {
+        let a = list(WITH_OBSERVER);
+        assert!(a.resolve(OBS).is_none());
+        assert!(a.resolve("voice-inbox").is_none());
+        assert!(a.by_mxid(OBS).is_none());
+        assert!(a.resolve_target(OBS).is_none());
+        assert!(a.resolve_target(TIM_DM).is_none());
+        assert!(!a.is_listed_room(TIM_DM));
+        assert!(!a.refusal("x").contains("voice-inbox"));
+    }
+
+    #[test]
+    fn old_binaries_ignore_the_observers_section() {
+        // The shape of AllowListFile before [[observers]] existed: no
+        // deny_unknown_fields, so an old binary reads a new file as before.
+        #[derive(Debug, Default, Deserialize)]
+        struct LegacyFile {
+            #[serde(default)]
+            recipients: Vec<Recipient>,
+            #[serde(default)]
+            rooms: Vec<RoomEntry>,
+        }
+        let legacy: LegacyFile = toml::from_str(WITH_OBSERVER).unwrap();
+        assert_eq!(legacy.recipients.len(), 1);
+        assert_eq!(legacy.rooms.len(), 1);
+        // And today's parser tolerates a section it does not know.
+        let future = format!("{GOOD}\n[[something_later]]\nname = \"x\"\n");
+        assert_eq!(parse_all(&future).unwrap().recipients.len(), 2);
+    }
+
+    #[test]
+    fn zero_observers_changes_nothing() {
+        let p = parse_all(WITH_ROOMS).unwrap();
+        assert!(p.observers.is_empty());
+        let a = list(WITH_ROOMS);
+        assert!(a.observers().is_empty());
+        assert!(a.observer_error().is_none());
+        // the refusal text and the lists are exactly what they were
+        assert_eq!(p.recipients.len(), 1);
+        assert_eq!(p.rooms.len(), 2);
+    }
+
+    #[test]
+    fn counting_leaves_out_only_the_observers_of_that_room() {
+        let tim = "@abc123:matrix.inblock.io";
+        let bridge = "@bridge:matrix.inblock.io";
+        let observers = [obs("voice-inbox", OBS, TIM_DM)];
+        // no observers: every joined member counts
+        assert_eq!(count_joined(TIM_DM, [tim, bridge, OBS], &[]), 3);
+        // Tim + bridge + the observer is a DM (2)
+        assert_eq!(count_joined(TIM_DM, [tim, bridge, OBS], &observers), 2);
+        // the observer, letter case aside
+        assert_eq!(
+            count_joined(TIM_DM, [tim, bridge, "@READER:matrix.inblock.io"], &observers),
+            2
+        );
+        // the observer plus two others is a group (3)
+        assert_eq!(
+            count_joined(TIM_DM, [tim, bridge, "@third:x", OBS], &observers),
+            3
+        );
+        // an observer bound to another room still counts here
+        assert_eq!(count_joined("!elsewhere:x", [tim, bridge, OBS], &observers), 3);
+        // an observer that is not joined (an invite) changes nothing
+        assert_eq!(count_joined(TIM_DM, [tim, bridge], &observers), 2);
+        // one MXID bound to two rooms is left out of each, only there
+        let two = [
+            obs("a", OBS, TIM_DM),
+            obs("b", OBS, "!second:matrix.inblock.io"),
+        ];
+        assert_eq!(count_joined("!second:matrix.inblock.io", [tim, bridge, OBS], &two), 2);
+        assert_eq!(count_joined("!third:x", [tim, bridge, OBS], &two), 3);
+    }
+
+    fn at(p: &Path, offset_secs: u64) {
+        // Keep the mtime moving: two writes inside one clock tick would look unchanged.
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(offset_secs))
+            .unwrap();
+    }
+
+    const GOOD_OBSERVER_FILE: &str = WITH_OBSERVER;
+    /// `GOOD_OBSERVER_FILE` plus a new person (who must NOT appear while the
+    /// file is rejected) and an observer row that cannot be accepted.
+    fn rejected_file() -> String {
+        format!(
+            "{GOOD_OBSERVER_FILE}\n[[recipients]]\nname = \"mallory\"\nmxid = \"@mallory:matrix.inblock.io\"\n\n[[observers]]\nname = \"broken\"\nmxid = \"not-an-mxid\"\nroom_id = \"{TIM_DM}\"\n"
+        )
+    }
+
+    #[test]
+    fn an_invalid_observer_keeps_the_last_good_lists() {
+        let p = cache_file("obs-keep", GOOD_OBSERVER_FILE);
+        let mut a = AllowList::new(p.clone());
+        assert_eq!(a.recipients().len(), 1);
+        assert_eq!(a.rooms().len(), 1);
+        assert_eq!(a.observers().len(), 1);
+        assert!(a.observer_error().is_none());
+
+        std::fs::write(&p, rejected_file()).unwrap();
+        at(&p, 10);
+        assert!(a.reload(false));
+        // the lists did NOT change: the file is rejected as a whole
+        assert_eq!(a.recipients().len(), 1, "mallory must not be added");
+        assert!(a.resolve("mallory").is_none());
+        assert_eq!(a.rooms().len(), 1);
+        assert_eq!(a.observers().len(), 1);
+        assert_eq!(a.observers()[0].name, "voice-inbox");
+        // messaging still works: this is not a fail-closed state
+        assert!(a.load_error().is_none());
+        assert!(a.resolve("tim").is_some());
+        assert!(a.refusal("x").starts_with("REFUSED: \"x\" is not on"));
+        // and the reason is visible
+        let why = a.observer_error().expect("observer error kept");
+        assert!(why.contains("observer broken"), "{why}");
+
+        // a fixed file is picked up and the error clears
+        std::fs::write(&p, GOOD_OBSERVER_FILE.replace("daily-updates", "renamed")).unwrap();
+        at(&p, 20);
+        assert!(a.reload(false));
+        assert!(a.observer_error().is_none());
+        assert_eq!(a.rooms()[0].name, "renamed");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn a_syntax_error_still_fails_closed() {
+        let p = cache_file("obs-syntax", GOOD_OBSERVER_FILE);
+        let mut a = AllowList::new(p.clone());
+        assert_eq!(a.recipients().len(), 1);
+        std::fs::write(&p, "not toml [[").unwrap();
+        at(&p, 10);
+        assert!(a.reload(false));
+        assert!(a.recipients().is_empty());
+        assert!(a.rooms().is_empty());
+        assert!(a.observers().is_empty());
+        assert!(a.load_error().is_some());
+        assert!(a.observer_error().is_none());
+        // a bad recipient together with a bad observer is today's fail-closed
+        std::fs::write(&p, GOOD_OBSERVER_FILE).unwrap();
+        at(&p, 20);
+        a.reload(false);
+        assert_eq!(a.recipients().len(), 1);
+        std::fs::write(
+            &p,
+            format!(
+                "{}\n[[recipients]]\nname = \"x\"\nmxid = \"bad\"\n",
+                rejected_file()
+            ),
+        )
+        .unwrap();
+        at(&p, 30);
+        a.reload(false);
+        assert!(a.recipients().is_empty());
+        assert!(a.load_error().is_some());
+        assert!(a.observer_error().is_none());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn an_invalid_observer_at_start_is_named_and_fails_closed() {
+        let p = cache_file("obs-start", &rejected_file());
+        let a = AllowList::new(p.clone());
+        assert!(a.observer_error().unwrap().contains("observer broken"));
+        // nothing was loaded: no last good list exists to keep
+        assert!(a.recipients().is_empty());
+        assert!(a.observers().is_empty());
+        assert!(a.load_error().is_some());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn an_embedded_owner_cannot_be_made_an_observer() {
+        let own = format!(
+            "[[observers]]\nname = \"o\"\nmxid = \"{}\"\nroom_id = \"!r:x\"\n",
+            owner().mxid
+        );
+        let p = cache_file("obs-owner", &own);
+        let a = AllowList::owner_only(owner(), Some(p.clone()), "M");
+        assert!(a.observer_error().unwrap().contains("observer o"));
+        assert!(a.observers().is_empty());
+        assert!(a.resolve("owner").is_some());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
 }

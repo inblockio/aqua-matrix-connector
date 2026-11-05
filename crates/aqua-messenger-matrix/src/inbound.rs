@@ -100,6 +100,15 @@ pub async fn joined_member_count(room: &Room) -> u64 {
     }
 }
 
+/// Members of `room` that count toward "is this a DM": joined members minus
+/// the observers bound to this room (STUB: red commit, counts everyone).
+pub async fn counted_members(
+    room: &Room,
+    _observers: &[aqua_messenger::allowlist::Observer],
+) -> u64 {
+    joined_member_count(room).await
+}
+
 /// Whether a message's room is a group: the member count from the last
 /// connect's snapshot (or the room's summary for a room joined since).
 pub fn is_group<T: Transport>(engine: &Engine<T>, room: &Room) -> bool {
