@@ -94,7 +94,7 @@ the unit `failed` ("Start request repeated too quickly") until a human ran
 `reset-failed`. An outage lasts as long as it lasts; no burst count fits it.
 
 The per-consultant `aqua-activity-watch-<label>.service` units rendered by
-`Skills/consultant-deploy/spawn-consultant.sh` follow the same scheme with a
+`Skills/consultant-deploy/spawn-consultant.sh --host nuc10` follow the same scheme with a
 10s base and a 120s cap (`RestartSteps=6`).
 
 To skip the remaining backoff after fixing a root cause:
