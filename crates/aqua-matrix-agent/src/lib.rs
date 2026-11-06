@@ -622,17 +622,35 @@ pub(crate) async fn mint_session_token(
     .context("reauth: could not acquire a fresh session")
 }
 
-/// Decline the invite to `room_id` on `client` (see [`AgentClient::decline_invite`]).
+/// Decline the invite to `room_id` on `client`: ONE leave request for ONE room id (see
+/// [`AgentClient::decline_invite`] for why it is not `Room::leave()`).
 async fn decline_invite_on(client: &Client, room_id: &str) -> Result<()> {
+    use matrix_sdk::ruma::api::client::membership::{forget_room, leave_room};
     let id: &RoomId = room_id
         .try_into()
         .map_err(|e| anyhow!("invalid room_id {room_id:?}: {e}"))?;
-    client
+    let room = client
         .get_room(id)
-        .ok_or_else(|| anyhow!("room {room_id} is not known to this client"))?
-        .leave()
+        .ok_or_else(|| anyhow!("room {room_id} is not known to this client"))?;
+    match room.state() {
+        RoomState::Invited => {}
+        // Already declined (or left): nothing to do.
+        RoomState::Left => return Ok(()),
+        other => anyhow::bail!("room {room_id} is {other:?}, not a pending invite"),
+    }
+    client
+        .send(leave_room::v3::Request::new(id.to_owned()))
         .await
-        .with_context(|| format!("declining the invite to {room_id}"))
+        .with_context(|| format!("declining the invite to {room_id}"))?;
+    // Room::leave() also forgot a declined invite, so the room drops out of the account's sync;
+    // keep that, for this room only, and never fail the decline over it.
+    if let Err(e) = client
+        .send(forget_room::v3::Request::new(id.to_owned()))
+        .await
+    {
+        tracing::debug!("forgetting the declined room {room_id} failed (ignored): {e}");
+    }
+    Ok(())
 }
 
 async fn build_and_restore(
@@ -1682,7 +1700,16 @@ impl AgentClient {
     }
 
     /// Decline one invite (leave the invited room). A room already left is a
-    /// no-op.
+    /// no-op; a room that is not a pending invite (a joined room, an unknown
+    /// id) is an error and nothing is sent.
+    ///
+    /// This is one leave request for the one room id. It is NOT `Room::leave()`,
+    /// which follows the room's `predecessor` links and also leaves every
+    /// predecessor the account is joined to: the predecessor of an invite comes
+    /// from the invite's stripped `m.room.create`, which the INVITER writes, so a
+    /// stranger's room naming one of our joined rooms (a DM with the owner) as
+    /// its predecessor made declining it leave that DM, and a room naming itself
+    /// looped the walk for ever (matrix-sdk 0.17, no cycle guard).
     pub async fn decline_invite(&self, room_id: &str) -> Result<()> {
         decline_invite_on(&self.client, room_id).await
     }

@@ -39,8 +39,10 @@ fn sync_body(invites: &[(&str, Option<&str>)], left: &[&str]) -> String {
         .iter()
         .map(|(room, pre)| ((*room).to_string(), invite("@stranger:localhost", *pre)))
         .collect();
-    let left: serde_json::Map<String, serde_json::Value> =
-        left.iter().map(|r| ((*r).to_string(), serde_json::json!({}))).collect();
+    let left: serde_json::Map<String, serde_json::Value> = left
+        .iter()
+        .map(|r| ((*r).to_string(), serde_json::json!({})))
+        .collect();
     serde_json::json!({
         "next_batch": "s_1",
         "rooms": {
@@ -105,7 +107,9 @@ async fn fake_homeserver(sync: String) -> (String, Log) {
                     let mut parts = head.lines().next().unwrap_or("").split_whitespace();
                     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
                     let path = target.split('?').next().unwrap_or("");
-                    seen.lock().unwrap().push((method.to_string(), path.to_string()));
+                    seen.lock()
+                        .unwrap()
+                        .push((method.to_string(), path.to_string()));
                     let body = if path.starts_with("/_matrix/client/versions") {
                         r#"{"versions":["v1.1","v1.11"],"unstable_features":{}}"#.to_string()
                     } else if path.ends_with("/sync") {
@@ -164,8 +168,14 @@ fn requests_ending(log: &Log, suffix: &str) -> Vec<String> {
         .iter()
         .filter(|(method, path)| method == "POST" && path.ends_with(suffix))
         .map(|(_, path)| {
-            let room = path.trim_end_matches(suffix).rsplit('/').next().unwrap_or("");
-            room.replace("%21", "!").replace("%3A", ":").replace("%3a", ":")
+            let room = path
+                .trim_end_matches(suffix)
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            room.replace("%21", "!")
+                .replace("%3A", ":")
+                .replace("%3a", ":")
         })
         .collect()
 }
@@ -180,7 +190,8 @@ fn forgets(log: &Log) -> Vec<String> {
 
 #[tokio::test]
 async fn declining_leaves_only_the_invited_room_not_the_joined_predecessor_it_names() {
-    let (client, log) = client_for("pred", sync_body(&[("!trap:localhost", Some(MINE))], &[])).await;
+    let (client, log) =
+        client_for("pred", sync_body(&[("!trap:localhost", Some(MINE))], &[])).await;
     decline_invite_on(&client, "!trap:localhost").await.unwrap();
     assert_eq!(
         leaves(&log),
@@ -188,7 +199,11 @@ async fn declining_leaves_only_the_invited_room_not_the_joined_predecessor_it_na
         "one leave request, for the declined room only"
     );
     let mine = client.get_room(<&RoomId>::try_from(MINE).unwrap()).unwrap();
-    assert_eq!(mine.state(), RoomState::Joined, "our joined room is untouched");
+    assert_eq!(
+        mine.state(),
+        RoomState::Joined,
+        "our joined room is untouched"
+    );
 }
 
 #[tokio::test]
@@ -204,7 +219,9 @@ async fn a_joined_room_is_not_an_invite_and_is_never_left_by_declining() {
 #[tokio::test]
 async fn an_unknown_or_malformed_room_id_sends_nothing() {
     let (client, log) = client_for("unknown", sync_body(&[], &[])).await;
-    assert!(decline_invite_on(&client, "!never-heard-of:localhost").await.is_err());
+    assert!(decline_invite_on(&client, "!never-heard-of:localhost")
+        .await
+        .is_err());
     assert!(decline_invite_on(&client, "not a room id").await.is_err());
     assert!(leaves(&log).is_empty());
 }
@@ -219,7 +236,49 @@ async fn a_room_already_left_is_a_no_op() {
 #[tokio::test]
 async fn declining_an_invite_also_forgets_that_room_and_only_that_room() {
     // Room::leave() forgot a declined invite; the single request keeps that (best effort).
-    let (client, log) = client_for("forget", sync_body(&[("!trap:localhost", Some(MINE))], &[])).await;
+    let (client, log) =
+        client_for("forget", sync_body(&[("!trap:localhost", Some(MINE))], &[])).await;
     decline_invite_on(&client, "!trap:localhost").await.unwrap();
     assert_eq!(forgets(&log), ["!trap:localhost"]);
+}
+
+#[tokio::test]
+async fn a_room_that_names_itself_as_its_predecessor_is_declined_once_and_ends() {
+    // Room::leave() has no cycle guard: this looped for ever (and grew without bound).
+    let (client, log) = client_for(
+        "self",
+        sync_body(&[("!loop:localhost", Some("!loop:localhost"))], &[]),
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        decline_invite_on(&client, "!loop:localhost"),
+    )
+    .await
+    .expect("the decline ends")
+    .unwrap();
+    assert_eq!(leaves(&log), ["!loop:localhost"]);
+}
+
+#[tokio::test]
+async fn two_invites_naming_each_other_are_declined_one_at_a_time() {
+    let (client, log) = client_for(
+        "cycle",
+        sync_body(
+            &[
+                ("!a:localhost", Some("!b:localhost")),
+                ("!b:localhost", Some("!a:localhost")),
+            ],
+            &[],
+        ),
+    )
+    .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        decline_invite_on(&client, "!a:localhost"),
+    )
+    .await
+    .expect("the decline ends")
+    .unwrap();
+    assert_eq!(leaves(&log), ["!a:localhost"], "declining a leaves b alone");
 }
