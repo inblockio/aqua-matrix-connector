@@ -36,11 +36,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create an encrypted room and invite `invite` (flag the invite
+    /// Create an encrypted room and invite every `--invite` (flag the invites
     /// `is_direct` with --is-direct).
     Create {
-        #[arg(long)]
-        invite: String,
+        #[arg(long, required = true)]
+        invite: Vec<String>,
         #[arg(long)]
         is_direct: bool,
         #[arg(long)]
@@ -64,6 +64,25 @@ enum Cmd {
         room: String,
         #[arg(long)]
         file: PathBuf,
+    },
+    /// Invite `user` to `room` (e.g. a read-only observer into a DM).
+    Invite {
+        #[arg(long)]
+        room: String,
+        #[arg(long)]
+        user: String,
+    },
+    /// Join every room this identity is invited to; print the room ids.
+    JoinInvited,
+    /// Leave `room`.
+    Leave {
+        #[arg(long)]
+        room: String,
+    },
+    /// Print the joined members of `room` (one MXID per line).
+    Members {
+        #[arg(long)]
+        room: String,
     },
     /// Print the last messages in `room`.
     Read {
@@ -107,9 +126,11 @@ async fn main() -> anyhow::Result<()> {
             is_direct,
             name,
         } => {
-            let user: OwnedUserId = invite.as_str().try_into()?;
             let mut req = CreateRoomRequest::new();
-            req.invite = vec![user];
+            req.invite = invite
+                .iter()
+                .map(|u| OwnedUserId::try_from(u.as_str()))
+                .collect::<Result<_, _>>()?;
             req.is_direct = is_direct;
             req.name = Some(name);
             req.initial_state = vec![InitialStateEvent::with_empty_state_key(
@@ -149,6 +170,42 @@ async fn main() -> anyhow::Result<()> {
             };
             let _ = agent.sync_once_nowait().await;
             println!("sent {id}");
+        }
+        Cmd::Invite { room, user } => {
+            let rid: &matrix_sdk::ruma::RoomId = room.as_str().try_into()?;
+            let uid: &matrix_sdk::ruma::UserId = user.as_str().try_into()?;
+            let r = agent
+                .client()
+                .get_room(rid)
+                .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
+            r.invite_user_by_id(uid).await?;
+            println!("invited {user} to {room}");
+        }
+        Cmd::Leave { room } => {
+            let rid: &matrix_sdk::ruma::RoomId = room.as_str().try_into()?;
+            let r = agent
+                .client()
+                .get_room(rid)
+                .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
+            r.leave().await?;
+            println!("left {room}");
+        }
+        Cmd::JoinInvited => {
+            for room in agent.client().invited_rooms() {
+                room.join().await?;
+                println!("{}", room.room_id());
+            }
+            let _ = agent.sync_once_nowait().await;
+        }
+        Cmd::Members { room } => {
+            let rid: &matrix_sdk::ruma::RoomId = room.as_str().try_into()?;
+            let r = agent
+                .client()
+                .get_room(rid)
+                .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
+            for m in r.members(matrix_sdk::RoomMemberships::JOIN).await? {
+                println!("{}", m.user_id());
+            }
         }
         Cmd::PostFile { room, file } => {
             let id = agent.send_media_to_room(&room, &file, None).await?;

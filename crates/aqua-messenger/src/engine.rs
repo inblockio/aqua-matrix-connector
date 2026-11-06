@@ -361,10 +361,21 @@ impl<T: Transport> Engine<T> {
         f(&mut self.status.lock().unwrap());
     }
 
-    /// Run `f` on the allow-list after a hot reload (mtime check).
-    pub fn with_allow<R>(&self, f: impl FnOnce(&AllowList) -> R) -> R {
+    /// The allow-list, locked after a hot reload (mtime check). A file the
+    /// reload rejected is audited here, once (the reload runs on a changed
+    /// file only).
+    fn allow_current(&self) -> std::sync::MutexGuard<'_, AllowList> {
         let mut allow = self.allow.lock().unwrap();
         allow.reload(false);
+        for row in allow.take_audit() {
+            self.audit(row);
+        }
+        allow
+    }
+
+    /// Run `f` on the allow-list after a hot reload (mtime check).
+    pub fn with_allow<R>(&self, f: impl FnOnce(&AllowList) -> R) -> R {
+        let allow = self.allow_current();
         f(&allow)
     }
 
@@ -389,6 +400,12 @@ impl<T: Transport> Engine<T> {
             .unwrap()
             .get(room_id)
             .map(|s| s.joined_members)
+    }
+
+    /// True the first time `key` is seen: lets a caller log or audit one
+    /// condition once per process instead of on every request.
+    pub fn note_once(&self, key: &str) -> bool {
+        self.dropped.lock().unwrap().insert(key.to_string())
     }
 
     /// Append one JSON line to `<state>/audit.jsonl`. Metadata only, never
@@ -536,8 +553,7 @@ impl<T: Transport> Engine<T> {
     }
 
     pub fn resolve_to(&self, to: &str) -> Result<Resolved, String> {
-        let mut allow = self.allow.lock().unwrap();
-        allow.reload(false);
+        let allow = self.allow_current();
         match allow.resolve_target(to) {
             Some(Target::Person(r)) => Ok(Resolved {
                 name: r.name.clone(),
@@ -569,8 +585,7 @@ impl<T: Transport> Engine<T> {
     /// room (name/room id), or any well-formed MXID / room id (entries of
     /// since-removed people and rooms stay readable).
     pub fn resolve_from(&self, from: &str) -> Result<FromFilter, String> {
-        let mut allow = self.allow.lock().unwrap();
-        allow.reload(false);
+        let allow = self.allow_current();
         match allow.resolve_target(from) {
             Some(Target::Person(r)) => return Ok(FromFilter::Sender(r.mxid.clone())),
             Some(Target::Room(r)) => return Ok(FromFilter::Room(r.room_id.clone())),
@@ -1061,8 +1076,7 @@ impl<T: Transport> Engine<T> {
 
     fn list_recipients(&self) -> Response {
         let l = self.profile.limits;
-        let mut allow = self.allow.lock().unwrap();
-        allow.reload(false);
+        let allow = self.allow_current();
         let mut rate = self.rate.lock().unwrap();
         let now = Instant::now();
         let recips: Vec<_> = allow
@@ -1105,7 +1119,7 @@ impl<T: Transport> Engine<T> {
             "rooms": rooms,
             "unlisted_non_dm_rooms_joined": unlisted,
             "allowlist_file": allow.path(),
-            "allowlist_error": allow.load_error(),
+            "allowlist_error": allow.error_text(),
             "rate_limit": format!("{} sends per {}s per person or room", l.rate_count, l.rate_window_secs),
             "max_message_bytes": l.max_message_bytes,
             "max_file_bytes": l.max_file_bytes,
@@ -1223,8 +1237,7 @@ impl<T: Transport> Engine<T> {
     /// removing a person or room from the list also stops downloads (and cache
     /// hits) of what they sent before. A broken allow-list refuses everything.
     fn fetch_permitted(&self, entry: &InboxEntry) -> Result<(), String> {
-        let mut allow = self.allow.lock().unwrap();
-        allow.reload(false);
+        let allow = self.allow_current();
         if let Some(e) = allow.load_error() {
             return Err(format!(
                 "REFUSED: the allow-list failed to load ({e}); attachments cannot be fetched until it is fixed"

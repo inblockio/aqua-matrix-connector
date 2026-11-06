@@ -1128,3 +1128,97 @@ async fn mention_names_one_allowlisted_person_and_survives_edits() {
     assert_eq!(sends_left(&e, "daily-updates").await, 18);
     let _ = std::fs::remove_dir_all(d);
 }
+
+// ---- [[observers]]: a member the bridge does not count ----------------------
+
+const OBSERVED_LIST: &str = "[[recipients]]\nname = \"tim\"\nmxid = \"@tim:localhost\"\n\n[[observers]]\nname = \"voice-inbox\"\nmxid = \"@reader:localhost\"\nroom_id = \"!timdm:localhost\"\n";
+
+fn host_observed(tag: &str) -> (Engine<Mock>, PathBuf) {
+    let d = dir(tag);
+    std::fs::write(d.join("allowlist.toml"), OBSERVED_LIST).unwrap();
+    let allow = AllowList::new(d.join("allowlist.toml"));
+    (Engine::new(Profile::host(), &d, allow, Mock::default()), d)
+}
+
+#[test]
+fn an_observer_never_reaches_the_inbox_and_tim_still_does() {
+    let (e, d) = host_observed("obs-inbound");
+    let own = "@bridge:localhost";
+    // the observer's own messages: dropped, logged once (it is not allow-listed)
+    for _ in 0..2 {
+        assert!(e
+            .classify_inbound(own, "@reader:localhost", "!timdm:localhost", "$o1", false)
+            .is_none());
+    }
+    let audit = std::fs::read_to_string(d.join("audit.jsonl")).unwrap();
+    assert_eq!(audit.matches("inbound_dropped").count(), 1, "{audit}");
+    // Tim's reply in the same room is ingested (the room is a DM, group = false)
+    let acc = e
+        .classify_inbound(own, "@tim:localhost", "!timdm:localhost", "$t1", false)
+        .expect("tim's reply is kept");
+    assert_eq!(acc.sender_name.as_deref(), Some("tim"));
+    assert!(acc.room_name.is_none());
+    // a real group room stays dropped
+    assert!(e
+        .classify_inbound(own, "@tim:localhost", "!group:localhost", "$t2", true)
+        .is_none());
+}
+
+#[tokio::test]
+async fn the_observer_is_neither_a_target_nor_a_source() {
+    let (e, _d) = host_observed("obs-targets");
+    for who in ["voice-inbox", "@reader:localhost", "!timdm:localhost"] {
+        let (text, is_err) = tool(&e, "send_message", json!({"to": who, "markdown": "hi"})).await;
+        assert!(is_err && text.contains("REFUSED"), "{who}: {text}");
+    }
+    let (text, _) = tool(&e, "list_recipients", json!({})).await;
+    assert!(
+        !text.contains("voice-inbox") && !text.contains("@reader"),
+        "{text}"
+    );
+}
+
+fn touch_ahead(p: &Path, secs: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(secs))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_rejected_observer_row_is_audited_and_the_lists_stay() {
+    let (e, d) = host_observed("obs-reject");
+    let file = d.join("allowlist.toml");
+    assert!(e.with_allow(|a| a.resolve("tim").is_some() && a.observers().len() == 1));
+
+    // Same file, plus a new person and an observer that is also a recipient.
+    let bad = format!(
+        "{OBSERVED_LIST}\n[[recipients]]\nname = \"mallory\"\nmxid = \"@mallory:localhost\"\n\n[[observers]]\nname = \"dup\"\nmxid = \"@tim:localhost\"\nroom_id = \"!x:localhost\"\n"
+    );
+    std::fs::write(&file, bad).unwrap();
+    touch_ahead(&file, 10);
+    // every request path reloads; ask twice, the audit row is written once
+    assert!(e.with_allow(|a| a.resolve("mallory").is_none() && a.resolve("tim").is_some()));
+    let (text, is_err) = tool(
+        &e,
+        "send_message",
+        json!({"to": "tim", "markdown": "still reachable"}),
+    )
+    .await;
+    assert!(!is_err, "{text}");
+    let (listed, _) = tool(&e, "list_recipients", json!({})).await;
+    assert!(
+        listed.contains("observer dup"),
+        "the reason is shown: {listed}"
+    );
+    assert!(!listed.contains("mallory"));
+
+    let audit = std::fs::read_to_string(d.join("audit.jsonl")).unwrap();
+    let rows: Vec<Value> = audit
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &Value| v["event"] == "allowlist_rejected")
+        .collect();
+    assert_eq!(rows.len(), 1, "{audit}");
+    assert!(rows[0]["reason"].as_str().unwrap().contains("observer dup"));
+    assert_eq!(rows[0]["kept"], "last_good");
+}

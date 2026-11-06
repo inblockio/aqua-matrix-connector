@@ -19,6 +19,7 @@ mod rtc_keys;
 mod rtc_member;
 
 pub use device_role::DeviceRole;
+pub use dm::{DmObserver, DmObservers};
 pub use durable::{WorkItem, WorkJournal, WorkState};
 pub use media::{MediaHandle, MediaKind};
 pub use net_retry::{
@@ -359,6 +360,9 @@ pub struct AgentClient {
     /// with a fresh token to redeliver the journalled reply within seconds rather
     /// than waiting for the next scheduled cycle.
     recycle: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Members that do not count when this client decides whether a room is a
+    /// 1:1 DM (the bridge allow-list's observers). Shared by clones.
+    dm_observers: DmObservers,
 }
 
 impl AgentClient {
@@ -1218,18 +1222,39 @@ fn partition_dm_rooms(
     (kept, left, not_dm)
 }
 
+/// The device to keep when pruning must be this client's own current device.
+fn ensure_keep_is_own(own: Option<&str>, keep: &str) -> std::result::Result<(), String> {
+    match own {
+        Some(own) if own == keep => Ok(()),
+        _ => Err(format!(
+            "refusing to prune: {keep} is not this client's own device (its device id is {})",
+            own.unwrap_or("unknown")
+        )),
+    }
+}
+
+/// Delete every device of this account EXCEPT `keep_device_id`, which must be
+/// the calling client's own current device id (anything else is refused with
+/// an error, so a wrong id can neither log the caller out nor delete a device
+/// that belongs to another process of the same account, such as the secondary
+/// bridge on clawi). Only for an account that runs ONE device.
+///
 /// Best-effort: after a store-wipe re-bootstrap minted a NEW device_id, delete the
 /// agent's OTHER server-side devices, so peers stop encrypting to dead devices
 /// whose Megolm keys this device can never read. Under MSC3861/OIDC delegated auth
 /// the Client-Server device-deletion endpoint may be disabled (device lifecycle
 /// belongs to the OIDC provider) — in that case we log and move on; the stale
-/// devices age out on the server. Never fatal.
-async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
+/// devices age out on the server. A failed listing or deletion is logged and is
+/// not an error. Public so a client that rebuilds its store on purpose (the
+/// inbox reader) can run the same prune with its new device id.
+pub async fn prune_stale_devices(client: &Client, keep_device_id: &str) -> Result<()> {
+    ensure_keep_is_own(client.device_id().map(|d| d.as_str()), keep_device_id)
+        .map_err(|e| anyhow!(e))?;
     let devices = match client.devices().await {
         Ok(r) => r.devices,
         Err(e) => {
             tracing::warn!("device prune: could not list devices: {e:#}");
-            return;
+            return Ok(());
         }
     };
     let stale: Vec<OwnedDeviceId> = devices
@@ -1242,7 +1267,7 @@ async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
             keep = keep_device_id,
             "device prune: no stale devices to remove"
         );
-        return;
+        return Ok(());
     }
     tracing::info!(
         keep = keep_device_id,
@@ -1256,6 +1281,7 @@ async fn prune_stale_devices(client: &Client, keep_device_id: &str) {
              stale devices will age out server-side or need OIDC-provider cleanup): {e:#}"
         ),
     }
+    Ok(())
 }
 
 /// Sign this device with the identity's self-signing key unless it already is.
@@ -1453,7 +1479,9 @@ impl AgentClient {
         // keys this device can't read → undecryptable messages). Best-effort prune
         // of the stale server-side devices. Only on the wipe path (rare).
         if wiped {
-            prune_stale_devices(&client, device_id.as_str()).await;
+            if let Err(e) = prune_stale_devices(&client, device_id.as_str()).await {
+                tracing::warn!("device prune skipped: {e:#}");
+            }
         }
 
         Ok(Self {
@@ -1464,7 +1492,15 @@ impl AgentClient {
             config,
             journal: None,
             recycle: None,
+            dm_observers: DmObservers::default(),
         })
+    }
+
+    /// Replace the set of members that do not count when deciding whether a
+    /// room is a 1:1 DM (`find_dm_room`, `dm_room_id`, `mark_dm`,
+    /// `is_one_to_one_dm`, `reconcile_owner_dms`). Empty by default.
+    pub fn set_dm_observers(&self, observers: Vec<DmObserver>) {
+        self.dm_observers.set(observers);
     }
 
     /// Re-mint the Matrix session non-interactively and rebuild the inner
@@ -3379,6 +3415,23 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::ensure_keep_is_own;
+
+    #[test]
+    fn prune_keeps_only_the_clients_own_device() {
+        assert_eq!(ensure_keep_is_own(Some("DEV1"), "DEV1"), Ok(()));
+        let wrong = ensure_keep_is_own(Some("DEV1"), "DEV2").unwrap_err();
+        assert!(
+            wrong.contains("not this client's own device")
+                && wrong.contains("DEV1")
+                && wrong.contains("DEV2"),
+            "{wrong}"
+        );
+        // a client with no session device id cannot say what to keep
+        let none = ensure_keep_is_own(None, "DEV1").unwrap_err();
+        assert!(none.contains("not this client's own device"), "{none}");
+    }
+
     use super::*;
     use std::fs;
 

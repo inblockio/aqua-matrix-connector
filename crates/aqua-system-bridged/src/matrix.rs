@@ -13,7 +13,8 @@ use aqua_matrix_agent::{
 use aqua_messenger::allowlist::{invite_action, InviteAction};
 use aqua_messenger::{Dest, ReplyRef, SeenRoom};
 use aqua_messenger_matrix::inbound::{
-    backfill, joined_member_count, register_message_handler, survey_rooms,
+    backfill, counted_members, counted_members_opt, register_message_handler, snapshot_count,
+    survey_rooms, sync_dm_observers,
 };
 use matrix_sdk::{
     config::SyncSettings,
@@ -363,9 +364,12 @@ async fn handle_invite(
     }
     match room.join().await {
         Ok(()) => {
+            let observers = sync_dm_observers(agent, shared);
             let seen = SeenRoom {
                 display_name: room.name(),
-                joined_members: joined_member_count(&room).await,
+                joined_members: snapshot_count(
+                    counted_members_opt(shared, &room, &observers).await,
+                ),
                 is_direct: action == InviteAction::JoinAsDm,
             };
             shared.note_joined_room(&room_id, seen);
@@ -447,10 +451,53 @@ async fn destination_room(
     }
 }
 
+/// One room that could be the DM with a person (see [`best_dm`]).
+#[derive(Debug, Clone)]
+struct DmCand {
+    id: String,
+    /// The room of the message being replied to.
+    prefer: bool,
+    /// An `[[observers]]` row names this room.
+    observed: bool,
+    /// `m.direct` records it.
+    is_direct: bool,
+    /// 2 = the person has joined, 1 = invited.
+    rank: u8,
+    /// The connector's own pick (most recent activity).
+    connector_pick: bool,
+}
+
+/// Whether the observed-room preference applies to one candidate: an observer
+/// row names the room, the person has JOINED it (`rank` 2), and the connector
+/// agrees the room is a 1:1 with that person once the observer is left out.
+fn observed_preference(bound: bool, rank: u8, one_to_one: bool) -> bool {
+    bound && rank == 2 && one_to_one
+}
+
+/// The best candidate: the reply room, then a room an `[[observers]]` row
+/// names (the row picks that room explicitly, so it beats whatever else the
+/// person shares with the bridge), then `m.direct`, the person joined over
+/// invited, the connector's pick, and the room id order last.
+fn best_dm(cands: Vec<DmCand>) -> Option<String> {
+    let key = |c: &DmCand| (c.prefer, c.observed, c.is_direct, c.rank, c.connector_pick);
+    let mut best: Option<DmCand> = None;
+    for c in cands {
+        let better = match &best {
+            None => true,
+            Some(b) => key(&c) > key(b) || (key(&c) == key(b) && c.id < b.id),
+        };
+        if better {
+            best = Some(c);
+        }
+    }
+    best.map(|c| c.id)
+}
+
 /// Resolve (or create, if `missing` allows) the 1:1 DM with `mxid`.
-/// Candidates: joined rooms with at most two joined members, not listed under
-/// `[[rooms]]`, where the person is joined (or invited). Preference: the room
-/// of the message being replied to (`prefer`, when it is a candidate), then
+/// Candidates: joined rooms with at most two counted members (an observer is
+/// not counted), not listed under `[[rooms]]`, where the person is joined (or
+/// invited). Preference: the room of the message being replied to (`prefer`,
+/// when it is a candidate), then a room an `[[observers]]` row names, then
 /// rooms recorded in `m.direct`, then the person joined over invited, then the
 /// connector's own pick (most recent activity), then room id order.
 async fn dm_room_for(
@@ -463,11 +510,12 @@ async fn dm_room_for(
     let target =
         OwnedUserId::try_from(mxid).map_err(|e| anyhow::anyhow!("invalid MXID {mxid}: {e}"))?;
     let listed = listed_room_ids(shared);
+    let observers = sync_dm_observers(agent, shared);
     let connector_pick = agent.dm_room_id(mxid).await.ok().flatten();
-    let mut best: Option<((bool, bool, u8, bool), String)> = None;
+    let mut cands: Vec<DmCand> = Vec::new();
     for room in agent.client().joined_rooms() {
         let id = room.room_id().to_string();
-        if listed.contains(&id) || joined_member_count(&room).await > 2 {
+        if listed.contains(&id) || counted_members(shared, &room, &observers).await > 2 {
             continue;
         }
         let Some(member) = room.get_member(&target).await.ok().flatten() else {
@@ -479,21 +527,19 @@ async fn dm_room_for(
             _ => continue,
         };
         let is_direct = room.is_direct().await.unwrap_or(false);
-        let key = (
-            prefer == Some(id.as_str()),
+        let bound = observers.iter().any(|o| o.room_id == id);
+        let one_to_one =
+            bound && rank == 2 && agent.is_one_to_one_dm(&id, mxid).await.unwrap_or(false);
+        cands.push(DmCand {
+            prefer: prefer == Some(id.as_str()),
+            observed: observed_preference(bound, rank, one_to_one),
             is_direct,
             rank,
-            connector_pick.as_deref() == Some(id.as_str()),
-        );
-        let better = match &best {
-            None => true,
-            Some((k, bid)) => key > *k || (key == *k && id < *bid),
-        };
-        if better {
-            best = Some((key, id));
-        }
+            connector_pick: connector_pick.as_deref() == Some(id.as_str()),
+            id,
+        });
     }
-    if let Some((_, id)) = best {
+    if let Some(id) = best_dm(cands) {
         return Ok(id);
     }
     if missing == MissingDm::LeaveToPrimary {
@@ -535,9 +581,15 @@ fn listed_room_ids(shared: &Shared) -> std::collections::HashSet<String> {
 /// writes only when something changed. Best-effort.
 async fn repair_m_direct(agent: &AgentClient, shared: &Shared) {
     let listed = listed_room_ids(shared);
+    let observers = sync_dm_observers(agent, shared);
     let mut groups = std::collections::HashSet::new();
     for r in agent.client().joined_rooms() {
-        if joined_member_count(&r).await > 2 {
+        // an observed room whose members cannot be read is left alone: the
+        // repair removes entries and must not act on a guess
+        if counted_members_opt(shared, &r, &observers)
+            .await
+            .is_some_and(|n| n > 2)
+        {
             groups.insert(r.room_id().to_string());
         }
     }
@@ -612,6 +664,105 @@ fn register_invite_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cand(id: &str) -> DmCand {
+        DmCand {
+            id: id.into(),
+            prefer: false,
+            observed: false,
+            is_direct: false,
+            rank: 2,
+            connector_pick: false,
+        }
+    }
+
+    #[test]
+    fn the_observed_preference_needs_the_person_joined_in_a_one_to_one() {
+        // a pending invitee must not pull its sends into somebody else's DM
+        assert!(!observed_preference(true, 1, true), "invited, not joined");
+        assert!(
+            !observed_preference(true, 2, false),
+            "not 1:1 apart from the observer"
+        );
+        assert!(
+            !observed_preference(false, 2, true),
+            "no row names the room"
+        );
+        assert!(observed_preference(true, 2, true));
+    }
+
+    #[test]
+    fn an_observed_room_outranks_m_direct_and_the_connector_pick() {
+        // the audit's A3: a second clean 2-member DM with Tim exists; it is in
+        // m.direct and the connector prefers it, but the row names the other room
+        let observed = DmCand {
+            observed: true,
+            ..cand("!observed:x")
+        };
+        let other = DmCand {
+            is_direct: true,
+            connector_pick: true,
+            ..cand("!other:x")
+        };
+        assert_eq!(
+            best_dm(vec![other.clone(), observed.clone()]).as_deref(),
+            Some("!observed:x")
+        );
+        assert_eq!(
+            best_dm(vec![observed, other]).as_deref(),
+            Some("!observed:x")
+        );
+    }
+
+    #[test]
+    fn the_reply_room_still_wins_over_an_observed_room() {
+        let replied = DmCand {
+            prefer: true,
+            ..cand("!replied:x")
+        };
+        let observed = DmCand {
+            observed: true,
+            ..cand("!observed:x")
+        };
+        assert_eq!(
+            best_dm(vec![observed, replied]).as_deref(),
+            Some("!replied:x")
+        );
+    }
+
+    #[test]
+    fn without_observers_the_old_order_holds() {
+        let direct = DmCand {
+            is_direct: true,
+            ..cand("!direct:x")
+        };
+        let picked = DmCand {
+            connector_pick: true,
+            ..cand("!picked:x")
+        };
+        let invited = DmCand {
+            is_direct: true,
+            rank: 1,
+            ..cand("!invited:x")
+        };
+        // m.direct beats the connector's pick
+        assert_eq!(
+            best_dm(vec![picked.clone(), direct.clone()]).as_deref(),
+            Some("!direct:x")
+        );
+        // joined beats invited at equal m.direct
+        assert_eq!(best_dm(vec![invited, direct]).as_deref(), Some("!direct:x"));
+        // the connector's pick beats the room id order, which breaks the last tie
+        assert_eq!(
+            best_dm(vec![cand("!a:x"), picked]).as_deref(),
+            Some("!picked:x")
+        );
+        assert_eq!(
+            best_dm(vec![cand("!b:x"), cand("!a:x")]).as_deref(),
+            Some("!a:x")
+        );
+        assert_eq!(best_dm(vec![]), None);
+    }
 
     #[test]
     fn only_the_primary_creates_dm_rooms_for_new_messages() {

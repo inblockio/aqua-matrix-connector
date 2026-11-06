@@ -112,6 +112,12 @@ struct Args {
     /// Print the identity (DID, and MXID once logged in) and exit.
     #[arg(long)]
     print_identity: bool,
+    /// Check an allow-list file with the daemon's own rules (the state dir's
+    /// persisted account may not be an observer) and exit: 0 when the daemon
+    /// would take it as it is, 1 when it would refuse to start on it or every
+    /// list would fail closed. Connects to nothing, touches no state.
+    #[arg(long, value_name = "FILE")]
+    check_allowlist: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -124,6 +130,55 @@ fn ensure_private_dir(p: &std::path::Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(p)?;
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+/// The MXID this store was last logged in as, if any (a first start has none).
+fn persisted_mxid(store: &std::path::Path) -> Option<String> {
+    aqua_matrix_agent::ConfigFile::load(&store.join("config.toml"))
+        .unwrap_or_default()
+        .session
+        .map(|s| s.user_id.to_string())
+}
+
+/// `--check-allowlist`: the deploy guard. Loads the file with the daemon's own
+/// code and says whether the daemon would take it; exits 1 when not.
+fn check_allowlist(file: &std::path::Path, store: &std::path::Path) -> anyhow::Result<()> {
+    use aqua_messenger::allowlist::{check_file, CheckFailure};
+    let own = persisted_mxid(store);
+    let reserved: Vec<String> = own.iter().cloned().collect();
+    let own_note = match &own {
+        Some(m) => format!("own account {m}"),
+        None => "no persisted account, so the own-account rule is not applied".into(),
+    };
+    match check_file(file, &reserved) {
+        Ok(sum) => {
+            println!(
+                "allowlist OK: {}: {} recipients, {} rooms, {} observers ({own_note})",
+                file.display(),
+                sum.recipients,
+                sum.rooms,
+                sum.observers.len()
+            );
+            for (name, room) in &sum.observers {
+                println!("  observer {name} -> {room}");
+            }
+            Ok(())
+        }
+        Err(CheckFailure::StartError(why)) => {
+            println!(
+                "allowlist REJECTED: {}: the daemon refuses to start on it: {why} ({own_note})",
+                file.display()
+            );
+            std::process::exit(1);
+        }
+        Err(CheckFailure::FailsClosed(why)) => {
+            println!(
+                "allowlist REJECTED: {}: every list would fail closed: {why} ({own_note})",
+                file.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 #[tokio::main]
@@ -148,6 +203,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| state.join("bridge.sock"));
     let store = state.join("store");
     let key_file = state.join("agent.pem");
+
+    if let Some(file) = &args.check_allowlist {
+        return check_allowlist(file, &store);
+    }
 
     if args.print_identity {
         if key_file.exists() {
@@ -202,13 +261,27 @@ async fn main() -> anyhow::Result<()> {
         track_processed: args.inbox_track_processed,
     });
     let inbox_policy = profile.inbox;
-    let allow = aqua_messenger::allowlist::AllowList::new(state.join("allowlist.toml"));
+    // The account this daemon is logged in as (persisted by an earlier run;
+    // none on the very first start) may not be listed as an observer. The
+    // cycle loop drops such a row at runtime as well.
+    let allow = aqua_messenger::allowlist::AllowList::new_with_reserved(
+        state.join("allowlist.toml"),
+        persisted_mxid(&config.store_dir).into_iter().collect(),
+    );
     let shared = Arc::new(aqua_messenger::Engine::new(
         profile,
         &state,
         allow,
         bridge::QueueTransport::new(cmd_tx),
     ));
+    // A file whose `[[observers]]` row is invalid is refused as a whole; with
+    // no good list to keep yet, the daemon does not start on it.
+    if let Some(e) = shared.with_allow(|a| a.observer_error().map(str::to_string)) {
+        anyhow::bail!(
+            "allow-list rejected: {e} (fix {})",
+            state.join("allowlist.toml").display()
+        );
+    }
     tracing::info!(
         max_entries = inbox_policy.max_entries,
         max_age_hours = args.inbox_max_age_hours,
