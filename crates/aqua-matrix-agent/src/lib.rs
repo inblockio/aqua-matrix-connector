@@ -15,6 +15,8 @@ mod registry;
 pub mod reply;
 #[cfg(test)]
 mod reply_stream_tests;
+#[cfg(test)]
+mod decline_invite_tests;
 mod rtc_keys;
 mod rtc_member;
 
@@ -618,6 +620,19 @@ pub(crate) async fn mint_session_token(
     )
     .await
     .context("reauth: could not acquire a fresh session")
+}
+
+/// Decline the invite to `room_id` on `client` (see [`AgentClient::decline_invite`]).
+async fn decline_invite_on(client: &Client, room_id: &str) -> Result<()> {
+    let id: &RoomId = room_id
+        .try_into()
+        .map_err(|e| anyhow!("invalid room_id {room_id:?}: {e}"))?;
+    client
+        .get_room(id)
+        .ok_or_else(|| anyhow!("room {room_id} is not known to this client"))?
+        .leave()
+        .await
+        .with_context(|| format!("declining the invite to {room_id}"))
 }
 
 async fn build_and_restore(
@@ -1669,10 +1684,7 @@ impl AgentClient {
     /// Decline one invite (leave the invited room). A room already left is a
     /// no-op.
     pub async fn decline_invite(&self, room_id: &str) -> Result<()> {
-        self.known_room(room_id)?
-            .leave()
-            .await
-            .with_context(|| format!("declining the invite to {room_id}"))
+        decline_invite_on(&self.client, room_id).await
     }
 
     fn known_room(&self, room_id: &str) -> Result<matrix_sdk::Room> {
