@@ -435,9 +435,26 @@ pub enum CheckFailure {
 
 /// Load `path` with the daemon's own code and report the verdict, without
 /// connecting to anything. `reserved` are MXIDs no observer may use (the
-/// bridge's own account). STUB (red commit): accepts every file.
-pub fn check_file(_path: &Path, _reserved: &[String]) -> Result<CheckSummary, CheckFailure> {
-    Ok(CheckSummary::default())
+/// bridge's own account). A missing or unreadable file is not a good file.
+pub fn check_file(path: &Path, reserved: &[String]) -> Result<CheckSummary, CheckFailure> {
+    let a = AllowList::new_with_reserved(path.to_path_buf(), reserved.to_vec());
+    // An observer error is checked first: at a first load it also sets
+    // `load_error`, but it is the daemon's start error.
+    if let Some(e) = a.observer_error() {
+        return Err(CheckFailure::StartError(e.to_string()));
+    }
+    if let Some(e) = a.load_error() {
+        return Err(CheckFailure::FailsClosed(e.to_string()));
+    }
+    Ok(CheckSummary {
+        recipients: a.recipients().len(),
+        rooms: a.rooms().len(),
+        observers: a
+            .observers()
+            .iter()
+            .map(|o| (o.name.clone(), o.room_id.clone()))
+            .collect(),
+    })
 }
 
 /// The allow-list plus the file it came from, reloaded on mtime change.
@@ -1373,7 +1390,10 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         let sum = check_file(&p, &[]).expect("good file");
         assert_eq!(sum.recipients, 1);
         assert_eq!(sum.rooms, 1);
-        assert_eq!(sum.observers, vec![("voice-inbox".to_string(), TIM_DM.to_string())]);
+        assert_eq!(
+            sum.observers,
+            vec![("voice-inbox".to_string(), TIM_DM.to_string())]
+        );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -1415,9 +1435,15 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         // a bad recipient wins over a bad observer: fails closed, not a start error
         let both = cache_file(
             "chk-both",
-            &format!("{}\n[[recipients]]\nname = \"x\"\nmxid = \"bad\"\n", rejected_file()),
+            &format!(
+                "{}\n[[recipients]]\nname = \"x\"\nmxid = \"bad\"\n",
+                rejected_file()
+            ),
         );
-        assert!(matches!(check_file(&both, &[]), Err(CheckFailure::FailsClosed(_))));
+        assert!(matches!(
+            check_file(&both, &[]),
+            Err(CheckFailure::FailsClosed(_))
+        ));
         let _ = std::fs::remove_dir_all(both.parent().unwrap());
         // a missing file is not a good file
         let missing = Path::new("/nonexistent/allowlist.toml");
@@ -1426,5 +1452,4 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
             other => panic!("expected fails-closed, got {other:?}"),
         }
     }
-
 }

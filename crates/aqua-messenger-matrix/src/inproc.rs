@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use aqua_matrix_agent::AgentClient;
-use aqua_messenger::allowlist::{is_valid_mxid, AllowList, Observer, Recipient};
+use aqua_messenger::allowlist::{is_valid_mxid, AllowList, Recipient};
 use aqua_messenger::{
     server, Dest, Engine, FetchRequest, Fetched, Profile, ReplyRef, Sent, Transport, SOCK_ENV,
 };
@@ -51,10 +51,26 @@ impl LiveClient {
         let _ = self.engine.set(Arc::downgrade(engine));
     }
 
+    fn engine(&self) -> Option<Arc<Engine<LiveClient>>> {
+        self.engine.get().and_then(Weak::upgrade)
+    }
+
     /// The observers in the engine's allow-list now (reloaded if the file
-    /// changed). STUB (red commit): none.
-    fn bound_observers(&self) -> Vec<Observer> {
-        Vec::new()
+    /// changed). None when no engine is bound. What `sync_observers` hands to
+    /// the client; kept apart so a test can read it without a Matrix client.
+    #[cfg(test)]
+    fn bound_observers(&self) -> Vec<aqua_messenger::allowlist::Observer> {
+        self.engine()
+            .map(|e| e.with_allow(|a| a.observers().to_vec()))
+            .unwrap_or_default()
+    }
+
+    /// Hand the current observers to `agent` before a DM decision, as the host
+    /// bridge does, so a hot reload of the allow-list reaches the send path.
+    fn sync_observers(&self, agent: &AgentClient) {
+        if let Some(engine) = self.engine() {
+            crate::inbound::sync_dm_observers(agent, &engine);
+        }
     }
 
     async fn set(&self, agent: Option<AgentClient>) {
@@ -74,10 +90,12 @@ fn timed_out(what: &str, d: Duration) -> String {
 /// 1:1 resolution (created if missing); when replying to an inbox message,
 /// the room that message is in wins if it is still a 1:1 DM with them.
 async fn room_for(
+    live: &LiveClient,
     agent: &AgentClient,
     to: &Dest,
     reply: Option<&ReplyRef>,
 ) -> anyhow::Result<String> {
+    live.sync_observers(agent);
     match to {
         Dest::Room(id) => Ok(id.clone()),
         Dest::Person(mxid) => {
@@ -102,7 +120,7 @@ impl Transport for LiveClient {
         let guard = self.current.read().await;
         let agent = guard.as_ref().ok_or(NOT_CONNECTED)?;
         let fut = async {
-            let room = room_for(agent, to, reply).await?;
+            let room = room_for(self, agent, to, reply).await?;
             crate::outbound::send_text(agent, &room, markdown, reply).await
         };
         tokio::time::timeout(SEND_TIMEOUT, fut)
@@ -121,7 +139,7 @@ impl Transport for LiveClient {
         let guard = self.current.read().await;
         let agent = guard.as_ref().ok_or(NOT_CONNECTED)?;
         let fut = async {
-            let room = room_for(agent, to, reply).await?;
+            let room = room_for(self, agent, to, reply).await?;
             crate::outbound::send_file(agent, &room, path, caption, reply).await
         };
         tokio::time::timeout(SEND_TIMEOUT, fut)

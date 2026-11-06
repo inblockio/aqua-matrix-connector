@@ -13,7 +13,8 @@ use aqua_matrix_agent::{
 use aqua_messenger::allowlist::{invite_action, InviteAction};
 use aqua_messenger::{Dest, ReplyRef, SeenRoom};
 use aqua_messenger_matrix::inbound::{
-    backfill, counted_members, register_message_handler, survey_rooms, sync_dm_observers,
+    backfill, counted_members, counted_members_opt, register_message_handler, survey_rooms,
+    sync_dm_observers,
 };
 use matrix_sdk::{
     config::SyncSettings,
@@ -467,9 +468,8 @@ struct DmCand {
 /// Whether the observed-room preference applies to one candidate: an observer
 /// row names the room, the person has JOINED it (`rank` 2), and the connector
 /// agrees the room is a 1:1 with that person once the observer is left out.
-/// STUB (red commit): the row alone decides.
-fn observed_preference(bound: bool, _rank: u8, _one_to_one: bool) -> bool {
-    bound
+fn observed_preference(bound: bool, rank: u8, one_to_one: bool) -> bool {
+    bound && rank == 2 && one_to_one
 }
 
 /// The best candidate: the reply room, then a room an `[[observers]]` row
@@ -525,9 +525,12 @@ async fn dm_room_for(
             _ => continue,
         };
         let is_direct = room.is_direct().await.unwrap_or(false);
+        let bound = observers.iter().any(|o| o.room_id == id);
+        let one_to_one =
+            bound && rank == 2 && agent.is_one_to_one_dm(&id, mxid).await.unwrap_or(false);
         cands.push(DmCand {
             prefer: prefer == Some(id.as_str()),
-            observed: observers.iter().any(|o| o.room_id == id),
+            observed: observed_preference(bound, rank, one_to_one),
             is_direct,
             rank,
             connector_pick: connector_pick.as_deref() == Some(id.as_str()),
@@ -579,7 +582,12 @@ async fn repair_m_direct(agent: &AgentClient, shared: &Shared) {
     let observers = sync_dm_observers(agent, shared);
     let mut groups = std::collections::HashSet::new();
     for r in agent.client().joined_rooms() {
-        if counted_members(&r, &observers).await > 2 {
+        // an observed room whose members cannot be read is left alone: the
+        // repair removes entries and must not act on a guess
+        if counted_members_opt(&r, &observers)
+            .await
+            .is_some_and(|n| n > 2)
+        {
             groups.insert(r.room_id().to_string());
         }
     }
@@ -670,8 +678,14 @@ mod tests {
     fn the_observed_preference_needs_the_person_joined_in_a_one_to_one() {
         // a pending invitee must not pull its sends into somebody else's DM
         assert!(!observed_preference(true, 1, true), "invited, not joined");
-        assert!(!observed_preference(true, 2, false), "not 1:1 apart from the observer");
-        assert!(!observed_preference(false, 2, true), "no row names the room");
+        assert!(
+            !observed_preference(true, 2, false),
+            "not 1:1 apart from the observer"
+        );
+        assert!(
+            !observed_preference(false, 2, true),
+            "no row names the room"
+        );
         assert!(observed_preference(true, 2, true));
     }
 

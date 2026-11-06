@@ -14,6 +14,7 @@ use aqua_matrix_agent::{AgentClient, DmObserver};
 use aqua_messenger::allowlist::{count_joined, Observer};
 use aqua_messenger::inbox::NewEntry;
 use aqua_messenger::{Engine, SeenRoom, Transport};
+use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::{
     event_handler::EventHandlerHandle,
     room::{MessagesOptions, Room},
@@ -28,7 +29,6 @@ use matrix_sdk::{
     },
     RoomMemberships,
 };
-use matrix_sdk::ruma::events::room::member::MembershipState;
 
 /// Per-room history scanned by [`backfill`].
 pub const BACKFILL_LIMIT: u32 = 30;
@@ -108,38 +108,35 @@ pub async fn joined_member_count(room: &Room) -> u64 {
 /// decides DM versus group counts through here. A room with no observer
 /// bound to it takes exactly the path of [`joined_member_count`].
 ///
-/// An observer room needs the real member list. If it cannot be fetched the
-/// cached list is used, and only then the sync summary, which still includes
-/// the observer: that errs toward "group", never toward a stray DM.
+/// A room an observer is bound to is counted from the member list with
+/// invited members included, as the connector's own 1:1 check does (see
+/// [`observed_count`]); if no member list can be read the room counts as
+/// [`GROUP_IF_UNKNOWN`].
 pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
+    counted_members_opt(room, observers)
+        .await
+        .unwrap_or(GROUP_IF_UNKNOWN)
+}
+
+/// [`counted_members`], `None` for an observed room whose members could not be
+/// read at all. For a caller that must not act on a guess (the `m.direct`
+/// repair removes entries).
+pub async fn counted_members_opt(room: &Room, observers: &[Observer]) -> Option<u64> {
     let room_id = room.room_id().as_str();
     // never discount this client itself, whatever a row says
     let observers = usable_observers(observers, room.own_user_id().as_str());
-    let observers = observers.as_slice();
     if !observers.iter().any(|o| o.room_id == room_id) {
-        return joined_member_count(room).await;
+        return Some(joined_member_count(room).await);
     }
-    let members = match room.members(RoomMemberships::JOIN).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(room = %room_id, "member list unavailable ({e:#}); trying the cached list");
-            match room.members_no_sync(RoomMemberships::JOIN).await {
-                Ok(m) => m,
-                Err(_) => return room.joined_members_count(),
-            }
-        }
-    };
-    count_joined(
-        room_id,
-        members.iter().map(|m| m.user_id().as_str()),
-        observers,
-    )
+    match observed_count(room, &observers).await {
+        LiveCount::Live(n) | LiveCount::Cached(n) => Some(n),
+        LiveCount::Unknown => None,
+    }
 }
 
 /// How many of a room's members count: the JOINED and INVITED ones, minus
 /// the observers bound to it (the connector's 1:1 check counts invited members
 /// too, so a pending invitee knocks a room out of the DM here as well).
-/// STUB (red commit): counts joined members only.
 pub fn count_active_members<'a>(
     room_id: &str,
     members: impl IntoIterator<Item = (&'a str, &'a MembershipState)>,
@@ -149,7 +146,7 @@ pub fn count_active_members<'a>(
         room_id,
         members
             .into_iter()
-            .filter(|(_, m)| **m == MembershipState::Join)
+            .filter(|(_, m)| matches!(**m, MembershipState::Join | MembershipState::Invite))
             .map(|(u, _)| u),
         observers,
     )
@@ -166,12 +163,46 @@ pub enum LiveCount {
     Unknown,
 }
 
-/// The group verdict for a tracked room from its live count. STUB (red
-/// commit): the store count ignores the snapshot and no answer means no group.
-pub fn tracked_group(_snapshot: Option<u64>, count: LiveCount) -> bool {
+/// The group verdict for a tracked room from its live count. The server's
+/// answer decides alone (a snapshot can be stale in both directions). When
+/// only the local store answered, the snapshot still counts and the larger of
+/// the two wins; when nobody answered the room is treated as a group, never as
+/// a DM: a dropped message comes back with the next backfill, a message filed
+/// into the wrong room does not.
+pub fn tracked_group(snapshot: Option<u64>, count: LiveCount) -> bool {
     match count {
-        LiveCount::Live(n) | LiveCount::Cached(n) => n > 2,
-        LiveCount::Unknown => false,
+        LiveCount::Live(n) => n > 2,
+        LiveCount::Cached(n) => snapshot.unwrap_or(0).max(n) > 2,
+        LiveCount::Unknown => true,
+    }
+}
+
+/// What [`counted_members`] reports for an observed room whose members could
+/// not be read at all: group-sized, so nothing is filed or sent as a DM.
+pub const GROUP_IF_UNKNOWN: u64 = 3;
+
+/// Count the members of a room an observer row names (now or earlier): joined
+/// and invited, observers left out, from the server's member list, else the
+/// local store, else unknown.
+pub async fn observed_count(room: &Room, observers: &[Observer]) -> LiveCount {
+    let room_id = room.room_id().as_str();
+    let observers = usable_observers(observers, room.own_user_id().as_str());
+    let count = |ms: &[matrix_sdk::room::RoomMember]| {
+        count_active_members(
+            room_id,
+            ms.iter().map(|m| (m.user_id().as_str(), m.membership())),
+            &observers,
+        )
+    };
+    match room.members(RoomMemberships::ACTIVE).await {
+        Ok(ms) => LiveCount::Live(count(&ms)),
+        Err(e) => {
+            tracing::debug!(room = %room_id, "member list unavailable ({e:#}); trying the cached list");
+            match room.members_no_sync(RoomMemberships::ACTIVE).await {
+                Ok(ms) => LiveCount::Cached(count(&ms)),
+                Err(_) => LiveCount::Unknown,
+            }
+        }
     }
 }
 
@@ -236,17 +267,17 @@ pub fn group_from_counts(snapshot: Option<u64>, current: u64) -> bool {
 /// connect's snapshot (or the room's summary for a room joined since). A room
 /// an observer row names (now, or earlier in this process) is counted live
 /// from its member list without the observer: the sync summary cannot tell
-/// the observer apart and the snapshot can be stale (see [`group_verdict`]).
+/// the observer apart and the snapshot can be stale (see [`tracked_group`]).
 pub async fn is_group<T: Transport>(engine: &Engine<T>, room: &Room) -> bool {
     let room_id = room.room_id().as_str();
     let (bound, tracked) =
         engine.with_allow(|a| (a.observers_in_room(room_id), a.was_observed(room_id)));
-    let current = if tracked {
-        counted_members(room, &bound).await
+    let snapshot = engine.snapshot_members(room_id);
+    if tracked {
+        tracked_group(snapshot, observed_count(room, &bound).await)
     } else {
-        room.joined_members_count()
-    };
-    group_verdict(tracked, engine.snapshot_members(room_id), current)
+        group_verdict(false, snapshot, room.joined_members_count())
+    }
 }
 
 /// Register the live inbound handler on `agent`'s Client. The caller MUST
@@ -404,7 +435,10 @@ mod tests {
             ("@tim:x", &Join),
             ("@reader:x", &Invite),
         ];
-        assert_eq!(count_active_members("!dm:x", observer_invited, &observers), 2);
+        assert_eq!(
+            count_active_members("!dm:x", observer_invited, &observers),
+            2
+        );
         // people who left, were banned or knocked are not members
         let gone = [
             ("@bridge:x", &Join),
@@ -414,7 +448,11 @@ mod tests {
         ];
         assert_eq!(count_active_members("!dm:x", gone, &observers), 2);
         // an observer bound to another room is an ordinary member here
-        let elsewhere = [("@bridge:x", &Join), ("@tim:x", &Join), ("@reader:x", &Join)];
+        let elsewhere = [
+            ("@bridge:x", &Join),
+            ("@tim:x", &Join),
+            ("@reader:x", &Join),
+        ];
         assert_eq!(count_active_members("!other:x", elsewhere, &observers), 3);
     }
 

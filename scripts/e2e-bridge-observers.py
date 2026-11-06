@@ -16,7 +16,11 @@ file keeping the running lists; and the control (row removed = 3-member room =
 not a DM). A second scenario covers a second 2-member DM with Tim (sends and
 edits stay in the observed DM), a row removed and added again while the reader
 is joined (no stale member snapshot) and the bridge joining a DM that already
-holds the reader (mark_dm).
+holds the reader (mark_dm). A third scenario covers a pending invitee (a
+stranger, and another allow-listed person) in the observed DM, and the deploy
+guard `aqua-system-bridged --check-allowlist FILE` runs on its own. The
+script prints the sha256 of the binaries it runs and fails when one is older
+than the sources: rebuild before every run.
 """
 import json, os, re, shutil, socket, subprocess, sys, time
 
@@ -123,11 +127,11 @@ def wait_inbox_body(body, frm="tim", timeout=60):
     return False
 
 
-def landed(room, text, timeout=45):
-    """The message `text` is in `room` as Tim's peer sees it (read-raw of the real room)."""
+def landed(room, text, timeout=45, who="tim"):
+    """The message `text` is in `room` as `who` (a member) sees it (read-raw of the real room)."""
     end = time.time() + timeout
     while time.time() < end:
-        if text in peer_room("tim", "read-raw", "--room", room, "--limit", "30"):
+        if text in peer_room(who, "read-raw", "--room", room, "--limit", "30"):
             return True
         time.sleep(3)
     return False
@@ -140,9 +144,9 @@ def write_allow(text):
     os.utime(p, (t, t))
 
 
-def fresh():
+def fresh(extra=()):
     """New identities and a new bridge state dir; returns (tim, reader, recipients toml)."""
-    for d in ("tim", "reader", "bridge"):
+    for d in ("tim", "reader", "bridge", *extra):
         shutil.rmtree(f"{E}/{d}", ignore_errors=True)
         os.makedirs(f"{E}/{d}", mode=0o700)
     open(BLOG, "w").close()
@@ -344,11 +348,109 @@ def scenario_second_dm():
         rc = None
         stop(d)
     check("B3: the bridge's own account as an observer stops the start", rc not in (None, 0) and "own account" in log()[mark:], f"rc={rc}")
+    # the deploy guard sees it too, with this state dir's persisted account
+    rc2, out2 = check_allowlist(f"{E}/bridge/allowlist.toml", f"{E}/bridge")
+    check("check mode: refuses the bridge's own account as an observer", rc2 == 1 and "own account" in out2 and "refuses to start" in out2, out2[-200:])
+
+
+def check_allowlist(path, state):
+    out = subprocess.run([f"{BIN}/aqua-system-bridged", "--state-dir", state, "--check-allowlist", path],
+                         capture_output=True, text=True, timeout=60, env=ENV)
+    return out.returncode, out.stdout + out.stderr
+
+
+def scenario_check_mode():
+    """The deploy guard: `aqua-system-bridged --check-allowlist FILE` (no stack, no connection)."""
+    d = f"{E}/check"
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, mode=0o700)
+    good = ('[[recipients]]\nname = "tim"\nmxid = "@tim:localhost"\n\n[[observers]]\nname = "voice-inbox"\n'
+            'mxid = "@reader:localhost"\nroom_id = "!dm:localhost"\n')
+    cases = [
+        ("good.toml", good, 0, "allowlist OK", "1 observers"),
+        ("bad-observer.toml", good + '\n[[observers]]\nname = "x"\nmxid = "nope"\nroom_id = "!y:localhost"\n', 1, "refuses to start", "observer x"),
+        ("two-in-a-room.toml", good + '\n[[observers]]\nname = "y"\nmxid = "@other:localhost"\nroom_id = "!dm:localhost"\n', 1, "refuses to start", "already has the observer"),
+        ("syntax.toml", "not toml [[", 1, "fail closed", "parse error"),
+        ("bad-recipient.toml", '[[recipients]]\nname = "x"\nmxid = "bad"\n', 1, "fail closed", "not a valid MXID"),
+    ]
+    for name, text, want_rc, want1, want2 in cases:
+        p = f"{d}/{name}"
+        open(p, "w").write(text)
+        rc, out = check_allowlist(p, d)
+        check(f"check mode: {name} exits {want_rc}", rc == want_rc and want1 in out and want2 in out, f"rc={rc} {out[-160:]!r}")
+    rc, out = check_allowlist(f"{d}/missing.toml", d)
+    check("check mode: a missing file exits 1", rc == 1 and "cannot read" in out, out[-120:])
+    check("check mode: touches no state", sorted(os.listdir(d)) == sorted(n for n, *_ in cases), str(os.listdir(d)))
+
+
+def scenario_invites():
+    """Second review F1 and C1: a pending invitee knocks an observed room out of the DM."""
+    tim, reader, recip = fresh(("tim2", "mallory"))
+    tim2, mallory = whoami("tim2"), whoami("mallory")
+    recip += f'\n[[recipients]]\nname = "tim2"\nmxid = "{tim2}"\n'
+    open(f"{E}/bridge/allowlist.toml", "w").write(recip)
+    d = start_bridge()
+    m = wait_log(r"mxid=(@[^\s\x1b]+)", 120)
+    check("invites: bridge connected", m)
+    bridge = m.group(1)
+    wait_log(r"cycle starting", 60)
+    rooms = {}
+    for who, key, name in (("tim", "dm1", "Aqua System"), ("tim", "dm2", "Aqua System 2"), ("tim2", "dmp", "Aqua System tim2")):
+        mark = len(log())
+        rooms[key] = peer_room(who, "create", "--invite", bridge, "--is-direct", "--name", name).strip()
+        check(f"invites: the bridge joined {key}", wait_log(r"joined DM invite from allow-listed user", 90, mark))
+    dm1, dm2, dmp = rooms["dm1"], rooms["dm2"], rooms["dmp"]
+    print("dm1", dm1, "dm2", dm2, "dmp", dmp)
+    peer_room("tim", "post", "--room", dm1, "--text", "ping in dm1")
+    wait_inbox_body("ping in dm1")
+    mark = len(log())
+    write_allow(recip + f'\n[[observers]]\nname = "voice-inbox"\nmxid = "{reader}"\nroom_id = "{dm1}"\n')
+    sock({"op": "list_recipients"})
+    check("invites: `observer loaded` for DM1", wait_log(rf"observer loaded.*room={re.escape(dm1)}", 30, mark))
+    peer_room("tim", "invite", "--room", dm1, "--user", reader)
+    check("invites: the reader joined DM1", dm1 in peer_room("reader", "join-invited"))
+    r = send("tim", "control report")
+    check("invites: control: with the reader joined the send stays in DM1", r.get("ok") is True and landed(dm1, "control report"), json.dumps(r)[:160])
+
+    # grok F1: an invited stranger
+    mark = len(log())
+    peer_room("tim", "invite", "--room", dm1, "--user", mallory)
+    time.sleep(10)  # the bridge's sync has to deliver the invite first
+    r = send("tim", "report with a pending invitee")
+    check("F1: a pending invitee in the observed DM: the report does NOT go there", r.get("ok") is True and not landed(dm1, "report with a pending invitee", 8), json.dumps(r)[:160])
+    check("F1: it goes to Tim's clean DM2 (no new DM)", landed(dm2, "report with a pending invitee") and "created a new DM room" not in log()[mark:])
+    peer_room("tim", "post", "--room", dm1, "--text", "tim after the invite")
+    time.sleep(10)
+    check("F1: Tim's message in the room with a pending invitee is not ingested as a DM", "tim after the invite" not in json.dumps(inbox()))
+
+    # re-review C1: another allow-listed person invited into the observed DM
+    mark = len(log())
+    peer_room("tim", "invite", "--room", dm1, "--user", tim2)
+    time.sleep(10)
+    r = send("tim2", "message for tim2")
+    check("C1: a message to tim2 (invited into Tim's observed DM) does NOT land there", r.get("ok") is True and not landed(dm1, "message for tim2", 8), json.dumps(r)[:160])
+    check("C1: it lands in tim2's own DM", landed(dmp, "message for tim2", who="tim2") and "created a new DM room" not in log()[mark:])
+    stop(d)
+
+
+def binary_report():
+    """Say which binaries run, and refuse a build older than the sources."""
+    import hashlib
+    crates = ("aqua-system-bridged", "aqua-system-bridge", "aqua-messenger", "aqua-messenger-matrix", "aqua-matrix-agent")
+    newest = max(os.path.getmtime(os.path.join(r, f)) for c in crates for r, _, fs in os.walk(f"{WT}/crates/{c}/src") for f in fs if f.endswith(".rs"))
+    newest = max([newest] + [os.path.getmtime(f"{WT}/crates/aqua-system-bridged/examples/{f}") for f in os.listdir(f"{WT}/crates/aqua-system-bridged/examples")])
+    for name, path in (("aqua-system-bridged", f"{BIN}/aqua-system-bridged"), ("peer_room", f"{EX}/peer_room")):
+        h = hashlib.sha256(open(path, "rb").read()).hexdigest()[:16]
+        stale = os.path.getmtime(path) < newest
+        print(f"binary {name} sha256 {h} built {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(os.path.getmtime(path)))}{'  STALE: older than the sources' if stale else ''}")
+        check(f"binary {name} is newer than every source file", not stale)
 
 
 def main():
-    scenario_basic()
-    scenario_second_dm()
+    binary_report()
+    todo = sys.argv[1:] or ["check_mode", "basic", "second_dm", "invites"]
+    for name in todo:
+        globals()[f"scenario_{name}"]()
     bad = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(bad)}/{len(results)} passed")
     if bad:
