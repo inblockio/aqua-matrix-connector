@@ -464,6 +464,14 @@ struct DmCand {
     connector_pick: bool,
 }
 
+/// Whether the observed-room preference applies to one candidate: an observer
+/// row names the room, the person has JOINED it (`rank` 2), and the connector
+/// agrees the room is a 1:1 with that person once the observer is left out.
+/// STUB (red commit): the row alone decides.
+fn observed_preference(bound: bool, _rank: u8, _one_to_one: bool) -> bool {
+    bound
+}
+
 /// The best candidate: the reply room, then a room an `[[observers]]` row
 /// names (the row picks that room explicitly, so it beats whatever else the
 /// person shares with the bridge), then `m.direct`, the person joined over
@@ -656,6 +664,15 @@ mod tests {
             rank: 2,
             connector_pick: false,
         }
+    }
+
+    #[test]
+    fn the_observed_preference_needs_the_person_joined_in_a_one_to_one() {
+        // a pending invitee must not pull its sends into somebody else's DM
+        assert!(!observed_preference(true, 1, true), "invited, not joined");
+        assert!(!observed_preference(true, 2, false), "not 1:1 apart from the observer");
+        assert!(!observed_preference(false, 2, true), "no row names the room");
+        assert!(observed_preference(true, 2, true));
     }
 
     #[test]

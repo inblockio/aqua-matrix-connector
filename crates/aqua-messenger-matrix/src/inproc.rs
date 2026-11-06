@@ -10,12 +10,12 @@
 //! to retry), they do not queue.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use aqua_matrix_agent::AgentClient;
-use aqua_messenger::allowlist::{is_valid_mxid, AllowList, Recipient};
+use aqua_messenger::allowlist::{is_valid_mxid, AllowList, Observer, Recipient};
 use aqua_messenger::{
     server, Dest, Engine, FetchRequest, Fetched, Profile, ReplyRef, Sent, Transport, SOCK_ENV,
 };
@@ -38,11 +38,25 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(150);
 #[derive(Clone, Default)]
 pub struct LiveClient {
     current: Arc<RwLock<Option<AgentClient>>>,
+    /// The engine that owns this transport, so a send can read the allow-list
+    /// (the observers) before it decides which room is the DM.
+    engine: Arc<OnceLock<Weak<Engine<LiveClient>>>>,
 }
 
 const NOT_CONNECTED: &str = "the agent is not connected to Matrix right now (reconnecting); nothing was sent, try again shortly";
 
 impl LiveClient {
+    /// Remember the engine (once, right after it is built).
+    fn bind_engine(&self, engine: &Arc<Engine<LiveClient>>) {
+        let _ = self.engine.set(Arc::downgrade(engine));
+    }
+
+    /// The observers in the engine's allow-list now (reloaded if the file
+    /// changed). STUB (red commit): none.
+    fn bound_observers(&self) -> Vec<Observer> {
+        Vec::new()
+    }
+
     async fn set(&self, agent: Option<AgentClient>) {
         *self.current.write().await = agent;
     }
@@ -200,6 +214,7 @@ impl AgentMessenger {
         let allow = AllowList::owner_only(owner, cfg.extra_allowlist, &profile.label);
         let live = LiveClient::default();
         let engine = Arc::new(Engine::new(profile, &cfg.state_dir, allow, live.clone()));
+        live.bind_engine(&engine);
         let pruned = engine.prune_attachments();
         if pruned > 0 {
             tracing::info!(
@@ -317,4 +332,56 @@ fn ensure_private_dir(p: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(p)?;
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OWNER: &str = "@owner:matrix.test";
+
+    fn dir(tag: &str) -> PathBuf {
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let d = base
+            .join(".cache")
+            .join(format!("msgr-inproc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn at(p: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(std::time::SystemTime::now() + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// An embedded agent's send path must see the observers the engine's
+    /// allow-list holds NOW, also after a hot reload, not the ones it saw at
+    /// attach (review C2/F2).
+    #[test]
+    fn the_send_path_reads_the_current_observers() {
+        let d = dir("observers");
+        let extra = d.join("extra.toml");
+        std::fs::write(
+            &extra,
+            "[[observers]]\nname = \"reader\"\nmxid = \"@reader:matrix.test\"\nroom_id = \"!dm:matrix.test\"\n",
+        )
+        .unwrap();
+        let mut cfg = MessengerConfig::owner_only(&d.join("state"), "Marina", OWNER);
+        cfg.extra_allowlist = Some(extra.clone());
+        let m = AgentMessenger::new(cfg).unwrap();
+        let seen = m.live.bound_observers();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].room_id, "!dm:matrix.test");
+        // the row is removed: the next read sees an empty set
+        std::fs::write(&extra, "").unwrap();
+        at(&extra, 10);
+        assert!(m.live.bound_observers().is_empty());
+        // a transport that was never bound to an engine has none
+        assert!(LiveClient::default().bound_observers().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

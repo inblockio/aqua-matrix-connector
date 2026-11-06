@@ -28,6 +28,7 @@ use matrix_sdk::{
     },
     RoomMemberships,
 };
+use matrix_sdk::ruma::events::room::member::MembershipState;
 
 /// Per-room history scanned by [`backfill`].
 pub const BACKFILL_LIMIT: u32 = 30;
@@ -133,6 +134,45 @@ pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
         members.iter().map(|m| m.user_id().as_str()),
         observers,
     )
+}
+
+/// How many of a room's members count: the JOINED and INVITED ones, minus
+/// the observers bound to it (the connector's 1:1 check counts invited members
+/// too, so a pending invitee knocks a room out of the DM here as well).
+/// STUB (red commit): counts joined members only.
+pub fn count_active_members<'a>(
+    room_id: &str,
+    members: impl IntoIterator<Item = (&'a str, &'a MembershipState)>,
+    observers: &[Observer],
+) -> u64 {
+    count_joined(
+        room_id,
+        members
+            .into_iter()
+            .filter(|(_, m)| **m == MembershipState::Join)
+            .map(|(u, _)| u),
+        observers,
+    )
+}
+
+/// What the live count of a room an observer row has named came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveCount {
+    /// From the server's member list.
+    Live(u64),
+    /// The server fetch failed; from the local store.
+    Cached(u64),
+    /// Neither source answered.
+    Unknown,
+}
+
+/// The group verdict for a tracked room from its live count. STUB (red
+/// commit): the store count ignores the snapshot and no answer means no group.
+pub fn tracked_group(_snapshot: Option<u64>, count: LiveCount) -> bool {
+    match count {
+        LiveCount::Live(n) | LiveCount::Cached(n) => n > 2,
+        LiveCount::Unknown => false,
+    }
 }
 
 /// The group verdict for a room an observer row has named (`tracked`: now or
@@ -339,6 +379,59 @@ pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pending_invitee_knocks_an_observed_room_out_of_the_dm() {
+        use MembershipState::*;
+        let observers = [obs("@reader:x", "!dm:x")];
+        let dm = [
+            ("@bridge:x", &Join),
+            ("@tim:x", &Join),
+            ("@reader:x", &Join),
+        ];
+        assert_eq!(count_active_members("!dm:x", dm, &observers), 2);
+        // an invited stranger counts, like the connector's own 1:1 check
+        let invited = [
+            ("@bridge:x", &Join),
+            ("@tim:x", &Join),
+            ("@reader:x", &Join),
+            ("@mallory:x", &Invite),
+        ];
+        assert_eq!(count_active_members("!dm:x", invited, &observers), 3);
+        // an observer that is only invited does not count either
+        let observer_invited = [
+            ("@bridge:x", &Join),
+            ("@tim:x", &Join),
+            ("@reader:x", &Invite),
+        ];
+        assert_eq!(count_active_members("!dm:x", observer_invited, &observers), 2);
+        // people who left, were banned or knocked are not members
+        let gone = [
+            ("@bridge:x", &Join),
+            ("@tim:x", &Join),
+            ("@old:x", &Leave),
+            ("@bad:x", &Ban),
+        ];
+        assert_eq!(count_active_members("!dm:x", gone, &observers), 2);
+        // an observer bound to another room is an ordinary member here
+        let elsewhere = [("@bridge:x", &Join), ("@tim:x", &Join), ("@reader:x", &Join)];
+        assert_eq!(count_active_members("!other:x", elsewhere, &observers), 3);
+    }
+
+    #[test]
+    fn a_failed_live_count_errs_toward_group() {
+        // the store answered: the snapshot still counts
+        assert!(tracked_group(Some(3), LiveCount::Cached(2)));
+        assert!(tracked_group(Some(2), LiveCount::Cached(3)));
+        assert!(!tracked_group(Some(2), LiveCount::Cached(2)));
+        assert!(!tracked_group(None, LiveCount::Cached(2)));
+        // nobody answered: never 0, never a DM
+        assert!(tracked_group(None, LiveCount::Unknown));
+        assert!(tracked_group(Some(2), LiveCount::Unknown));
+        // the server answered: a stale snapshot is ignored, as before
+        assert!(!tracked_group(Some(3), LiveCount::Live(2)));
+        assert!(tracked_group(Some(2), LiveCount::Live(3)));
+    }
 
     fn obs(mxid: &str, room: &str) -> Observer {
         Observer {

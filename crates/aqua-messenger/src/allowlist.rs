@@ -414,6 +414,32 @@ fn parse_observers(
     Ok(out)
 }
 
+/// What a file holds, as the daemon would load it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CheckSummary {
+    pub recipients: usize,
+    pub rooms: usize,
+    /// `(name, room_id)` of each observer row.
+    pub observers: Vec<(String, String)>,
+}
+
+/// Why the daemon would not take a file as it is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckFailure {
+    /// An invalid `[[observers]]` row: the daemon refuses to START on it (and a
+    /// running daemon keeps its last good lists).
+    StartError(String),
+    /// Anything else: the daemon starts but every list fails closed.
+    FailsClosed(String),
+}
+
+/// Load `path` with the daemon's own code and report the verdict, without
+/// connecting to anything. `reserved` are MXIDs no observer may use (the
+/// bridge's own account). STUB (red commit): accepts every file.
+pub fn check_file(_path: &Path, _reserved: &[String]) -> Result<CheckSummary, CheckFailure> {
+    Ok(CheckSummary::default())
+}
+
 /// The allow-list plus the file it came from, reloaded on mtime change.
 pub struct AllowList {
     /// The allow-list file, if any (hot-reloaded on mtime change).
@@ -1338,4 +1364,67 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         assert!(a.was_observed(TIM_DM));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
+
+    // ---- check mode (the deploy guard for B5) --------------------------------
+
+    #[test]
+    fn check_accepts_a_good_file_and_counts_it() {
+        let p = cache_file("chk-ok", WITH_OBSERVER);
+        let sum = check_file(&p, &[]).expect("good file");
+        assert_eq!(sum.recipients, 1);
+        assert_eq!(sum.rooms, 1);
+        assert_eq!(sum.observers, vec![("voice-inbox".to_string(), TIM_DM.to_string())]);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn check_refuses_what_the_daemon_would_refuse_to_start_on() {
+        let p = cache_file("chk-start", &rejected_file());
+        match check_file(&p, &[]) {
+            Err(CheckFailure::StartError(why)) => {
+                assert!(why.contains("observer broken"), "{why}")
+            }
+            other => panic!("expected a start error, got {other:?}"),
+        }
+        // the bridge's own account is refused with the reserved list
+        let own = cache_file("chk-own", WITH_OBSERVER);
+        match check_file(&own, &[OBS.to_string()]) {
+            Err(CheckFailure::StartError(why)) => assert!(why.contains("own account"), "{why}"),
+            other => panic!("expected a start error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        let _ = std::fs::remove_dir_all(own.parent().unwrap());
+    }
+
+    #[test]
+    fn check_refuses_a_file_that_would_fail_closed() {
+        for (tag, text) in [
+            ("chk-syntax", "not toml [["),
+            (
+                "chk-recipient",
+                "[[recipients]]\nname = \"x\"\nmxid = \"bad\"\n",
+            ),
+        ] {
+            let p = cache_file(tag, text);
+            assert!(
+                matches!(check_file(&p, &[]), Err(CheckFailure::FailsClosed(_))),
+                "{tag}"
+            );
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+        // a bad recipient wins over a bad observer: fails closed, not a start error
+        let both = cache_file(
+            "chk-both",
+            &format!("{}\n[[recipients]]\nname = \"x\"\nmxid = \"bad\"\n", rejected_file()),
+        );
+        assert!(matches!(check_file(&both, &[]), Err(CheckFailure::FailsClosed(_))));
+        let _ = std::fs::remove_dir_all(both.parent().unwrap());
+        // a missing file is not a good file
+        let missing = Path::new("/nonexistent/allowlist.toml");
+        match check_file(missing, &[]) {
+            Err(CheckFailure::FailsClosed(why)) => assert!(why.contains("cannot read"), "{why}"),
+            other => panic!("expected fails-closed, got {other:?}"),
+        }
+    }
+
 }
