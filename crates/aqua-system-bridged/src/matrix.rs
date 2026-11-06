@@ -13,8 +13,8 @@ use aqua_matrix_agent::{
 use aqua_messenger::allowlist::{invite_action, InviteAction};
 use aqua_messenger::{Dest, ReplyRef, SeenRoom};
 use aqua_messenger_matrix::inbound::{
-    backfill, counted_members, counted_members_opt, register_message_handler, survey_rooms,
-    sync_dm_observers,
+    backfill, counted_members, counted_members_opt, register_message_handler, snapshot_count,
+    survey_rooms, sync_dm_observers,
 };
 use matrix_sdk::{
     config::SyncSettings,
@@ -367,7 +367,9 @@ async fn handle_invite(
             let observers = sync_dm_observers(agent, shared);
             let seen = SeenRoom {
                 display_name: room.name(),
-                joined_members: counted_members(&room, &observers).await,
+                joined_members: snapshot_count(
+                    counted_members_opt(shared, &room, &observers).await,
+                ),
                 is_direct: action == InviteAction::JoinAsDm,
             };
             shared.note_joined_room(&room_id, seen);
@@ -513,7 +515,7 @@ async fn dm_room_for(
     let mut cands: Vec<DmCand> = Vec::new();
     for room in agent.client().joined_rooms() {
         let id = room.room_id().to_string();
-        if listed.contains(&id) || counted_members(&room, &observers).await > 2 {
+        if listed.contains(&id) || counted_members(shared, &room, &observers).await > 2 {
             continue;
         }
         let Some(member) = room.get_member(&target).await.ok().flatten() else {
@@ -584,7 +586,7 @@ async fn repair_m_direct(agent: &AgentClient, shared: &Shared) {
     for r in agent.client().joined_rooms() {
         // an observed room whose members cannot be read is left alone: the
         // repair removes entries and must not act on a guess
-        if counted_members_opt(&r, &observers)
+        if counted_members_opt(shared, &r, &observers)
             .await
             .is_some_and(|n| n > 2)
         {

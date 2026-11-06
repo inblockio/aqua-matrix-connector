@@ -74,6 +74,11 @@ enum Cmd {
     },
     /// Join every room this identity is invited to; print the room ids.
     JoinInvited,
+    /// Leave `room`.
+    Leave {
+        #[arg(long)]
+        room: String,
+    },
     /// Print the joined members of `room` (one MXID per line).
     Members {
         #[arg(long)]
@@ -175,6 +180,15 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
             r.invite_user_by_id(uid).await?;
             println!("invited {user} to {room}");
+        }
+        Cmd::Leave { room } => {
+            let rid: &matrix_sdk::ruma::RoomId = room.as_str().try_into()?;
+            let r = agent
+                .client()
+                .get_room(rid)
+                .ok_or_else(|| anyhow::anyhow!("room not joined"))?;
+            r.leave().await?;
+            println!("left {room}");
         }
         Cmd::JoinInvited => {
             for room in agent.client().invited_rooms() {

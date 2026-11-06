@@ -112,8 +112,12 @@ pub async fn joined_member_count(room: &Room) -> u64 {
 /// invited members included, as the connector's own 1:1 check does (see
 /// [`observed_count`]); if no member list can be read the room counts as
 /// [`GROUP_IF_UNKNOWN`].
-pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
-    counted_members_opt(room, observers)
+pub async fn counted_members<T: Transport>(
+    engine: &Engine<T>,
+    room: &Room,
+    observers: &[Observer],
+) -> u64 {
+    counted_members_opt(engine, room, observers)
         .await
         .unwrap_or(GROUP_IF_UNKNOWN)
 }
@@ -121,11 +125,17 @@ pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
 /// [`counted_members`], `None` for an observed room whose members could not be
 /// read at all. For a caller that must not act on a guess (the `m.direct`
 /// repair removes entries).
-pub async fn counted_members_opt(room: &Room, observers: &[Observer]) -> Option<u64> {
+pub async fn counted_members_opt<T: Transport>(
+    engine: &Engine<T>,
+    room: &Room,
+    observers: &[Observer],
+) -> Option<u64> {
     let room_id = room.room_id().as_str();
     // never discount this client itself, whatever a row says
     let observers = usable_observers(observers, room.own_user_id().as_str());
-    if !observers.iter().any(|o| o.room_id == room_id) {
+    let bound = observers.iter().any(|o| o.room_id == room_id);
+    let tracked = engine.with_allow(|a| a.was_observed(room_id));
+    if !counts_members_live(bound, tracked) {
         return Some(joined_member_count(room).await);
     }
     match observed_count(room, &observers).await {
@@ -179,17 +189,17 @@ pub fn tracked_group(snapshot: Option<u64>, count: LiveCount) -> bool {
 
 /// Whether a room is counted from the member list with invited members
 /// included: a row names it now (`bound`), or one did earlier in this process
-/// (`tracked`). STUB (red commit): only a current row.
-pub fn counts_members_live(bound: bool, _tracked: bool) -> bool {
-    bound
+/// (`tracked`).
+pub fn counts_members_live(bound: bool, tracked: bool) -> bool {
+    bound || tracked
 }
 
 /// The snapshot value for a measured count. A count that failed is stored as
 /// 0, which every decision reads as "no snapshot" (they take `unwrap_or(0)`);
 /// it is never stored as [`GROUP_IF_UNKNOWN`], which would beat a later
-/// measured 2. STUB (red commit): stores the group sentinel.
+/// measured 2.
 pub fn snapshot_count(count: Option<u64>) -> u64 {
-    count.unwrap_or(GROUP_IF_UNKNOWN)
+    count.unwrap_or(0)
 }
 
 /// What [`counted_members`] reports for an observed room whose members could
@@ -399,7 +409,7 @@ pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>,
         let id = room.room_id().to_string();
         let seen = SeenRoom {
             display_name: room.display_name().await.ok().map(|n| n.to_string()),
-            joined_members: counted_members(&room, &observers).await,
+            joined_members: snapshot_count(counted_members_opt(engine, &room, &observers).await),
             is_direct: room.is_direct().await.unwrap_or(false),
         };
         map.insert(id, seen);
@@ -491,7 +501,10 @@ mod tests {
         assert!(!tracked_group(snap, LiveCount::Cached(2)));
         assert!(!group_verdict(false, snap, 2));
         // a measured group count still sticks
-        assert!(tracked_group(Some(snapshot_count(Some(3))), LiveCount::Cached(2)));
+        assert!(tracked_group(
+            Some(snapshot_count(Some(3))),
+            LiveCount::Cached(2)
+        ));
     }
 
     #[test]

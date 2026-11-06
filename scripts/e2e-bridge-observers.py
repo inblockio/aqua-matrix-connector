@@ -430,6 +430,18 @@ def scenario_invites():
     r = send("tim2", "message for tim2")
     check("C1: a message to tim2 (invited into Tim's observed DM) does NOT land there", r.get("ok") is True and not landed(dm1, "message for tim2", 8), json.dumps(r)[:160])
     check("C1: it lands in tim2's own DM", landed(dmp, "message for tim2", who="tim2") and "created a new DM room" not in log()[mark:])
+
+    # last grok pass F1: the row is removed and the reader has left, but invitees are still pending;
+    # the room was observed earlier in this process, so it still counts them. Tim has no other DM.
+    peer_room("reader", "leave", "--room", dm1)
+    peer_room("tim", "leave", "--room", dm2)
+    mark = len(log())
+    write_allow(recip)
+    sock({"op": "list_recipients"})
+    time.sleep(10)
+    r = send("tim", "send after the row is gone")
+    check("F1b: row removed, reader left, invitees pending: the send does NOT go into that room", r.get("ok") is True and not landed(dm1, "send after the row is gone", 8), json.dumps(r)[:160])
+    check("F1b: the bridge opened a new DM with Tim instead", "created a new DM room" in log()[mark:])
     stop(d)
 
 
