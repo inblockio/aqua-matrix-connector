@@ -36,7 +36,7 @@ pub struct DmObserver {
 
 /// The observers an [`AgentClient`] currently knows. Clones of the client
 /// share it, and the owner of the allow-list replaces it ([`DmObservers::set`])
-/// whenever it reads the list. STUB (red commit): nothing is ever found.
+/// whenever it reads the list.
 #[derive(Debug, Clone, Default)]
 pub struct DmObservers(std::sync::Arc<std::sync::RwLock<Vec<DmObserver>>>);
 
@@ -47,19 +47,33 @@ impl DmObservers {
     }
 
     /// The observer user ids bound to `room_id` (ASCII case as given).
-    pub fn members_in(&self, _room_id: &str) -> Vec<String> {
-        Vec::new()
+    pub fn members_in(&self, room_id: &str) -> Vec<String> {
+        self.0
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|o| o.room_id == room_id)
+            .map(|o| o.user_id.clone())
+            .collect()
     }
 }
 
-/// The room's active members without the observers bound to it. Never drops
-/// `own` or `target`, whatever the observer list says. STUB: drops nothing.
+/// The room's active members without the observers bound to it (joined or
+/// merely invited). Never drops `own` or `target`, whatever the observer list
+/// says, so a wrong row cannot make a room look like it has no peer.
 pub(crate) fn without_observed(
-    active: Vec<(OwnedUserId, MembershipState)>,
-    _own: &UserId,
-    _target: &UserId,
-    _observed: &[String],
+    mut active: Vec<(OwnedUserId, MembershipState)>,
+    own: &UserId,
+    target: &UserId,
+    observed: &[String],
 ) -> Vec<(OwnedUserId, MembershipState)> {
+    if !observed.is_empty() {
+        active.retain(|(u, _)| {
+            u.as_str() == own.as_str()
+                || u.as_str() == target.as_str()
+                || !observed.iter().any(|o| o.eq_ignore_ascii_case(u.as_str()))
+        });
+    }
     active
 }
 
@@ -188,8 +202,10 @@ pub(crate) async fn active_members(
 }
 
 impl AgentClient {
-    /// Classify `room` for a DM with `target` from its member list. The bool is
-    /// whether the member list was authoritative (see [`active_members`]).
+    /// Classify `room` for a DM with `target` from its member list, leaving out
+    /// the observers set with [`AgentClient::set_dm_observers`] for this room.
+    /// The bool is whether the member list was authoritative (see
+    /// [`active_members`]).
     pub(crate) async fn dm_verdict(
         &self,
         room: &matrix_sdk::Room,
@@ -197,6 +213,8 @@ impl AgentClient {
     ) -> Option<(DmVerdict, bool)> {
         let own = self.client.user_id()?.to_owned();
         let (active, authoritative) = active_members(room).await?;
+        let observed = self.dm_observers.members_in(room.room_id().as_str());
+        let active = without_observed(active, &own, target, &observed);
         Some((classify_dm_room(&own, target, &active), authoritative))
     }
 
@@ -302,7 +320,10 @@ mod tests {
         );
         // user ids compare in ASCII case, as Synapse lowercases localparts
         assert_eq!(
-            observed_dm(&[(READER, MembershipState::Join)], &["@READER:matrix.inblock.io"]),
+            observed_dm(
+                &[(READER, MembershipState::Join)],
+                &["@READER:matrix.inblock.io"]
+            ),
             DmVerdict::Joined
         );
     }
@@ -311,7 +332,10 @@ mod tests {
     fn a_stranger_next_to_the_observer_still_makes_a_group() {
         assert_eq!(
             observed_dm(
-                &[(READER, MembershipState::Join), (OTHER, MembershipState::Join)],
+                &[
+                    (READER, MembershipState::Join),
+                    (OTHER, MembershipState::Join)
+                ],
                 &[READER]
             ),
             DmVerdict::NotOneToOne

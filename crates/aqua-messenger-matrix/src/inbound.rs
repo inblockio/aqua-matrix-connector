@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aqua_matrix_agent::AgentClient;
+use aqua_matrix_agent::{AgentClient, DmObserver};
 use aqua_messenger::allowlist::{count_joined, Observer};
 use aqua_messenger::inbox::NewEntry;
 use aqua_messenger::{Engine, SeenRoom, Transport};
@@ -112,6 +112,9 @@ pub async fn joined_member_count(room: &Room) -> u64 {
 /// the observer: that errs toward "group", never toward a stray DM.
 pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
     let room_id = room.room_id().as_str();
+    // never discount this client itself, whatever a row says
+    let observers = usable_observers(observers, room.own_user_id().as_str());
+    let observers = observers.as_slice();
     if !observers.iter().any(|o| o.room_id == room_id) {
         return joined_member_count(room).await;
     }
@@ -132,16 +135,56 @@ pub async fn counted_members(room: &Room, observers: &[Observer]) -> u64 {
     )
 }
 
-/// The group verdict for a room an observer row has named (`tracked`) or not.
-/// STUB (red commit): the old rule for every room.
-pub fn group_verdict(_tracked: bool, snapshot: Option<u64>, current: u64) -> bool {
-    group_from_counts(snapshot, current)
+/// The group verdict for a room an observer row has named (`tracked`: now or
+/// earlier in this process) or not. The connect-time snapshot of a tracked
+/// room can be stale in both directions (a row added or removed while the
+/// observer is joined), so only the live count decides there. Any other room
+/// keeps the old rule.
+pub fn group_verdict(tracked: bool, snapshot: Option<u64>, current: u64) -> bool {
+    if tracked {
+        current > 2
+    } else {
+        group_from_counts(snapshot, current)
+    }
 }
 
 /// The observers that may be applied: a row naming `own` (this client's own
-/// account) is dropped, a client is never its own observer. STUB: keeps all.
-pub fn usable_observers(observers: &[Observer], _own: &str) -> Vec<Observer> {
-    observers.to_vec()
+/// account) is dropped, a client is never its own observer. Without this a
+/// wrong row would make a three-member group look like a DM.
+pub fn usable_observers(observers: &[Observer], own: &str) -> Vec<Observer> {
+    observers
+        .iter()
+        .filter(|o| !o.mxid.eq_ignore_ascii_case(own))
+        .cloned()
+        .collect()
+}
+
+/// Read the observers in force from the engine's allow-list, drop a row that
+/// names this client itself (logged and audited once), and hand the rest to
+/// the connector so its own 1:1 checks (`mark_dm`, `dm_room_id`,
+/// `is_one_to_one_dm`) leave them out too. Call before any DM decision.
+pub fn sync_dm_observers<T: Transport>(agent: &AgentClient, engine: &Engine<T>) -> Vec<Observer> {
+    let all = engine.with_allow(|a| a.observers().to_vec());
+    let own = agent.user_id().to_string();
+    let usable = usable_observers(&all, &own);
+    if usable.len() != all.len() {
+        for o in all.iter().filter(|o| o.mxid.eq_ignore_ascii_case(&own)) {
+            if engine.note_once(&format!("own-observer:{}:{}", o.name, o.room_id)) {
+                tracing::error!(name = %o.name, room = %o.room_id, "observer row names this bridge's own account; ignored");
+                engine.audit(serde_json::json!({"event": "observer_ignored", "name": o.name, "room": o.room_id, "reason": "own_account"}));
+            }
+        }
+    }
+    agent.set_dm_observers(
+        usable
+            .iter()
+            .map(|o| DmObserver {
+                room_id: o.room_id.clone(),
+                user_id: o.mxid.clone(),
+            })
+            .collect(),
+    );
+    usable
 }
 
 /// The group verdict from the last connect's snapshot and a current count.
@@ -151,18 +194,19 @@ pub fn group_from_counts(snapshot: Option<u64>, current: u64) -> bool {
 
 /// Whether a message's room is a group: the member count from the last
 /// connect's snapshot (or the room's summary for a room joined since). A room
-/// with an observer bound to it is counted from its member list without the
-/// observer; the sync summary cannot tell the observer apart, so it is not
-/// used there.
+/// an observer row names (now, or earlier in this process) is counted live
+/// from its member list without the observer: the sync summary cannot tell
+/// the observer apart and the snapshot can be stale (see [`group_verdict`]).
 pub async fn is_group<T: Transport>(engine: &Engine<T>, room: &Room) -> bool {
     let room_id = room.room_id().as_str();
-    let bound = engine.with_allow(|a| a.observers_in_room(room_id));
-    let current = if bound.is_empty() {
-        room.joined_members_count()
-    } else {
+    let (bound, tracked) =
+        engine.with_allow(|a| (a.observers_in_room(room_id), a.was_observed(room_id)));
+    let current = if tracked {
         counted_members(room, &bound).await
+    } else {
+        room.joined_members_count()
     };
-    group_from_counts(engine.snapshot_members(room_id), current)
+    group_verdict(tracked, engine.snapshot_members(room_id), current)
 }
 
 /// Register the live inbound handler on `agent`'s Client. The caller MUST
@@ -263,7 +307,7 @@ pub async fn backfill<T: Transport>(agent: &AgentClient, engine: &Engine<T>) -> 
 /// engine, and log it on the first connect and whenever a room is new, so an
 /// operator can learn which room id is which.
 pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>, log_all: bool) {
-    let observers = engine.with_allow(|a| a.observers().to_vec());
+    let observers = sync_dm_observers(agent, engine);
     let mut map = BTreeMap::new();
     for room in agent.client().joined_rooms() {
         let id = room.room_id().to_string();

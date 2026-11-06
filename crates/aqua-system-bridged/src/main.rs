@@ -202,7 +202,17 @@ async fn main() -> anyhow::Result<()> {
         track_processed: args.inbox_track_processed,
     });
     let inbox_policy = profile.inbox;
-    let allow = aqua_messenger::allowlist::AllowList::new(state.join("allowlist.toml"));
+    // The account this daemon is logged in as (persisted by an earlier run;
+    // none on the very first start) may not be listed as an observer. The
+    // cycle loop drops such a row at runtime as well.
+    let own_mxid = aqua_matrix_agent::ConfigFile::load(&config.store_dir.join("config.toml"))
+        .unwrap_or_default()
+        .session
+        .map(|s| s.user_id.to_string());
+    let allow = aqua_messenger::allowlist::AllowList::new_with_reserved(
+        state.join("allowlist.toml"),
+        own_mxid.into_iter().collect(),
+    );
     let shared = Arc::new(aqua_messenger::Engine::new(
         profile,
         &state,

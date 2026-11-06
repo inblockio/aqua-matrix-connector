@@ -206,12 +206,25 @@ impl From<ParseFailure> for String {
 /// typo can never silently widen or narrow the list. Observer rows are
 /// checked last, so a file error elsewhere wins (fail closed).
 pub fn parse_checked(text: &str) -> Result<Parsed, ParseFailure> {
+    parse_with(text, &[], &[])
+}
+
+/// [`parse_checked`] for a list that has built-in recipients (`fixed`, an
+/// embedded agent's owner) and MXIDs no observer may use (`reserved`, the
+/// bridge's own account). The built-in name checks run with the recipient and
+/// room checks, so they win over an observer error.
+fn parse_with(
+    text: &str,
+    fixed: &[Recipient],
+    reserved: &[String],
+) -> Result<Parsed, ParseFailure> {
     let file: AllowListFile = toml::from_str(text)
         .map_err(|e| ParseFailure::File(format!("allow-list parse error: {e}")))?;
     let (recipients, rooms) =
         people_and_rooms(file.recipients, file.rooms).map_err(ParseFailure::File)?;
-    let observers =
-        parse_observers(file.observers, &recipients, &rooms).map_err(ParseFailure::Observer)?;
+    check_fixed(fixed, &recipients, &rooms).map_err(ParseFailure::File)?;
+    let observers = parse_observers(file.observers, &recipients, &rooms, fixed, reserved)
+        .map_err(ParseFailure::Observer)?;
     Ok(Parsed {
         recipients,
         rooms,
@@ -277,11 +290,40 @@ fn people_and_rooms(
     Ok((recipients, rooms))
 }
 
+/// Reject a file that reuses a built-in (owner) name for another MXID or
+/// names a room like the owner.
+fn check_fixed(
+    fixed: &[Recipient],
+    recipients: &[Recipient],
+    rooms: &[RoomEntry],
+) -> Result<(), String> {
+    for f in fixed {
+        if let Some(c) = recipients
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(&f.name) && !e.mxid.eq_ignore_ascii_case(&f.mxid))
+        {
+            return Err(format!(
+                "allow-list entry {:?} reuses the built-in name {:?} for a different MXID",
+                c.name, f.name
+            ));
+        }
+        if let Some(r) = rooms.iter().find(|r| r.name.eq_ignore_ascii_case(&f.name)) {
+            return Err(format!(
+                "[[rooms]] entry {:?} reuses the built-in name {:?}",
+                r.name, f.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate the `[[observers]]` rows. Errors read `observer <name>: <reason>`.
 fn parse_observers(
     raw: Option<toml::Value>,
     recipients: &[Recipient],
     rooms: &[RoomEntry],
+    fixed: &[Recipient],
+    reserved: &[String],
 ) -> Result<Vec<Observer>, String> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
@@ -323,8 +365,15 @@ fn parse_observers(
                 o.room_id
             )));
         }
+        if reserved.iter().any(|r| r.eq_ignore_ascii_case(&o.mxid)) {
+            return Err(fail(format!(
+                "{} is this bridge's own account; it can not observe its own rooms",
+                o.mxid
+            )));
+        }
         if recipients
             .iter()
+            .chain(fixed)
             .any(|r| r.mxid.eq_ignore_ascii_case(&o.mxid))
         {
             return Err(fail(format!(
@@ -335,13 +384,24 @@ fn parse_observers(
         if rooms.iter().any(|r| r.room_id == room_id) {
             return Err(fail(format!("its room {room_id} is a [[rooms]] entry")));
         }
+        if recipients
+            .iter()
+            .map(|r| r.name.as_str())
+            .chain(fixed.iter().map(|r| r.name.as_str()))
+            .chain(rooms.iter().map(|r| r.name.as_str()))
+            .any(|n| n.trim().eq_ignore_ascii_case(&name))
+        {
+            return Err(fail(
+                "the name is already used by a recipient or a room".into(),
+            ));
+        }
         if out.iter().any(|x| x.name.eq_ignore_ascii_case(&name)) {
             return Err(fail("the name is used by another observer".into()));
         }
-        if out.iter().any(|x| x.is(&o.mxid, &room_id)) {
+        if let Some(x) = out.iter().find(|x| x.room_id == room_id) {
             return Err(fail(format!(
-                "{} is listed twice for room {room_id}",
-                o.mxid
+                "room {room_id} already has the observer {}; one room has at most one",
+                x.name
             )));
         }
         out.push(Observer {
@@ -365,6 +425,11 @@ pub struct AllowList {
     recipients: Vec<Recipient>,
     rooms: Vec<RoomEntry>,
     observers: Vec<Observer>,
+    /// MXIDs that may not be observers (the bridge's own account).
+    reserved: Vec<String>,
+    /// Rooms an observer row has named since this list was built, kept after
+    /// the row is gone: their member snapshot may be stale either way.
+    ever_observed: std::collections::BTreeSet<String>,
     load_error: Option<String>,
     /// Why the last reload was refused because of an `[[observers]]` row.
     /// With a good list loaded before, the lists were kept (`load_error`
@@ -390,9 +455,12 @@ impl AllowList {
     }
 
     /// [`AllowList::new`] that also refuses these MXIDs as observers (the
-    /// bridge's own account, read from its persisted session). STUB: ignored.
-    pub fn new_with_reserved(path: PathBuf, _reserved: Vec<String>) -> Self {
-        Self::new(path)
+    /// bridge's own account, read from its persisted session).
+    pub fn new_with_reserved(path: PathBuf, reserved: Vec<String>) -> Self {
+        let mut a = Self::unloaded(Some(path), Vec::new(), "Aqua System", "Tim");
+        a.reserved = reserved;
+        a.reload(true);
+        a
     }
 
     /// The embedded-agent default: ONLY the owner. More people or rooms need
@@ -406,22 +474,28 @@ impl AllowList {
     }
 
     fn build(path: Option<PathBuf>, fixed: Vec<Recipient>, label: &str, approver: &str) -> Self {
-        let mut a = Self {
+        let mut a = Self::unloaded(path, fixed, label, approver);
+        a.reload(true);
+        a
+    }
+
+    fn unloaded(path: Option<PathBuf>, fixed: Vec<Recipient>, label: &str, approver: &str) -> Self {
+        Self {
             path,
             mtime: None,
             recipients: fixed.clone(),
             fixed,
             rooms: Vec::new(),
             observers: Vec::new(),
+            reserved: Vec::new(),
+            ever_observed: Default::default(),
             load_error: None,
             observer_error: None,
             loaded: false,
             pending_audit: Vec::new(),
             label: label.to_string(),
             approver: approver.to_string(),
-        };
-        a.reload(true);
-        a
+        }
     }
 
     /// The allow-list file, if this list has one.
@@ -452,7 +526,7 @@ impl AllowList {
         let mut rooms = Vec::new();
         let mut observers = Vec::new();
         match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_checked(&text).and_then(|p| self.merge_checked(p)) {
+            Ok(text) => match parse_with(&text, &self.fixed, &self.reserved) {
                 Ok(p) => {
                     for e in p.recipients {
                         if !recipients
@@ -464,6 +538,8 @@ impl AllowList {
                     }
                     rooms = p.rooms;
                     observers = p.observers;
+                    self.ever_observed
+                        .extend(observers.iter().map(|o| o.room_id.clone()));
                     tracing::info!(count = recipients.len(), rooms = rooms.len(), path = %path.display(), "allow-list loaded");
                     for o in &observers {
                         tracing::info!(name = %o.name, room = %o.room_id, "observer loaded");
@@ -512,42 +588,6 @@ impl AllowList {
         true
     }
 
-    /// Reject a file that reuses a built-in (owner) name for another MXID or
-    /// names a room like the owner.
-    fn merge_checked(&self, p: Parsed) -> Result<Parsed, ParseFailure> {
-        for f in &self.fixed {
-            if let Some(c) = p.recipients.iter().find(|e| {
-                e.name.eq_ignore_ascii_case(&f.name) && !e.mxid.eq_ignore_ascii_case(&f.mxid)
-            }) {
-                return Err(ParseFailure::File(format!(
-                    "allow-list entry {:?} reuses the built-in name {:?} for a different MXID",
-                    c.name, f.name
-                )));
-            }
-            if let Some(r) = p
-                .rooms
-                .iter()
-                .find(|r| r.name.eq_ignore_ascii_case(&f.name))
-            {
-                return Err(ParseFailure::File(format!(
-                    "[[rooms]] entry {:?} reuses the built-in name {:?}",
-                    r.name, f.name
-                )));
-            }
-            if let Some(o) = p
-                .observers
-                .iter()
-                .find(|o| o.mxid.eq_ignore_ascii_case(&f.mxid))
-            {
-                return Err(ParseFailure::Observer(format!(
-                    "observer {}: {} is the built-in recipient {:?}",
-                    o.name, o.mxid, f.name
-                )));
-            }
-        }
-        Ok(p)
-    }
-
     pub fn recipients(&self) -> &[Recipient] {
         &self.recipients
     }
@@ -593,9 +633,10 @@ impl AllowList {
     }
 
     /// True when an observer row has named `room_id` since this list was
-    /// built, even if the row is gone now. STUB: never.
-    pub fn was_observed(&self, _room_id: &str) -> bool {
-        false
+    /// built, even if the row is gone now. Such a room's member snapshot can
+    /// be stale in both directions, so its count is always taken live.
+    pub fn was_observed(&self, room_id: &str) -> bool {
+        self.ever_observed.contains(room_id)
     }
 
     /// The observers bound to `room_id` (owned, for use across an await).
@@ -703,6 +744,8 @@ room_id = " !rvKzMvUBBaewXApthx:matrix.inblock.io "
             recipients: p.recipients,
             rooms: p.rooms,
             observers: p.observers,
+            reserved: Vec::new(),
+            ever_observed: Default::default(),
             load_error: None,
             observer_error: None,
             loaded: true,
@@ -1214,7 +1257,9 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         );
         let err = parse_all(&two).unwrap_err();
         assert!(
-            err.starts_with("observer second:") && err.contains(TIM_DM) && err.contains("voice-inbox"),
+            err.starts_with("observer second:")
+                && err.contains(TIM_DM)
+                && err.contains("voice-inbox"),
             "{err}"
         );
     }
@@ -1226,7 +1271,10 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
                 "{WITH_ROOMS}\n[[observers]]\nname = \"{name}\"\nmxid = \"@reader:x\"\nroom_id = \"!dm:x\"\n"
             );
             let err = parse_all(&text).unwrap_err();
-            assert!(err.starts_with(&format!("observer {name}:")), "{name}: {err}");
+            assert!(
+                err.starts_with(&format!("observer {name}:")),
+                "{name}: {err}"
+            );
         }
     }
 
@@ -1239,7 +1287,10 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         let p = cache_file("obs-reserved", &text);
         let a = AllowList::new_with_reserved(p.clone(), vec![own.to_string()]);
         let why = a.observer_error().expect("the row is refused");
-        assert!(why.starts_with("observer me:") && why.contains("own account"), "{why}");
+        assert!(
+            why.starts_with("observer me:") && why.contains("own account"),
+            "{why}"
+        );
         assert!(a.observers().is_empty());
         // the same file is fine for a list that reserves nothing
         let open = AllowList::new(p.clone());
@@ -1254,8 +1305,14 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         let p = cache_file("obs-owner-order", text);
         let a = AllowList::owner_only(owner(), Some(p.clone()), "M");
         let why = a.load_error().expect("the recipient error closes the list");
-        assert!(why.contains("built-in name") && why.contains("owner"), "{why}");
-        assert!(a.observer_error().is_none(), "the observer row is not blamed");
+        assert!(
+            why.contains("built-in name") && why.contains("owner"),
+            "{why}"
+        );
+        assert!(
+            a.observer_error().is_none(),
+            "the observer row is not blamed"
+        );
         assert_eq!(a.resolve("owner").unwrap().mxid, "@own:x");
         assert!(a.by_mxid("@evil:x").is_none());
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
@@ -1281,5 +1338,4 @@ note = "dev-connector inbox_read (D10): read-only member, not counted"
         assert!(a.was_observed(TIM_DM));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
-
 }

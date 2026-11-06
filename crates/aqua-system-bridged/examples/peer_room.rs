@@ -36,11 +36,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create an encrypted room and invite `invite` (flag the invite
+    /// Create an encrypted room and invite every `--invite` (flag the invites
     /// `is_direct` with --is-direct).
     Create {
-        #[arg(long)]
-        invite: String,
+        #[arg(long, required = true)]
+        invite: Vec<String>,
         #[arg(long)]
         is_direct: bool,
         #[arg(long)]
@@ -121,9 +121,11 @@ async fn main() -> anyhow::Result<()> {
             is_direct,
             name,
         } => {
-            let user: OwnedUserId = invite.as_str().try_into()?;
             let mut req = CreateRoomRequest::new();
-            req.invite = vec![user];
+            req.invite = invite
+                .iter()
+                .map(|u| OwnedUserId::try_from(u.as_str()))
+                .collect::<Result<_, _>>()?;
             req.is_direct = is_direct;
             req.name = Some(name);
             req.initial_state = vec![InitialStateEvent::with_empty_state_key(

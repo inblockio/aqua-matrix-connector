@@ -402,6 +402,12 @@ impl<T: Transport> Engine<T> {
             .map(|s| s.joined_members)
     }
 
+    /// True the first time `key` is seen: lets a caller log or audit one
+    /// condition once per process instead of on every request.
+    pub fn note_once(&self, key: &str) -> bool {
+        self.dropped.lock().unwrap().insert(key.to_string())
+    }
+
     /// Append one JSON line to `<state>/audit.jsonl`. Metadata only, never
     /// message bodies.
     pub fn audit(&self, mut v: Value) {
