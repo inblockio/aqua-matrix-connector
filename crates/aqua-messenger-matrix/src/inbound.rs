@@ -177,6 +177,21 @@ pub fn tracked_group(snapshot: Option<u64>, count: LiveCount) -> bool {
     }
 }
 
+/// Whether a room is counted from the member list with invited members
+/// included: a row names it now (`bound`), or one did earlier in this process
+/// (`tracked`). STUB (red commit): only a current row.
+pub fn counts_members_live(bound: bool, _tracked: bool) -> bool {
+    bound
+}
+
+/// The snapshot value for a measured count. A count that failed is stored as
+/// 0, which every decision reads as "no snapshot" (they take `unwrap_or(0)`);
+/// it is never stored as [`GROUP_IF_UNKNOWN`], which would beat a later
+/// measured 2. STUB (red commit): stores the group sentinel.
+pub fn snapshot_count(count: Option<u64>) -> u64 {
+    count.unwrap_or(GROUP_IF_UNKNOWN)
+}
+
 /// What [`counted_members`] reports for an observed room whose members could
 /// not be read at all: group-sized, so nothing is filed or sent as a DM.
 pub const GROUP_IF_UNKNOWN: u64 = 3;
@@ -454,6 +469,29 @@ mod tests {
             ("@reader:x", &Join),
         ];
         assert_eq!(count_active_members("!other:x", elsewhere, &observers), 3);
+    }
+
+    #[test]
+    fn every_tracked_room_counts_invited_members() {
+        // a room a row named earlier keeps the invite-aware count after the row is gone
+        assert!(counts_members_live(false, true));
+        assert!(counts_members_live(true, true));
+        assert!(counts_members_live(true, false));
+        // a room no row ever named takes the old joined-only count
+        assert!(!counts_members_live(false, false));
+    }
+
+    #[test]
+    fn a_failed_count_is_never_stored_as_a_snapshot() {
+        assert_eq!(snapshot_count(Some(2)), 2);
+        assert_eq!(snapshot_count(Some(0)), 0);
+        // unknown stays "no snapshot": a later measured 2 decides, on every path
+        assert_eq!(snapshot_count(None), 0);
+        let snap = Some(snapshot_count(None));
+        assert!(!tracked_group(snap, LiveCount::Cached(2)));
+        assert!(!group_verdict(false, snap, 2));
+        // a measured group count still sticks
+        assert!(tracked_group(Some(snapshot_count(Some(3))), LiveCount::Cached(2)));
     }
 
     #[test]
