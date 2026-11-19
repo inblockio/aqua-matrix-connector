@@ -22,6 +22,8 @@ struct Sent {
     status: u16,
     is_edit: bool,
     text: String,
+    /// The event's `m.relates_to` (`null` when it has none).
+    relation: serde_json::Value,
 }
 
 #[derive(Clone, Default)]
@@ -131,6 +133,10 @@ async fn serve(hs: Hs) -> String {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        let relation = event
+                            .get("m.relates_to")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                         let ok = hs.accept.lock().unwrap().contains(&token);
                         let (status, reply) = if hs.forbid.load(Ordering::SeqCst) {
                             (
@@ -152,6 +158,7 @@ async fn serve(hs: Hs) -> String {
                             status,
                             is_edit,
                             text,
+                            relation,
                         });
                         (status, reply)
                     } else {
@@ -407,4 +414,63 @@ async fn finalize_stops_at_a_rejected_token_and_retries_anything_else() {
     .await
     .unwrap_err();
     assert_eq!(calls.load(Ordering::SeqCst), FINALIZE_MAX_ATTEMPTS);
+}
+
+/// A reply to a message in a thread stays in it: the first message is a
+/// genuine reply inside the thread, a rollover continuation and the finish
+/// chunks are plain thread messages, and the in-place edits carry no thread
+/// relation (they follow their original).
+#[tokio::test]
+async fn a_threaded_stream_opens_and_continues_inside_the_thread() {
+    let hs = Hs::accepting(&["t"]);
+    let url = serve(hs.clone()).await;
+    let thread = ThreadReply::of(ROOM, "$q:localhost", Some("$root:localhost")).unwrap();
+    let mut stream = ReplyStream::start(room_with(&url, "thr", "t").await, None)
+        .await
+        .unwrap()
+        .in_thread(&thread);
+
+    // enough to open the first message, then roll over into a continuation
+    push_chunks(&mut stream, 3, 3_000).await;
+    stream.finish(Some("the end")).await.expect("finish");
+
+    let sends = hs.sends();
+    assert!(sends.iter().all(|s| s.status == 200), "{sends:?}");
+    let fresh: Vec<_> = sends.iter().filter(|s| !s.is_edit).collect();
+    assert!(fresh.len() >= 2, "expected a rollover continuation: {sends:?}");
+    let first = &fresh[0].relation;
+    assert_eq!(first["rel_type"], "m.thread", "{first}");
+    assert_eq!(first["event_id"], "$root:localhost");
+    assert_eq!(first["m.in_reply_to"]["event_id"], "$q:localhost");
+    assert_ne!(first["is_falling_back"], serde_json::json!(true));
+    for later in &fresh[1..] {
+        let r = &later.relation;
+        assert_eq!(r["rel_type"], "m.thread", "{r}");
+        assert_eq!(r["event_id"], "$root:localhost");
+        assert_eq!(r["is_falling_back"], serde_json::json!(true));
+    }
+    for edit in sends.iter().filter(|s| s.is_edit) {
+        assert_eq!(edit.relation["rel_type"], "m.replace", "{:?}", edit.relation);
+    }
+}
+
+/// A reply that is not in a thread is exactly what it always was: no relation
+/// on any message of the stream.
+#[tokio::test]
+async fn a_plain_stream_adds_no_relation() {
+    let hs = Hs::accepting(&["t"]);
+    let url = serve(hs.clone()).await;
+    let mut stream = ReplyStream::start(room_with(&url, "plain", "t").await, None)
+        .await
+        .unwrap();
+
+    push_chunks(&mut stream, 3, 3_000).await;
+    stream.finish(Some("the end")).await.expect("finish");
+
+    let sends = hs.sends();
+    let fresh: Vec<_> = sends.iter().filter(|s| !s.is_edit).collect();
+    assert!(fresh.len() >= 2, "{sends:?}");
+    for s in fresh {
+        assert!(s.relation.is_null(), "no relation expected: {:?}", s.relation);
+    }
 }

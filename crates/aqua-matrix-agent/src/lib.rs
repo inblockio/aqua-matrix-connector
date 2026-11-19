@@ -26,7 +26,7 @@ pub use net_retry::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
     ConnectErrorClass, ConnectOutcome,
 };
-pub use reply::ReplyTarget;
+pub use reply::{ReplyTarget, ThreadReply};
 pub use rtc_keys::{
     CallEncryptionKeys, CallEncryptionKeysEventContent, CallKey, CALL_ENCRYPTION_KEYS_TYPE,
 };
@@ -2098,38 +2098,9 @@ impl AgentClient {
         message: &str,
         mention: Option<&RoomMention<'_>>,
     ) -> Result<String> {
-        let chunks = split_for_matrix(message, STREAM_ROLLOVER_BYTES);
-        let n = chunks.len();
-        let mut last = String::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let content = match mention {
-                Some(m) if i + 1 == n => mention_content(chunk, m)?,
-                _ => RoomMessageEventContent::text_markdown(chunk),
-            };
-            let first = retry_finalize("send-room", || {
-                self.send_content_once(room_id, content.clone())
-            })
-            .await;
-            last = match first {
-                Ok(id) => id,
-                Err(e) if is_unknown_token(&e) => {
-                    tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "room send rejected with M_UNKNOWN_TOKEN; refreshing token and retrying the chunk once"
-                    );
-                    self.reauth_token_only()
-                        .await
-                        .context("token refresh after M_UNKNOWN_TOKEN failed")?;
-                    retry_finalize("send-room", || {
-                        self.send_content_once(room_id, content.clone())
-                    })
-                    .await
-                    .context("room send still failed after token refresh")?
-                }
-                Err(e) => return Err(e),
-            };
-        }
-        Ok(last)
+        // The chunk loop lives in `reply.rs`; no reply means no relation.
+        self.send_to_room_chunked_reply_with_refresh(room_id, message, mention, None)
+            .await
     }
 }
 
@@ -2548,6 +2519,15 @@ impl AgentClient {
         let refresher = room_refresher(self.config.clone(), room.room_id().to_owned());
         ReplyStream::start(room, Some(refresher)).await
     }
+
+    /// [`reply_stream_in_room`](Self::reply_stream_in_room) for a reply that
+    /// must land inside a Matrix thread: opened in the thread's own room, with
+    /// the thread relation on every new message of the reply (see
+    /// [`ReplyStream::in_thread`]). This is the streaming path of an agent
+    /// answering a message that was posted in a thread, in a DM or a group room.
+    pub async fn reply_stream_in_thread(&self, thread: &ThreadReply) -> Result<ReplyStream> {
+        Ok(self.reply_stream_in_room(&thread.room_id).await?.in_thread(thread))
+    }
 }
 
 /// The membership gate behind [`AgentClient::joined_room`], split out so the
@@ -2909,6 +2889,11 @@ pub struct ReplyStream {
     /// Used to bound fan-out and to know whether any rollover has happened in
     /// `finish`.
     messages: usize,
+    /// Set when the reply must land in a Matrix thread ([`Self::in_thread`]):
+    /// every NEW message of the reply (the first, a rollover continuation, a
+    /// finish chunk) carries the thread relation. `None` adds no relation at
+    /// all. Edits (`m.replace`) never carry one: they follow their original.
+    thread: Option<ReplyTarget>,
 }
 
 impl ReplyStream {
@@ -2928,7 +2913,37 @@ impl ReplyStream {
             last_edit: Instant::now(),
             pending: false,
             messages: 0,
+            thread: None,
         })
+    }
+
+    /// Make this reply land inside `thread` (a message and its thread root, see
+    /// [`ThreadReply`]): the first message is a genuine reply in the thread,
+    /// every continuation a plain thread message, so a long answer stays in
+    /// the thread. The edits that make the text appear to stream are unchanged.
+    /// Call before the first `push`.
+    pub fn in_thread(mut self, thread: &ThreadReply) -> Self {
+        self.thread = Some(thread.target.clone());
+        self
+    }
+
+    /// The content of a NEW message of this reply (never an edit). `first` is
+    /// the message that opens the reply; any later one continues it. Without a
+    /// thread this is the plain Markdown message it always was.
+    fn new_message(&self, body: &str, first: bool) -> Result<RoomMessageEventContent> {
+        let relation = match &self.thread {
+            None => None,
+            Some(t) if first => Some(reply::first_relation(t)?),
+            Some(t) => {
+                let previous = self
+                    .event_id
+                    .as_ref()
+                    .map(|e| e.as_str())
+                    .unwrap_or(&t.event_id);
+                reply::continuation_relation(t.thread_root.as_deref(), previous)?
+            }
+        };
+        Ok(reply::markdown_with(body, relation))
     }
 
     /// Whether the first real message has been sent yet. The caller keeps its
@@ -3024,7 +3039,7 @@ impl ReplyStream {
         if self.gave_up() || !self.open_gate.ready(Instant::now()) {
             return;
         }
-        match self.send_new(&render_streaming(&self.buf)).await {
+        match self.send_new(&render_streaming(&self.buf), true).await {
             Ok(ev) => {
                 self.event_id = Some(ev);
                 self.messages = 1;
@@ -3150,10 +3165,10 @@ impl ReplyStream {
         if self.event_id.is_some() {
             retry_finalize("reply-finalize", || self.edit(&first)).await?;
         } else {
-            retry_finalize("reply-finalize", || self.send_plain(&first)).await?;
+            retry_finalize("reply-finalize", || self.send_plain(&first, true)).await?;
         }
         for chunk in chunks.iter().skip(1) {
-            retry_finalize("reply-continuation", || self.send_plain(chunk)).await?;
+            retry_finalize("reply-continuation", || self.send_plain(chunk, false)).await?;
         }
         Ok(())
     }
@@ -3184,7 +3199,7 @@ impl ReplyStream {
         // Open the continuation WITH its content (not a bare "…") so its push
         // notification, if any, previews real text. Do it FIRST; on failure leave
         // everything untouched.
-        let new_ev = match self.send_new(&render_streaming(&new_buf)).await {
+        let new_ev = match self.send_new(&render_streaming(&new_buf), false).await {
             Ok(ev) => ev,
             Err(e) => {
                 let wait = self.open_gate.failed(Instant::now());
@@ -3212,8 +3227,8 @@ impl ReplyStream {
     /// Send `body` as a fresh message and return its event id (a new live
     /// message). Used to open a rollover continuation and the first message —
     /// always with real content so it never notifies as a bare placeholder.
-    async fn send_new(&self, body: &str) -> Result<OwnedEventId> {
-        self.deliver(RoomMessageEventContent::text_markdown(body))
+    async fn send_new(&self, body: &str, first: bool) -> Result<OwnedEventId> {
+        self.deliver(self.new_message(body, first)?)
             .await
             .context("failed to open continuation message")
     }
@@ -3251,8 +3266,8 @@ impl ReplyStream {
     /// Send `body` as a brand-new message (not an edit). Used for continuation
     /// messages: a fresh `m.room.message` carries no `m.new_content` copy, so it
     /// is far smaller on the wire than the equivalent edit.
-    async fn send_plain(&self, body: &str) -> Result<()> {
-        let content = RoomMessageEventContent::text_markdown(body);
+    async fn send_plain(&self, body: &str, first: bool) -> Result<()> {
+        let content = self.new_message(body, first)?;
         self.deliver(content)
             .await
             .context("failed to send continuation message")?;
