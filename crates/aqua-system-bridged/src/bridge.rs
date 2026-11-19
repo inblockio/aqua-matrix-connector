@@ -446,11 +446,60 @@ room_id = "!daily:x"
                 origin: "t@h".into(),
                 reply_to: Some(seq.unwrap().to_string()),
                 mention: None,
+                thread: None,
             })
             .await;
         assert!(r.ok, "{r:?}");
         assert_eq!(r.data["reply_to"], "$q");
         assert_eq!(r.data["thread_root"], "$root");
+        loop_.await.unwrap();
+    }
+
+    /// The daemon queues a `thread` send with the thread flag and the root of
+    /// the message's thread, and reports the thread it went into (and no
+    /// `reply_to`, nothing was quoted).
+    #[tokio::test]
+    async fn thread_sends_are_queued_into_the_thread_root() {
+        let (e, mut rx) = engine_with(LIST, "thread");
+        let e2 = e.clone();
+        let loop_ = tokio::spawn(async move {
+            let cmd = rx.recv().await.unwrap();
+            let r = cmd.reply.as_ref().unwrap();
+            assert_eq!(r.event_id, "$q");
+            assert!(r.into_thread);
+            assert_eq!(r.thread_root.as_deref(), Some("$root"));
+            let _ = cmd.done.send(Ok(CmdOk::Sent(Sent {
+                event_id: "$new".into(),
+                thread_root: r.thread_root.clone(),
+            })));
+        });
+        let seq = e2.ingest(NewEntry {
+            event_id: "$q".into(),
+            room_id: "!daily:x".into(),
+            sender: "@stranger:x".into(),
+            sender_name: None,
+            room: Some("daily-updates".into()),
+            ts_ms: 1,
+            kind: "text".into(),
+            body: "question".into(),
+            filename: None,
+            media: None,
+            in_reply_to: None,
+            thread_root: Some("$root".into()),
+        });
+        let r = e2
+            .handle(Request::SendMessage {
+                to: "daily-updates".into(),
+                markdown: "answer".into(),
+                origin: "t@h".into(),
+                reply_to: None,
+                mention: None,
+                thread: Some(seq.unwrap().to_string()),
+            })
+            .await;
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.data["thread_root"], "$root");
+        assert!(r.data.get("reply_to").is_none(), "{:?}", r.data);
         loop_.await.unwrap();
     }
 

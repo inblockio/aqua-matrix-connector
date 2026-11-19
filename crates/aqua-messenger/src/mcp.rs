@@ -157,19 +157,30 @@ fn str_arg<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
 
 /// `reply_to` as a string: an inbox seq may arrive as a JSON number.
 pub fn reply_to_arg(args: &Value) -> Result<Option<String>, String> {
-    match args.get("reply_to") {
+    message_ref_arg(args, "reply_to")
+}
+
+/// `thread` as a string, like [`reply_to_arg`].
+pub fn thread_arg(args: &Value) -> Result<Option<String>, String> {
+    message_ref_arg(args, "thread")
+}
+
+/// An argument that names a message: an inbox seq (a JSON number or a decimal
+/// string) or a Matrix event id.
+fn message_ref_arg(args: &Value, what: &str) -> Result<Option<String>, String> {
+    match args.get(what) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => n
             .as_u64()
             .map(|n| Some(n.to_string()))
-            .ok_or_else(|| format!("reply_to {n} is not a valid inbox seq")),
+            .ok_or_else(|| format!("{what} {n} is not a valid inbox seq")),
         Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
         Some(Value::String(s)) => {
-            crate::engine::parse_reply_to(s)?;
+            crate::engine::parse_ref(what, s)?;
             Ok(Some(s.trim().to_string()))
         }
         Some(other) => Err(format!(
-            "reply_to must be an inbox seq or a Matrix event id, not {other}"
+            "{what} must be an inbox seq or a Matrix event id, not {other}"
         )),
     }
 }
@@ -200,6 +211,7 @@ pub fn build_request(
                     origin: origin(args),
                     reply_to: reply_to_arg(args)?,
                     mention: None,
+                    thread: thread_arg(args)?,
                 },
                 SEND_TIMEOUT,
             )
@@ -224,6 +236,7 @@ pub fn build_request(
                     caption: str_arg(args, "caption").map(String::from),
                     origin: origin(args),
                     reply_to: reply_to_arg(args)?,
+                    thread: thread_arg(args)?,
                 },
                 SEND_TIMEOUT,
             )
@@ -340,6 +353,7 @@ pub fn render(name: &str, d: &Value, label: &str, wait: bool) -> String {
             let reply = match (d["reply_to"].as_str(), d["thread_root"].as_str()) {
                 (Some(r), Some(t)) => format!(" as a reply to {r} (in thread {t})"),
                 (Some(r), None) => format!(" as a reply to {r}"),
+                (None, Some(t)) => format!(" in thread {t}"),
                 _ => String::new(),
             };
             let cursor = if wait {
@@ -501,4 +515,50 @@ pub async fn run_stdio<B: Backend + ?Sized>(backend: &B, fallback: Value) -> any
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn thread_arg_takes_a_seq_or_an_event_id_like_reply_to() {
+        assert_eq!(thread_arg(&json!({})), Ok(None));
+        assert_eq!(thread_arg(&json!({"thread": null})), Ok(None));
+        assert_eq!(thread_arg(&json!({"thread": "  "})), Ok(None));
+        assert_eq!(thread_arg(&json!({"thread": 12})), Ok(Some("12".into())));
+        assert_eq!(thread_arg(&json!({"thread": " $a:x "})), Ok(Some("$a:x".into())));
+        assert!(thread_arg(&json!({"thread": "nope"}))
+            .unwrap_err()
+            .starts_with("thread \"nope\" is neither"));
+        assert!(thread_arg(&json!({"thread": -1})).is_err());
+        assert!(thread_arg(&json!({"thread": true})).is_err());
+        // the other argument is unaffected
+        assert_eq!(reply_to_arg(&json!({"thread": 3})), Ok(None));
+    }
+
+    #[test]
+    fn send_tools_pass_thread_to_the_request_and_nothing_else() {
+        let (req, _) = build_request(
+            jsonrpc::T_SEND_MESSAGE,
+            &json!({"markdown": "hi", "thread": "$root:x"}),
+            60,
+        )
+        .unwrap();
+        let Request::SendMessage { thread, reply_to, mention, .. } = req else {
+            panic!("not a send_message");
+        };
+        assert_eq!(thread.as_deref(), Some("$root:x"));
+        assert_eq!((reply_to, mention), (None, None));
+    }
+
+    #[test]
+    fn a_thread_send_reports_the_thread_it_went_into() {
+        let d = json!({"event_id": "$e", "to_name": "tim", "to_kind": "person",
+                       "to_mxid": "@tim:x", "inbox_seq": 4, "thread_root": "$root"});
+        let t = render(jsonrpc::T_SEND_MESSAGE, &d, "Aqua System", true);
+        assert!(t.contains("as Matrix event $e in thread $root."), "{t}");
+        assert!(!t.contains("as a reply to"), "{t}");
+    }
 }
