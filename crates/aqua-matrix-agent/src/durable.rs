@@ -56,6 +56,14 @@ pub struct WorkItem {
     /// as sent by `target`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
+    /// The thread root when the inbound message was posted in a Matrix thread,
+    /// so a replay or a redelivery answers inside that thread instead of the
+    /// main timeline. Same compatibility rule as `sender`: `None` (a message
+    /// outside any thread) is not written at all, so such a journal stays
+    /// byte-identical to the format before this field existed, `serde(default)`
+    /// reads that format, and an older binary ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
 }
 
 /// Durable, process-shared journal of [`WorkItem`]s for one target. Cloneable via
@@ -211,6 +219,7 @@ mod tests {
             body: format!("body of {id}"),
             state: WorkState::Pending,
             sender: None,
+            thread_root: None,
         }
     }
 
@@ -323,6 +332,29 @@ mod tests {
   }
 ]"#
         );
+    }
+
+    /// A thread root is written for a threaded message only, survives a restart
+    /// and comes back as-is; an item outside a thread leaves the journal
+    /// byte-identical to the format before the field (the old-format test
+    /// above loads a journal without it).
+    #[test]
+    fn recorded_thread_root_round_trips_and_plain_items_write_nothing() {
+        let dir = tmp_dir("thread");
+        {
+            let j = WorkJournal::load_or_empty(&dir);
+            j.enqueue(WorkItem {
+                thread_root: Some("$root:server".to_string()),
+                ..item("$threaded")
+            });
+            j.enqueue(item("$plain"));
+        }
+        let on_disk = std::fs::read_to_string(dir.join(WorkJournal::FILE_NAME)).unwrap();
+        assert_eq!(on_disk.matches("\"thread_root\"").count(), 1, "{on_disk}");
+        let pending = WorkJournal::load_or_empty(&dir).pending_work();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].thread_root.as_deref(), Some("$root:server"));
+        assert_eq!(pending[1].thread_root, None);
     }
 
     /// A recorded sender is written, survives a restart and comes back as-is.

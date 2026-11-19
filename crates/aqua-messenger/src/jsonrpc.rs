@@ -50,6 +50,8 @@ const FROM_LABEL: &str = "Optional short label identifying this session in the u
 
 const REPLY_TO: &str = "Optional: send this as a Matrix reply to one message, given by its inbox seq (e.g. \"12\", from read_inbox) or its Matrix event id (\"$...\", e.g. one returned by send_message). It must be a message in the conversation `to` names (that person's DM or that room). When the original was posted in a thread, the reply stays in that thread.";
 
+const THREAD: &str = "Optional: send this INTO a Matrix thread instead of the main timeline. Give the inbox seq (e.g. \"12\", from read_inbox) or the Matrix event id (\"$...\", e.g. one returned by send_message) of a message in that thread, or of the message to start a thread on. It must be a message in the conversation `to` names (that person's DM or that room). The thread is rooted at that message, or at its root when that message is already inside a thread; a long message stays in the thread. Use `thread` or `reply_to`, not both.";
+
 /// MCP tool annotations for `name` (see the module docs).
 pub fn annotations(name: &str) -> Value {
     let (title, read_only, idempotent, open_world) = match name {
@@ -159,6 +161,7 @@ fn tool_def(p: &Profile, name: &str) -> Value {
             });
             from_label(&mut props);
             props["reply_to"] = json!({"type": "string", "description": REPLY_TO});
+            props["thread"] = json!({"type": "string", "description": THREAD});
             let description = if host {
                 format!(
                     "Send a Markdown message (rendered in Element) as the \"{}\" identity to an allow-listed person (end-to-end-encrypted DM) or into an allow-listed group room (everyone in the room reads it). Use for PR updates, summaries, notes. Targets outside the allow-list, and joined rooms not listed under [[rooms]], are refused. Only message people other than {}, or post in a room, when {} asked for it. {rate}; max {} bytes (use send_file for longer documents). Returns the Matrix event id and an inbox_seq cursor{}.",
@@ -190,6 +193,7 @@ fn tool_def(p: &Profile, name: &str) -> Value {
             });
             from_label(&mut props);
             props["reply_to"] = json!({"type": "string", "description": REPLY_TO});
+            props["thread"] = json!({"type": "string", "description": THREAD});
             let reader = if host {
                 "the bridge daemon running as the same user"
             } else {
@@ -498,6 +502,23 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .contains(&json!("reply_to")));
+            }
+        }
+    }
+
+    #[test]
+    fn send_tools_take_an_optional_thread() {
+        for p in [Profile::host(), Profile::default()] {
+            let tools = list(&describe(&p));
+            for t in &tools[..2] {
+                let r = &t["inputSchema"]["properties"]["thread"];
+                assert_eq!(r["type"], "string", "{t}");
+                let d = r["description"].as_str().unwrap();
+                assert!(d.contains("thread") && d.contains("reply_to"), "{d}");
+                assert!(!t["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("thread")));
             }
         }
     }

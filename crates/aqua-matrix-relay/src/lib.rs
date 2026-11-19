@@ -74,7 +74,7 @@ use matrix_sdk::{
 pub use aqua_matrix_agent::{
     classify_connect_error, connect_with_outage_retry, is_transient_network_error,
     is_unknown_token, load_dotenv, ConnectErrorClass, ConnectOutcome, AgentClient, AgentConfig, MediaHandle, MediaKind, ReplyStream,
-    RoomMention, TypingGuard, WorkItem, WorkJournal, WorkState,
+    ReplyTarget, RoomMention, ThreadReply, TypingGuard, WorkItem, WorkJournal, WorkState,
 };
 pub use async_trait::async_trait;
 
@@ -202,6 +202,24 @@ pub struct InboundMessage<'a> {
     /// `Some` for an attachment message; carries the kind/metadata and a handle
     /// to download the (decrypted) bytes. `None` for a plain text message.
     pub media: Option<InboundMedia>,
+    /// The thread root when the message was posted in a Matrix thread
+    /// (`m.relates_to.rel_type = m.thread`), `None` for a message in the main
+    /// timeline. A handler that wants its answer in the same thread sends it
+    /// with [`thread_reply`](Self::thread_reply). Set for a
+    /// message replayed after a restart too (the journal keeps it).
+    pub thread_root: Option<&'a str>,
+}
+
+impl InboundMessage<'_> {
+    /// Where an answer to this message must go to land in its thread: `Some`
+    /// only when the message is in a thread, `None` otherwise (a message outside
+    /// any thread is answered exactly as before, with no reply relation). Pass
+    /// it to the `*_in_thread_*` sends of [`AgentClient`], which post a genuine
+    /// reply inside the thread (`m.in_reply_to` this message, thread root
+    /// unchanged) and keep every later chunk of a long answer in the thread.
+    pub fn thread_reply(&self) -> Option<ThreadReply> {
+        ThreadReply::of(self.room_id, self.event_id, self.thread_root)
+    }
 }
 
 /// A concrete agent backend. The relay owns the Matrix lifecycle; the handler
@@ -1673,6 +1691,10 @@ async fn dispatch<H: MessageHandler>(
         _ => return,
     };
 
+    // The thread this message is in, if any (the same parse the messenger uses
+    // for its inbound side; a thread FALLBACK reply still reports its root).
+    let thread_root = aqua_matrix_agent::reply::reply_fields(ev.content.relates_to.as_ref()).1;
+
     // Advance (and persist) the watermark BEFORE dispatching: if the handler
     // (or the process) dies mid-work we must not re-trigger on the same
     // message after restart.
@@ -1704,6 +1726,7 @@ async fn dispatch<H: MessageHandler>(
             watermarks.is_bound(room.room_id().as_str()),
             target,
         ),
+        thread_root: thread_root.clone(),
     });
     if !newly_enqueued {
         tracing::debug!(
@@ -1743,6 +1766,7 @@ async fn dispatch<H: MessageHandler>(
         msgtype: ev.content.msgtype.msgtype(),
         body: &body,
         media,
+        thread_root: thread_root.as_deref(),
     };
 
     // The relay never unwinds on a handler error: log it at `warn` and keep
@@ -1780,13 +1804,25 @@ async fn drain_deliveries(
     role: &str,
     bound_rooms: &[String],
 ) {
-    for item in journal.pending_deliveries() {
+    let items = journal.pending_deliveries();
+    // The DM room is only looked up when a threaded answer waits for delivery.
+    let dm_room = if items.iter().any(|i| i.thread_root.is_some()) {
+        agent.dm_room_id(target).await.ok().flatten()
+    } else {
+        None
+    };
+    for item in items {
         let WorkState::ToDeliver { text } = &item.state else {
             continue;
         };
-        let sent = match redelivery_target(&item.room_id, bound_rooms) {
+        let sent = match redelivery_for(&item, bound_rooms, dm_room.as_deref()) {
             Redelivery::TargetDm => agent.send_dm_chunked(target, text).await,
             Redelivery::Room(room_id) => agent.send_to_room_chunked(room_id, text).await,
+            Redelivery::Thread(t) => {
+                agent
+                    .send_to_room_chunked_reply(&t.room_id, text, Some(&t.target))
+                    .await
+            }
         };
         match sent {
             Ok(_) => {
@@ -1856,6 +1892,7 @@ async fn replay_inbox<H: MessageHandler>(
             msgtype: &item.msgtype,
             body: &item.body,
             media: None,
+            thread_root: item.thread_root.as_deref(),
         };
         if let Err(e) = handler.handle_message(agent, target, &msg).await {
             tracing::warn!("{}: replay handle_message failed: {e:#}", handler.role());
@@ -1901,6 +1938,26 @@ enum Redelivery<'a> {
     TargetDm,
     /// The bound room the message arrived in.
     Room(&'a str),
+    /// The thread the message was in, in the room it arrived in (a DM or a
+    /// bound room alike): a thread must be answered where its root lives.
+    Thread(ThreadReply),
+}
+
+/// The [`Redelivery`] for a journalled item: back into its thread when it came
+/// from one in a room the answer belongs in (a bound room, or the DM with the
+/// target, `dm_room`), otherwise as [`redelivery_target`] says. A thread in any
+/// other room (a group the target wrote in) is answered in the DM, as live.
+fn redelivery_for<'a>(
+    item: &'a WorkItem,
+    bound_rooms: &[String],
+    dm_room: Option<&str>,
+) -> Redelivery<'a> {
+    let answers_here = bound_rooms.iter().any(|b| *b == item.room_id)
+        || dm_room == Some(item.room_id.as_str());
+    match ThreadReply::of(&item.room_id, &item.event_id, item.thread_root.as_deref()) {
+        Some(t) if answers_here => Redelivery::Thread(t),
+        _ => redelivery_target(&item.room_id, bound_rooms),
+    }
 }
 
 /// Pick the [`Redelivery`] for an item that arrived in `room_id`: that room iff
@@ -2907,8 +2964,9 @@ mod restart_path_tests {
         DefaultHandler, RoomPolicyHandler, COLLABORATOR, DM_ROOM, GROUP_ROOM, OTHER_ROOM,
     };
     use super::{
-        journal_sender, redelivery_target, replay_admitted, replay_sender, MessageHandler,
-        Redelivery, WorkItem, WorkState,
+        journal_sender, redelivery_for, redelivery_target, replay_admitted, replay_sender,
+        InboundMessage, MessageHandler, Redelivery, ReplyTarget, ThreadReply, WorkItem,
+        WorkState,
     };
 
     const TARGET: &str = "@did-key-zDnaePeer:matrix.inblock.io";
@@ -2922,6 +2980,7 @@ mod restart_path_tests {
             body: "b".to_string(),
             state: WorkState::Pending,
             sender: sender.map(str::to_string),
+            thread_root: None,
         }
     }
 
@@ -2961,6 +3020,73 @@ mod restart_path_tests {
             assert!(replay_admitted(&DefaultHandler, &item(room, None), TARGET));
             assert!(replay_admitted(&RoomPolicyHandler, &item(room, None), TARGET));
         }
+    }
+
+    /// A message in a thread is answered in that thread when it arrived in a
+    /// room the answer belongs in (the DM with the target, or a bound room); a
+    /// thread in any other room is answered in the DM as before, and a message
+    /// outside a thread keeps the old routing exactly.
+    #[test]
+    fn redelivery_of_a_threaded_message_goes_back_into_its_thread() {
+        let bound = [GROUP_ROOM.to_string()];
+        let threaded = |room| WorkItem {
+            thread_root: Some("$root:x".to_string()),
+            ..item(room, None)
+        };
+        let thread_in = |room: &str| {
+            Redelivery::Thread(ThreadReply {
+                room_id: room.to_string(),
+                target: ReplyTarget {
+                    event_id: "$e".to_string(),
+                    thread_root: Some("$root:x".to_string()),
+                },
+            })
+        };
+        // the DM with the target, and a bound room: into the thread
+        assert_eq!(redelivery_for(&threaded(DM_ROOM), &bound, Some(DM_ROOM)), thread_in(DM_ROOM));
+        assert_eq!(redelivery_for(&threaded(GROUP_ROOM), &bound, Some(DM_ROOM)), thread_in(GROUP_ROOM));
+        assert_eq!(redelivery_for(&threaded(GROUP_ROOM), &bound, None), thread_in(GROUP_ROOM));
+        // a thread in some other room (or no DM known): the DM, as before
+        assert_eq!(redelivery_for(&threaded(OTHER_ROOM), &bound, Some(DM_ROOM)), Redelivery::TargetDm);
+        assert_eq!(redelivery_for(&threaded(DM_ROOM), &bound, None), Redelivery::TargetDm);
+        // no thread: the old routing, whatever the DM room is
+        for room in [DM_ROOM, GROUP_ROOM, OTHER_ROOM] {
+            for dm in [None, Some(DM_ROOM)] {
+                assert_eq!(
+                    redelivery_for(&item(room, None), &bound, dm),
+                    redelivery_target(room, &bound)
+                );
+            }
+        }
+    }
+
+    /// The thread an answer goes to comes from the inbound message: only a
+    /// threaded one yields a target, so a plain message is answered with no
+    /// reply relation at all.
+    #[test]
+    fn thread_reply_only_for_a_threaded_message() {
+        let msg = |thread_root| InboundMessage {
+            sender_mxid: TARGET,
+            sender_did: None,
+            event_id: "$q:x",
+            room_id: DM_ROOM,
+            timestamp_ms: 1,
+            msgtype: "m.text",
+            body: "hi",
+            media: None,
+            thread_root,
+        };
+        assert_eq!(msg(None).thread_reply(), None);
+        assert_eq!(
+            msg(Some("$root:x")).thread_reply(),
+            Some(ThreadReply {
+                room_id: DM_ROOM.to_string(),
+                target: ReplyTarget {
+                    event_id: "$q:x".to_string(),
+                    thread_root: Some("$root:x".to_string()),
+                },
+            })
+        );
     }
 
     #[test]

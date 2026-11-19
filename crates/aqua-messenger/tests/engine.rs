@@ -558,7 +558,8 @@ async fn reply_to_resolves_within_the_conversation() {
             event_id: "$q".into(),
             sender: Some(OWNER.into()),
             room_id: Some("!dm:localhost".into()),
-            thread_root: None
+            thread_root: None,
+            into_thread: false,
         }
     );
     // threaded room message: the reply carries the thread root
@@ -645,6 +646,132 @@ async fn reply_to_resolves_within_the_conversation() {
             event_id: "$elsewhere:localhost".into(),
             ..Default::default()
         }
+    );
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// `thread` posts INTO a thread: an inbox message already in a thread gives
+/// its root, any other message becomes the root of the thread the send starts.
+/// Same conversation check as `reply_to`; never combined with it.
+#[tokio::test]
+async fn thread_option_targets_the_thread_root_in_the_conversation() {
+    let (e, d) = embedded_with_rooms("thread");
+    let dm = e
+        .ingest(text_entry("$q", "!dm:localhost", OWNER, None, None))
+        .unwrap();
+    let threaded = e
+        .ingest(text_entry(
+            "$tq",
+            "!team:localhost",
+            "@stranger:localhost",
+            Some("team"),
+            Some("$root"),
+        ))
+        .unwrap();
+    let last = |e: &aqua_messenger::Engine<Mock>| {
+        e.transport().sent.lock().unwrap().last().cloned().unwrap().2
+    };
+
+    // a message outside any thread: the send starts a thread rooted on it
+    let (t, err) = tool(
+        &e,
+        "send_message",
+        json!({"markdown": "start", "thread": dm}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert!(
+        t.contains("in thread $q") && !t.contains("as a reply to"),
+        "{t}"
+    );
+    assert_eq!(
+        last(&e),
+        Some(ReplyRef {
+            event_id: "$q".into(),
+            sender: Some(OWNER.into()),
+            room_id: Some("!dm:localhost".into()),
+            thread_root: Some("$q".into()),
+            into_thread: true,
+        })
+    );
+
+    // a message already inside a thread: the thread's root, by seq or by id,
+    // for a text and for a file
+    let (t, err) = tool(
+        &e,
+        "send_message",
+        json!({"to": "team", "markdown": "in it", "thread": threaded.to_string()}),
+    )
+    .await;
+    assert!(!err && t.contains("in thread $root"), "{t}");
+    let r = last(&e).unwrap();
+    assert_eq!(
+        (r.event_id.as_str(), r.thread_root.as_deref(), r.into_thread),
+        ("$tq", Some("$root"), true)
+    );
+    let file = d.with_extension("thread.md");
+    std::fs::write(&file, "# report").unwrap();
+    let (t, err) = tool(
+        &e,
+        "send_file",
+        json!({"to": "team", "path": file.display().to_string(), "thread": "$tq"}),
+    )
+    .await;
+    let _ = std::fs::remove_file(&file);
+    assert!(!err && t.contains("in thread $root"), "{t}");
+    assert_eq!(last(&e).unwrap().thread_root.as_deref(), Some("$root"));
+
+    // a bare event id unknown to the inbox: the transport loads the event and
+    // decides the root, so the engine only flags the thread send
+    let (t, err) = tool(
+        &e,
+        "send_message",
+        json!({"markdown": "x", "thread": "$elsewhere:localhost"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert_eq!(
+        last(&e),
+        Some(ReplyRef {
+            event_id: "$elsewhere:localhost".into(),
+            into_thread: true,
+            ..Default::default()
+        })
+    );
+
+    // refusals, all before any send: another conversation, no such seq, not an
+    // id, both options, a mention
+    let n = e.transport().sent.lock().unwrap().len();
+    let (t, err) = tool(
+        &e,
+        "send_message",
+        json!({"markdown": "x", "thread": threaded}),
+    )
+    .await;
+    assert!(
+        err && t.starts_with("REFUSED") && t.contains("thread") && t.contains("room team"),
+        "{t}"
+    );
+    let (t, err) = tool(&e, "send_message", json!({"markdown": "x", "thread": 999})).await;
+    assert!(err && t.contains("thread: no inbox entry with seq 999"), "{t}");
+    let (t, err) = tool(
+        &e,
+        "send_message",
+        json!({"markdown": "x", "thread": "not-an-id"}),
+    )
+    .await;
+    assert!(err && t.contains("thread \"not-an-id\" is neither an inbox seq"), "{t}");
+    let (t, err) = tool(
+        &e,
+        "send_message",
+        json!({"markdown": "x", "thread": dm, "reply_to": dm}),
+    )
+    .await;
+    assert!(err && t.contains("not both"), "{t}");
+    assert_eq!(
+        e.transport().sent.lock().unwrap().len(),
+        n,
+        "refusals never reach the transport"
     );
     let _ = std::fs::remove_dir_all(d);
 }
@@ -1073,6 +1200,7 @@ fn mention_send(to: &str, mention: &str, md: &str) -> Request {
         origin: "trains@nuc10".into(),
         reply_to: None,
         mention: Some(mention.into()),
+        thread: None,
     }
 }
 
@@ -1122,6 +1250,11 @@ async fn mention_names_one_allowlisted_person_and_survives_edits() {
     let mut both = mention_send("tim", "tim", "x");
     if let Request::SendMessage { reply_to, .. } = &mut both {
         *reply_to = Some("$q:x".into());
+    }
+    assert!(err(e.handle(both).await).contains("not both"));
+    let mut both = mention_send("tim", "tim", "x");
+    if let Request::SendMessage { thread, .. } = &mut both {
+        *thread = Some("$q:x".into());
     }
     assert!(err(e.handle(both).await).contains("not both"));
     assert_eq!(sends_left(&e, "tim").await, 20);

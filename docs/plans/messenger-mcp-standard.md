@@ -45,6 +45,10 @@ and `wait_for_reply` only where a profile enables it) by default:
    `thread_root`, so a session sees that a message answers one it sent (compare with
    the event id `send_message` returns). A thread message whose `m.in_reply_to` is only
    the thread fallback is not reported as a reply (the matrix-mcp rule).
+   `thread` (same argument forms and conversation check as `reply_to`, not combined with
+   it) posts INTO the thread of a message, starting one when the message is not in a
+   thread yet: the thread is rooted at the message, or at its root when it is already
+   inside one.
 3. **`wait_for_reply` is OFF** in the shared default profile and for consultants and
    embedded agents: not listed in `tools/list`, not mentioned in any text, and refused
    by the engine if called anyway. Only `Profile::host()` enables it, explicitly, so

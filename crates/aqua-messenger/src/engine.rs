@@ -75,6 +75,12 @@ pub struct ReplyRef {
     pub sender: Option<String>,
     pub room_id: Option<String>,
     pub thread_root: Option<String>,
+    /// The send was asked (`thread`) to go into the thread of `event_id`
+    /// rather than to quote it: the thread rooted at `thread_root`, or at
+    /// `event_id` itself when that message is not in a thread yet. For an
+    /// inbox entry the engine has already filled `thread_root`; for a bare
+    /// event id the transport does, once it has loaded the event.
+    pub into_thread: bool,
 }
 
 /// A delivered send.
@@ -253,6 +259,12 @@ pub enum ReplyArg {
 
 /// Parse `reply_to`: a decimal inbox seq or a Matrix event id.
 pub fn parse_reply_to(s: &str) -> Result<ReplyArg, String> {
+    parse_ref("reply_to", s)
+}
+
+/// [`parse_reply_to`] for any argument that names a message (`reply_to`,
+/// `thread`): `what` is the argument's name, used in the error text.
+pub fn parse_ref(what: &str, s: &str) -> Result<ReplyArg, String> {
     let s = s.trim();
     if let Ok(n) = s.parse::<u64>() {
         return Ok(ReplyArg::Seq(n));
@@ -265,7 +277,7 @@ pub fn parse_reply_to(s: &str) -> Result<ReplyArg, String> {
         return Ok(ReplyArg::EventId(s.to_string()));
     }
     Err(format!(
-        "reply_to {s:?} is neither an inbox seq (e.g. \"12\") nor a Matrix event id (\"$...\")"
+        "{what} {s:?} is neither an inbox seq (e.g. \"12\") nor a Matrix event id (\"$...\")"
     ))
 }
 
@@ -609,12 +621,33 @@ impl<T: Transport> Engine<T> {
     /// loads it from the destination room, which fails for an event that is
     /// not there.
     pub fn resolve_reply(&self, reply_to: &str, to: &Resolved) -> Result<ReplyRef, String> {
-        let arg = parse_reply_to(reply_to)?;
+        self.resolve_ref("reply_to", reply_to, to)
+    }
+
+    /// Resolve `thread` for a send to `to`: the same lookup and the same
+    /// "must be in the conversation `to` names" check as
+    /// [`resolve_reply`](Self::resolve_reply), but the send goes INTO the thread
+    /// of that message instead of quoting it. A message already in a thread
+    /// gives its root; any other inbox message is the root of a thread the send
+    /// starts. A bare event id not in the inbox is left to the transport, which
+    /// loads the event and applies the same rule.
+    pub fn resolve_thread(&self, thread: &str, to: &Resolved) -> Result<ReplyRef, String> {
+        let mut r = self.resolve_ref("thread", thread, to)?;
+        r.into_thread = true;
+        if r.room_id.is_some() && r.thread_root.is_none() {
+            r.thread_root = Some(r.event_id.clone());
+        }
+        Ok(r)
+    }
+
+    /// `what` names the argument (`reply_to` or `thread`) in error texts.
+    fn resolve_ref(&self, what: &str, reply_to: &str, to: &Resolved) -> Result<ReplyRef, String> {
+        let arg = parse_ref(what, reply_to)?;
         let entry = {
             let inbox = self.inbox.lock().unwrap();
             match &arg {
                 ReplyArg::Seq(n) => Some(inbox.get(*n).cloned().ok_or_else(|| {
-                    format!("reply_to: no inbox entry with seq {n} (see read_inbox)")
+                    format!("{what}: no inbox entry with seq {n} (see read_inbox)")
                 })?),
                 ReplyArg::EventId(id) => inbox.get_by_event_id(id).cloned(),
             }
@@ -641,8 +674,8 @@ impl<T: Transport> Engine<T> {
         };
         if !fits {
             return Err(format!(
-                "REFUSED: reply_to {} (inbox seq {}) is a message in {where_}, not in the conversation with {}; \
-                 a reply must go where the original was posted (set `to` accordingly, or drop reply_to).",
+                "REFUSED: {what} {} (inbox seq {}) is a message in {where_}, not in the conversation with {}; \
+                 a reply must go where the original was posted (set `to` accordingly, or drop {what}).",
                 reply_to.trim(),
                 e.seq,
                 to.name
@@ -653,6 +686,7 @@ impl<T: Transport> Engine<T> {
             sender: Some(e.sender),
             room_id: Some(e.room_id),
             thread_root: e.thread_root,
+            into_thread: false,
         })
     }
 
@@ -689,6 +723,7 @@ impl<T: Transport> Engine<T> {
                 origin,
                 reply_to,
                 mention,
+                thread,
             } => {
                 if let Err(r) = self.tool_enabled(jsonrpc::T_SEND_MESSAGE) {
                     return r;
@@ -712,8 +747,13 @@ impl<T: Transport> Engine<T> {
                     Err(e) => return Response::err(e),
                 };
                 if mention.is_some() {
-                    if reply_to.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-                        return Response::err("send_message takes `mention` or `reply_to`, not both");
+                    if [&reply_to, &thread]
+                        .into_iter()
+                        .any(|r| r.as_deref().is_some_and(|r| !r.trim().is_empty()))
+                    {
+                        return Response::err(
+                            "send_message takes `mention` or `reply_to`/`thread`, not both",
+                        );
                     }
                     if markdown.len() > MAX_MENTION_BYTES {
                         return Response::err(format!(
@@ -738,7 +778,8 @@ impl<T: Transport> Engine<T> {
                         mention,
                     },
                 };
-                self.send(&to, out, &origin, reply_to.as_deref(), info).await
+                self.send(&to, out, &origin, reply_to.as_deref(), thread.as_deref(), info)
+                    .await
             }
             Request::SendFile {
                 to,
@@ -746,6 +787,7 @@ impl<T: Transport> Engine<T> {
                 caption,
                 origin,
                 reply_to,
+                thread,
             } => {
                 if let Err(r) = self.tool_enabled(jsonrpc::T_SEND_FILE) {
                     return r;
@@ -802,6 +844,7 @@ impl<T: Transport> Engine<T> {
                     Outgoing::File { path: p, caption },
                     &origin,
                     reply_to.as_deref(),
+                    thread.as_deref(),
                     info,
                 )
                 .await
@@ -907,6 +950,7 @@ impl<T: Transport> Engine<T> {
                         mention,
                     },
                     &origin,
+                    None,
                     None,
                     info,
                 )
@@ -1135,6 +1179,7 @@ impl<T: Transport> Engine<T> {
         out: Outgoing,
         origin: &str,
         reply_to: Option<&str>,
+        thread: Option<&str>,
         info: Value,
     ) -> Response {
         let origin = format::sanitize_origin(origin);
@@ -1146,15 +1191,25 @@ impl<T: Transport> Engine<T> {
                 return Response::err(refusal);
             }
         };
-        let reply = match reply_to.map(str::trim).filter(|r| !r.is_empty()) {
+        let reply_to = reply_to.map(str::trim).filter(|r| !r.is_empty());
+        let thread = thread.map(str::trim).filter(|r| !r.is_empty());
+        if reply_to.is_some() && thread.is_some() {
+            return Response::err(
+                "a send takes `reply_to` (quote one message) or `thread` (post into its thread), not both",
+            );
+        }
+        let (what, resolved) = match (reply_to, thread) {
+            (Some(r), _) => ("reply_to", Some(self.resolve_reply(r, &target))),
+            (None, Some(t)) => ("thread", Some(self.resolve_thread(t, &target))),
+            (None, None) => ("", None),
+        };
+        let reply = match resolved {
             None => None,
-            Some(r) => match self.resolve_reply(r, &target) {
-                Ok(rr) => Some(rr),
-                Err(e) => {
-                    self.audit(json!({"event": "send_refused", "reason": "reply_to", "to": target.name, "origin": origin}));
-                    return Response::err(e);
-                }
-            },
+            Some(Ok(rr)) => Some(rr),
+            Some(Err(e)) => {
+                self.audit(json!({"event": "send_refused", "reason": what, "to": target.name, "origin": origin}));
+                return Response::err(e);
+            }
         };
         let Resolved {
             name,
@@ -1197,8 +1252,11 @@ impl<T: Transport> Engine<T> {
             Ok(sent) => {
                 tracing::info!(to = %name, origin = %origin, event_id = %sent.event_id, "sent");
                 let mut a = json!({"event": "sent", "to": name, "room": is_room, "origin": origin, "event_id": sent.event_id});
-                if let Some(r) = &reply {
+                if let Some(r) = reply.as_ref().filter(|r| !r.into_thread) {
                     a["reply_to"] = json!(r.event_id);
+                }
+                if let (Some(_), Some(t)) = (&reply, &sent.thread_root) {
+                    a["thread_root"] = json!(t);
                 }
                 if let (Some(a), Some(i)) = (a.as_object_mut(), info.as_object()) {
                     a.extend(i.clone());
@@ -1209,7 +1267,9 @@ impl<T: Transport> Engine<T> {
                 }
                 let mut data = json!({"event_id": sent.event_id, "to_name": name, "to_kind": if is_room { "room" } else { "person" }, "inbox_seq": inbox_seq});
                 data[if is_room { "to_room_id" } else { "to_mxid" }] = json!(key);
-                if let Some(r) = &reply {
+                // `reply_to` only when the caller asked to quote a message; a
+                // `thread` send reports the thread it went into (below) alone.
+                if let Some(r) = reply.as_ref().filter(|r| !r.into_thread) {
                     data["reply_to"] = json!(r.event_id);
                 }
                 if let Some(t) = &sent.thread_root {

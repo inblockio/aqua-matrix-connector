@@ -28,9 +28,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
         /// @mention this allow-listed person (name or MXID): `m.mentions`
-        /// plus a pill, one event, not combined with `reply_to`.
+        /// plus a pill, one event, not combined with `reply_to` or `thread`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mention: Option<String>,
+        /// Send into the Matrix thread of this message (an inbox `seq` or a
+        /// Matrix event id, resolved and checked like `reply_to`): the thread
+        /// rooted at that message, or at its root when it is itself in a
+        /// thread. Starts the thread when there is none yet. Not combined
+        /// with `reply_to` or `mention`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<String>,
     },
     /// Replace (`m.replace`) the text of a message the bridge itself sent
     /// earlier in the room `to` resolves to. `markdown` is the full new body;
@@ -59,6 +66,9 @@ pub enum Request {
         /// See [`Request::SendMessage::reply_to`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
+        /// See [`Request::SendMessage::thread`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<String>,
     },
     /// List the allow-listed recipients.
     ListRecipients,
@@ -182,12 +192,14 @@ mod tests {
             origin: "x@y".into(),
             reply_to: None,
             mention: None,
+            thread: None,
         };
         let line = encode_line(&r);
         assert!(line.contains("\"op\":\"send_message\""));
-        // no reply_to key on the wire when absent (an older daemon sees the
-        // exact pre-reply request)
+        // no reply_to or thread key on the wire when absent (an older daemon
+        // sees the exact pre-reply request)
         assert!(!line.contains("reply_to"));
+        assert!(!line.contains("thread"));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(back, r);
     }
@@ -210,6 +222,27 @@ mod tests {
         assert!(line.contains("\"op\":\"edit_message\""));
         let back: Request = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn thread_parses_for_both_send_ops_and_round_trips() {
+        let r: Request =
+            serde_json::from_str(r#"{"op":"send_message","markdown":"x","thread":"12"}"#).unwrap();
+        let Request::SendMessage { thread, reply_to, .. } = &r else {
+            panic!("not a send_message: {r:?}");
+        };
+        assert_eq!(thread.as_deref(), Some("12"));
+        assert_eq!(*reply_to, None);
+        let back: Request = serde_json::from_str(encode_line(&r).trim()).unwrap();
+        assert_eq!(back, r);
+        let f: Request = serde_json::from_str(
+            r#"{"op":"send_file","path":"/tmp/x.md","thread":"$root:x"}"#,
+        )
+        .unwrap();
+        let Request::SendFile { thread, .. } = &f else {
+            panic!("not a send_file: {f:?}");
+        };
+        assert_eq!(thread.as_deref(), Some("$root:x"));
     }
 
     #[test]

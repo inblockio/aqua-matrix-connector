@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use aqua_matrix_md_mcp::ipc::{self, MdReply, MdRequest};
 use aqua_matrix_md_mcp::{safe_md_filename, SOCK_ENV};
-use aqua_matrix_relay::AgentClient;
+use aqua_matrix_relay::{AgentClient, ThreadReply};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -64,6 +64,18 @@ impl MdBridge {
     /// `*_with_refresh` sends, so the caller (claude-p's `stream_claude`) must
     /// already hold the client mutably by the time it gets here.
     pub async fn setup(agent: &mut AgentClient, target: &str) -> anyhow::Result<Self> {
+        Self::setup_in_thread(agent, target, None).await
+    }
+
+    /// [`setup`](Self::setup) for a run that answers inside a Matrix thread:
+    /// with `Some(thread)` the file (and the inline fallback when the file
+    /// cannot be sent) goes into that thread as a reply instead of the DM with
+    /// `target`. `None` is exactly [`setup`](Self::setup).
+    pub async fn setup_in_thread(
+        agent: &mut AgentClient,
+        target: &str,
+        thread: Option<ThreadReply>,
+    ) -> anyhow::Result<Self> {
         let id = uuid::Uuid::new_v4();
         let dir = std::env::temp_dir();
         let sock_path = dir.join(format!("aqua-md-{id}.sock"));
@@ -99,7 +111,8 @@ impl MdBridge {
         let deliver = move |req: MdRequest| {
             let mut agent = agent.clone();
             let target = target.clone();
-            async move { deliver_file(&mut agent, &target, &req).await }
+            let thread = thread.clone();
+            async move { deliver_file(&mut agent, &target, thread.as_ref(), &req).await }
         };
         let fired_for_loop = fired.clone();
         let task = tokio::spawn(async move {
@@ -193,24 +206,31 @@ where
 /// untrusted model filename), attach it via [`AgentClient::send_file`], and
 /// remove the temp file. On any failure, degrade to inline chunked delivery so
 /// the content is never lost, and report which path was taken.
-async fn deliver_file(agent: &mut AgentClient, target: &str, req: &MdRequest) -> MdReply {
+async fn deliver_file(
+    agent: &mut AgentClient,
+    target: &str,
+    thread: Option<&ThreadReply>,
+    req: &MdRequest,
+) -> MdReply {
     let filename = safe_md_filename(&req.filename);
     let dir = Path::new(MEDIA_TMP_DIR);
     if let Err(e) = tokio::fs::create_dir_all(dir).await {
         tracing::warn!("md-bridge: can't create {} ({e:#}); delivering inline", dir.display());
-        return inline_fallback(agent, target, &req.markdown, format!("temp dir error: {e}")).await;
+        return inline_fallback(agent, target, thread, &req.markdown, format!("temp dir error: {e}")).await;
     }
     let path = dir.join(&filename);
     if let Err(e) = tokio::fs::write(&path, &req.markdown).await {
         tracing::warn!("md-bridge: can't write {} ({e:#}); delivering inline", path.display());
-        return inline_fallback(agent, target, &req.markdown, format!("temp write error: {e}")).await;
+        return inline_fallback(agent, target, thread, &req.markdown, format!("temp write error: {e}")).await;
     }
     let caption = "Here is your answer as a Markdown file. 📎";
     // `_with_refresh`: on M_UNKNOWN_TOKEN (the daemon's `AgentClient` is a
     // per-cycle clone that can outlive the cycle whose token it was minted
     // with — see the reauth-on-401 fix), reauth once and resend once rather
     // than aborting straight to the inline-text fallback below.
-    let sent = agent.send_file_with_refresh(target, &path, Some(caption)).await;
+    let sent = agent
+        .send_file_in_thread_with_refresh(target, &path, Some(caption), thread)
+        .await;
     let _ = tokio::fs::remove_file(&path).await; // best-effort cleanup, always
     match sent {
         Ok(ev) => {
@@ -222,7 +242,7 @@ async fn deliver_file(agent: &mut AgentClient, target: &str, req: &MdRequest) ->
         }
         Err(e) => {
             tracing::warn!("md-bridge: send_file to {target} failed ({e:#}); delivering inline");
-            inline_fallback(agent, target, &req.markdown, format!("attachment send failed: {e}")).await
+            inline_fallback(agent, target, thread, &req.markdown, format!("attachment send failed: {e}")).await
         }
     }
 }
@@ -231,8 +251,17 @@ async fn deliver_file(agent: &mut AgentClient, target: &str, req: &MdRequest) ->
 /// be sent: push the Markdown to the user inline, split across as many messages
 /// as needed. Reports `delivered:false` (the FILE was not attached) with a
 /// detail saying the content went out inline, so the model does not resend it.
-async fn inline_fallback(agent: &mut AgentClient, target: &str, markdown: &str, why: String) -> MdReply {
-    match agent.send_dm_chunked_with_refresh(target, markdown).await {
+async fn inline_fallback(
+    agent: &mut AgentClient,
+    target: &str,
+    thread: Option<&ThreadReply>,
+    markdown: &str,
+    why: String,
+) -> MdReply {
+    match agent
+        .send_dm_chunked_in_thread_with_refresh(target, markdown, thread)
+        .await
+    {
         Ok(_) => MdReply::failed(format!("{why}; sent inline")),
         Err(e) => MdReply::failed(format!("{why}; inline delivery also failed: {e}")),
     }
