@@ -19,6 +19,12 @@ path = "src/main.rs"
 name = "room_probe"
 test = true
 
+# Persistent scriptable test user for the Paige e2e loop (see the example's
+# module doc). `test = true` so a plain `cargo test` runs its HTTP-layer tests.
+[[example]]
+name = "paige_test_peer"
+test = true
+
 [features]
 e2e = ["dep:uuid"]
 
