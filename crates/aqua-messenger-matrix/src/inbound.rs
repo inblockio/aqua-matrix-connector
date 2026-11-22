@@ -3,8 +3,9 @@
 //! (a DM from an allow-listed person, or any member's message in a listed
 //! `[[rooms]]` room; everything else is dropped and logged once). Reply and
 //! thread metadata (`in_reply_to`, `thread_root`) is recorded with each
-//! entry. Also: the joined-room survey the engine uses for `list_recipients`
-//! and the group-room check.
+//! entry; an edit is recorded with its new text and the event it edits. Also:
+//! the joined-room survey the engine uses for `list_recipients` and the
+//! group-room check.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use matrix_sdk::{
         api::client::receipt::create_receipt::v3::ReceiptType,
         events::{
             receipt::ReceiptThread,
-            room::message::{MessageType, OriginalSyncRoomMessageEvent},
+            room::message::{MessageType, OriginalSyncRoomMessageEvent, Relation},
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         },
         UInt,
@@ -68,15 +69,36 @@ pub fn ingest_event<T: Transport>(
     ) else {
         return false;
     };
-    let (kind, body, filename) = describe_msgtype(&ev.content.msgtype);
+    engine
+        .ingest(new_entry(ev, room_id, acc.sender_name, acc.room_name))
+        .is_some()
+}
+
+/// The inbox entry for an accepted message event (no I/O).
+pub fn new_entry(
+    ev: &OriginalSyncRoomMessageEvent,
+    room_id: &str,
+    sender_name: Option<String>,
+    room: Option<String>,
+) -> NewEntry {
+    let (kind, mut body, filename) = describe_msgtype(&ev.content.msgtype);
     let (in_reply_to, thread_root) =
         aqua_matrix_agent::reply::reply_fields(ev.content.relates_to.as_ref());
-    let entry = NewEntry {
+    // An edit's own body is the "* ..." fallback for clients that cannot
+    // edit; the text the sender means is in `m.new_content`.
+    let edits = match ev.content.relates_to.as_ref() {
+        Some(Relation::Replacement(r)) => {
+            body = describe_msgtype(&r.new_content.msgtype).1;
+            Some(r.event_id.to_string())
+        }
+        _ => None,
+    };
+    NewEntry {
         event_id: ev.event_id.to_string(),
         room_id: room_id.to_string(),
         sender: ev.sender.to_string(),
-        sender_name: acc.sender_name,
-        room: acc.room_name,
+        sender_name,
+        room,
         ts_ms: u64::from(ev.origin_server_ts.0),
         kind: kind.to_string(),
         body,
@@ -84,8 +106,8 @@ pub fn ingest_event<T: Transport>(
         media: crate::media::media_ref(&ev.content.msgtype),
         in_reply_to,
         thread_root,
-    };
-    engine.ingest(entry).is_some()
+        edits,
+    }
 }
 
 /// Joined members of `room`, from the full member list (fetched from the
@@ -435,6 +457,48 @@ pub async fn survey_rooms<T: Transport>(agent: &AgentClient, engine: &Engine<T>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(content: serde_json::Value) -> OriginalSyncRoomMessageEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$edit:x",
+            "sender": "@tim:x",
+            "origin_server_ts": 1_790_000_000_000u64,
+            "content": content,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_edit_records_what_it_edits_and_carries_the_new_text() {
+        let ev = event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "* fallback star text",
+            "m.new_content": {"msgtype": "m.text", "body": "the real new text"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$orig:x"},
+        }));
+        let e = new_entry(&ev, "!dm:x", Some("tim".into()), None);
+        assert_eq!(e.edits.as_deref(), Some("$orig:x"));
+        assert_eq!(e.body, "the real new text");
+        // the inbox, not this function, copies the thread from the original
+        assert!(e.in_reply_to.is_none() && e.thread_root.is_none());
+    }
+
+    #[test]
+    fn a_thread_message_and_a_plain_message_are_not_edits() {
+        let thread = event(serde_json::json!({
+            "msgtype": "m.text",
+            "body": "answer",
+            "m.relates_to": {"rel_type": "m.thread", "event_id": "$root:x", "is_falling_back": true,
+                "m.in_reply_to": {"event_id": "$root:x"}},
+        }));
+        let e = new_entry(&thread, "!dm:x", None, None);
+        assert_eq!(e.thread_root.as_deref(), Some("$root:x"));
+        assert!(e.edits.is_none() && e.in_reply_to.is_none());
+        let plain = event(serde_json::json!({"msgtype": "m.text", "body": "hi"}));
+        let e = new_entry(&plain, "!dm:x", None, None);
+        assert!(e.edits.is_none() && e.thread_root.is_none() && e.body == "hi");
+    }
 
     #[test]
     fn a_pending_invitee_knocks_an_observed_room_out_of_the_dm() {

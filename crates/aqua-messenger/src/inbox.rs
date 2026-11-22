@@ -235,6 +235,11 @@ pub struct InboxEntry {
     /// Root event id of the thread this message was posted in (`m.thread`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_root: Option<String>,
+    /// Event id of the message this entry edits (`m.replace`). For an edit,
+    /// `body` is the new text and `in_reply_to` / `thread_root` are copied from
+    /// the original's entry when it is still in the inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits: Option<String>,
     /// `state() != New`, kept on disk for binaries that predate the states.
     #[serde(default)]
     pub read: bool,
@@ -305,6 +310,8 @@ pub struct NewEntry {
     pub in_reply_to: Option<String>,
     /// See [`InboxEntry::thread_root`].
     pub thread_root: Option<String>,
+    /// See [`InboxEntry::edits`].
+    pub edits: Option<String>,
 }
 
 /// Filter for [`Inbox::query`].
@@ -444,6 +451,7 @@ impl Inbox {
         {
             return None;
         }
+        let (in_reply_to, thread_root) = self.relation_of(&new);
         let seq = self.next_seq;
         self.next_seq += 1;
         self.seen.insert(new.event_id.clone(), new.ts_ms);
@@ -459,8 +467,9 @@ impl Inbox {
             body: new.body,
             filename: new.filename,
             media: new.media,
-            in_reply_to: new.in_reply_to,
-            thread_root: new.thread_root,
+            in_reply_to,
+            thread_root,
+            edits: new.edits,
             read: false,
             seen: None,
             processed: None,
@@ -473,6 +482,24 @@ impl Inbox {
         }
         log_pruned(pruned);
         kept.then_some(seq)
+    }
+
+    /// `(in_reply_to, thread_root)` for `new`. An edit (`m.replace`) carries
+    /// no thread or reply relation of its own, so it takes them from the
+    /// original's entry, if that is still in the inbox and is the same
+    /// sender's message in the same room (an "edit" of someone else's message
+    /// is not an edit and must not borrow its thread). Otherwise they stay as
+    /// the event gave them.
+    fn relation_of(&self, new: &NewEntry) -> (Option<String>, Option<String>) {
+        let mut rel = (new.in_reply_to.clone(), new.thread_root.clone());
+        let original = new.edits.as_deref().and_then(|id| self.get_by_event_id(id));
+        if let Some(o) = original
+            .filter(|o| o.room_id == new.room_id && o.sender.eq_ignore_ascii_case(&new.sender))
+        {
+            rel.0 = rel.0.or_else(|| o.in_reply_to.clone());
+            rel.1 = rel.1.or_else(|| o.thread_root.clone());
+        }
+        rel
     }
 
     /// Drop whatever the policy no longer allows, as of now. Persists and logs
@@ -717,6 +744,7 @@ mod tests {
             media: None,
             in_reply_to: None,
             thread_root: None,
+            edits: None,
         }
     }
 
@@ -1170,6 +1198,91 @@ mod tests {
         assert_eq!(ib.get(2).unwrap().state(), State::New);
         // the read is still recorded as state, with its provenance
         assert_eq!(ib.get(1).unwrap().seen.as_ref().unwrap().by, "a");
+    }
+
+    #[test]
+    fn an_edit_inherits_the_thread_and_reply_of_its_original() {
+        let mut ib = Inbox::load(tmp_path("edit-inherit"));
+        let mut o = msg("$o", "@t:x", 1);
+        o.thread_root = Some("$root".into());
+        o.in_reply_to = Some("$ours".into());
+        ib.ingest(o);
+        let mut ed = msg("$e", "@t:x", 2);
+        ed.body = "the new text".into();
+        ed.edits = Some("$o".into());
+        let seq = ib.ingest(ed).unwrap();
+        let e = ib.get(seq).unwrap();
+        assert_eq!(e.edits.as_deref(), Some("$o"));
+        assert_eq!(e.thread_root.as_deref(), Some("$root"));
+        assert_eq!(e.in_reply_to.as_deref(), Some("$ours"));
+        assert_eq!(e.body, "the new text");
+    }
+
+    #[test]
+    fn an_edit_of_an_unknown_original_stays_bare_but_records_what_it_edits() {
+        let mut ib = Inbox::load(tmp_path("edit-unknown"));
+        let mut ed = msg("$e", "@t:x", 2);
+        ed.edits = Some("$gone".into());
+        let seq = ib.ingest(ed).unwrap();
+        let e = ib.get(seq).unwrap();
+        assert_eq!(e.edits.as_deref(), Some("$gone"));
+        assert!(e.thread_root.is_none() && e.in_reply_to.is_none());
+    }
+
+    #[test]
+    fn an_edit_never_takes_the_thread_of_someone_elses_message() {
+        let mut ib = Inbox::load(tmp_path("edit-forged"));
+        let mut o = msg("$o", "@t:x", 1);
+        o.thread_root = Some("$root".into());
+        ib.ingest(o);
+        // another sender, or another room: not a valid edit of $o
+        let mut forged = msg("$f1", "@mallory:x", 2);
+        forged.edits = Some("$o".into());
+        let mut elsewhere = msg("$f2", "@t:x", 3);
+        elsewhere.room_id = "!other:x".into();
+        elsewhere.edits = Some("$o".into());
+        for m in [forged, elsewhere] {
+            let seq = ib.ingest(m).unwrap();
+            assert!(ib.get(seq).unwrap().thread_root.is_none());
+        }
+    }
+
+    #[test]
+    fn an_edit_of_an_edit_keeps_the_original_thread() {
+        let mut ib = Inbox::load(tmp_path("edit-chain"));
+        let mut o = msg("$o", "@t:x", 1);
+        o.thread_root = Some("$root".into());
+        ib.ingest(o);
+        let mut e1 = msg("$e1", "@t:x", 2);
+        e1.edits = Some("$o".into());
+        ib.ingest(e1);
+        // a second edit names the ORIGINAL again (Matrix edits always do), but
+        // must also work when it names an earlier edit entry
+        let mut e2 = msg("$e2", "@t:x", 3);
+        e2.edits = Some("$e1".into());
+        let seq = ib.ingest(e2).unwrap();
+        assert_eq!(ib.get(seq).unwrap().thread_root.as_deref(), Some("$root"));
+    }
+
+    #[test]
+    fn edits_persist_and_old_lines_load() {
+        let p = tmp_path("edit-persist");
+        let mut ib = Inbox::load(p.clone());
+        let mut ed = msg("$e", "@t:x", 1);
+        ed.edits = Some("$o".into());
+        ib.ingest(ed);
+        ib.ingest(msg("$plain", "@t:x", 2));
+        let re = Inbox::load(p.clone());
+        assert_eq!(
+            re.get_by_event_id("$e").unwrap().edits.as_deref(),
+            Some("$o")
+        );
+        // absent field is not written, and a line from before the field parses
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("\"edits\"").count(), 1);
+        let old = r#"{"seq":9,"event_id":"$o","room_id":"!r:x","sender":"@t:x","ts_ms":1,"kind":"text","body":"b","read":false}"#;
+        let e: InboxEntry = serde_json::from_str(old).unwrap();
+        assert!(e.edits.is_none());
     }
 
     #[test]

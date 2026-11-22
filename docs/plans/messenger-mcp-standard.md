@@ -44,7 +44,11 @@ and `wait_for_reply` only where a profile enables it) by default:
    plain thread messages. Inbox entries expose `event_id`, `in_reply_to` and
    `thread_root`, so a session sees that a message answers one it sent (compare with
    the event id `send_message` returns). A thread message whose `m.in_reply_to` is only
-   the thread fallback is not reported as a reply (the matrix-mcp rule).
+   the thread fallback is not reported as a reply (the matrix-mcp rule). An edit
+   (`m.replace`) of a message is its own entry with the new text (`m.new_content`), an
+   `edits` field naming the edited event, and the original's `thread_root` /
+   `in_reply_to` copied from the original's entry when that is in the inbox and has the
+   same sender and room.
    `thread` (same argument forms and conversation check as `reply_to`, not combined with
    it) posts INTO the thread of a message, starting one when the message is not in a
    thread yet: the thread is rooted at the message, or at its root when it is already

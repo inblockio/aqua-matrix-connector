@@ -322,6 +322,7 @@ room_id = "!daily:x"
             }),
             in_reply_to: None,
             thread_root: None,
+            edits: None,
         })
         .unwrap()
     }
@@ -438,6 +439,7 @@ room_id = "!daily:x"
             media: None,
             in_reply_to: None,
             thread_root: Some("$root".into()),
+            edits: None,
         });
         let r = e2
             .handle(Request::SendMessage {
@@ -486,6 +488,7 @@ room_id = "!daily:x"
             media: None,
             in_reply_to: None,
             thread_root: Some("$root".into()),
+            edits: None,
         });
         let r = e2
             .handle(Request::SendMessage {
