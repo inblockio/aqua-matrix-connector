@@ -10,7 +10,8 @@
 //! - per-target rate limit ([`ratelimit`]), size caps ([`profile::Limits`]),
 //!   sensitive-path guard;
 //! - reply threading (`reply_to`, [`engine::ReplyRef`]); inbox entries carry
-//!   `event_id`, `in_reply_to` and `thread_root`;
+//!   `event_id`, `in_reply_to` and `thread_root`; an edit (`m.replace`) of a
+//!   message also carries `edits` and the original's thread and reply fields;
 //! - durable inbox ([`inbox`]) and on-demand attachment store ([`attachments`]);
 //! - inbound content always framed as untrusted data ([`format`]);
 //! - MCP tool annotations on every tool ([`jsonrpc::annotations`]).

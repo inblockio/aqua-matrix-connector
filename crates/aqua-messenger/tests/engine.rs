@@ -140,6 +140,7 @@ fn attachment_entry(id: &str, size: Option<u64>) -> NewEntry {
         }),
         in_reply_to: None,
         thread_root: None,
+        edits: None,
     }
 }
 
@@ -163,6 +164,7 @@ fn text_entry(
         media: None,
         in_reply_to: None,
         thread_root: thread_root.map(Into::into),
+        edits: None,
     }
 }
 
