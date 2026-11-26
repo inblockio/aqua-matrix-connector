@@ -49,13 +49,89 @@ pub(crate) trait ProfileFlagStore {
 }
 
 /// Whether to set the flag for this connect: the switch value `env` over the kind's default.
-pub(crate) fn flag_enabled(_env: Option<&str>, _kind: ConnectKind) -> bool {
-    false
+pub(crate) fn flag_enabled(env: Option<&str>, kind: ConnectKind) -> bool {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "false" | "off" | "no") => false,
+        Some("1" | "true" | "on" | "yes") => true,
+        _ => kind == ConnectKind::LongRunning,
+    }
+}
+
+/// [`flag_enabled`] with the switch read from the environment.
+pub(crate) fn flag_enabled_from_env(kind: ConnectKind) -> bool {
+    flag_enabled(std::env::var(SELF_FLAG_ENV).ok().as_deref(), kind)
 }
 
 /// Set the flag when missing. Never fails: every problem is logged and reported as [`FlagOutcome::Failed`].
-pub(crate) async fn ensure_agent_flag<S: ProfileFlagStore>(_store: &S) -> FlagOutcome {
-    FlagOutcome::Failed
+pub(crate) async fn ensure_agent_flag<S: ProfileFlagStore>(store: &S) -> FlagOutcome {
+    let run = async {
+        if store.is_present().await? {
+            return Ok(FlagOutcome::AlreadyPresent);
+        }
+        store.set().await?;
+        Ok::<_, anyhow::Error>(FlagOutcome::Set)
+    };
+    match tokio::time::timeout(FLAG_TIMEOUT, run).await {
+        Ok(Ok(outcome)) => {
+            match outcome {
+                FlagOutcome::Set => tracing::info!("set profile field {AGENT_FLAG_FIELD}=true"),
+                _ => tracing::info!("profile field {AGENT_FLAG_FIELD} already present"),
+            }
+            outcome
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("could not set profile field {AGENT_FLAG_FIELD} (connect continues): {e:#}");
+            FlagOutcome::Failed
+        }
+        Err(_) => {
+            tracing::warn!(
+                "profile field {AGENT_FLAG_FIELD} check timed out after {}s (connect continues)",
+                FLAG_TIMEOUT.as_secs()
+            );
+            FlagOutcome::Failed
+        }
+    }
+}
+
+/// The real store: the client's own profile on the homeserver.
+pub(crate) struct OwnProfile<'a> {
+    pub(crate) client: &'a matrix_sdk::Client,
+}
+
+impl ProfileFlagStore for OwnProfile<'_> {
+    async fn is_present(&self) -> Result<bool> {
+        use matrix_sdk::ruma::profile::ProfileFieldName;
+        let user_id = self
+            .client
+            .user_id()
+            .ok_or_else(|| anyhow::anyhow!("no user id on the client"))?
+            .to_owned();
+        match self
+            .client
+            .account()
+            .fetch_profile_field_of(user_id, ProfileFieldName::from(AGENT_FLAG_FIELD))
+            .await
+        {
+            Ok(value) => Ok(value.is_some()),
+            // Synapse answers 404 M_NOT_FOUND for an unset custom field.
+            Err(e)
+                if matches!(
+                    e.client_api_error_kind(),
+                    Some(matrix_sdk::ruma::api::error::ErrorKind::NotFound)
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn set(&self) -> Result<()> {
+        use matrix_sdk::ruma::profile::ProfileFieldValue;
+        let value = ProfileFieldValue::new(AGENT_FLAG_FIELD, serde_json::json!(true))?;
+        self.client.account().set_profile_field(value).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
