@@ -4,6 +4,7 @@
 // the bound is hit through this crate's public API so the limit stays here).
 #![recursion_limit = "256"]
 
+mod agent_flag;
 mod call;
 mod device_role;
 mod dm;
@@ -1301,7 +1302,15 @@ async fn sign_own_device_if_needed(client: &Client) {
 }
 
 impl AgentClient {
+    /// Connect as a plain client. Person drivers (the e2e harnesses) and the
+    /// one-shot CLI come through here and do NOT set the agent flag unless
+    /// `AGENT_SELF_FLAG=on`; the long-running agents connect through
+    /// [`connect_with_outage_retry`], which does (see `agent_flag`).
     pub async fn connect(config: AgentConfig) -> Result<Self> {
+        Self::connect_as(config, agent_flag::ConnectKind::Plain).await
+    }
+
+    pub(crate) async fn connect_as(config: AgentConfig, kind: agent_flag::ConnectKind) -> Result<Self> {
         let key = if config.key_file.exists() {
             tracing::info!("loading key from {}", config.key_file.display());
             SiwxKey::from_pem_file(&config.key_file).context("failed to load key")?
@@ -1473,6 +1482,13 @@ impl AgentClient {
         // kept it) stays unsigned and needs a new device_id; see
         // docs/RECOVERY.md.
         sign_own_device_if_needed(&client).await;
+
+        // Self-declared agent flag on the own profile. Best effort, never fatal.
+        if agent_flag::flag_enabled_from_env(kind) {
+            agent_flag::ensure_agent_flag(&agent_flag::OwnProfile { client: &client }).await;
+        } else {
+            tracing::debug!("agent flag not set for this connect ({})", agent_flag::SELF_FLAG_ENV);
+        }
 
         // If we just re-bootstrapped onto a NEW device_id (store wipe), the peer's
         // client may still be encrypting to our previous, now-dead devices (whose

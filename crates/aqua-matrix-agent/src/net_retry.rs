@@ -381,7 +381,7 @@ where
         let res = tokio::select! {
             biased;
             _ = &mut shutdown => return ConnectOutcome::Shutdown,
-            r = AgentClient::connect(config.clone()) => r,
+            r = AgentClient::connect_as(config.clone(), crate::agent_flag::ConnectKind::LongRunning) => r,
         };
         let delay = match res {
             Ok(agent) => {
