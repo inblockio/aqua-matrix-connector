@@ -1115,6 +1115,11 @@ URL_ENV_ARGS=()
 [ -n "$MATRIX_URL_ARG" ] && URL_ENV_ARGS+=( -e "MATRIX_URL=$MATRIX_URL_ARG" )
 
 # ---------------------------------------------------------------- assemble the run
+# Effort (Tim 2026-11-26): consultants run Opus 5.5 at high effort. The CLI default for claude-opus-5-5 is medium and
+# nothing else sets one; CLAUDE_CODE_EFFORT_LEVEL is the first source the CLI reads, so every `claude -p` run inherits
+# it. CONSULTANT_EFFORT overrides (low, medium, high, xhigh, max). See SKILL.md "Effort".
+EFFORT="${CONSULTANT_EFFORT:-high}"
+case "$EFFORT" in low|medium|high|xhigh|max) ;; *) echo "!! CONSULTANT_EFFORT=$EFFORT is not one of low, medium, high, xhigh, max (nothing changed)" >&2; exit 2 ;; esac
 # ONE argument vector feeds both --print-run and the real `podman run`, so what is printed
 # is exactly what runs. Secrets are bare `-e NAME` (inherited), never `-e NAME=value`. The
 # resource/caps/token lines are byte-identical to the legacy recreate-*.sh (see SKILL.md,
@@ -1127,6 +1132,7 @@ RUN_ARGS=( \
   --tmpfs /tmp \
   -e AGENT_TARGET="$TARGET" \
   -e AGENT_CONFIG_FILE=/agent/config.json \
+  -e CLAUDE_CODE_EFFORT_LEVEL="$EFFORT" \
   "${URL_ENV_ARGS[@]}" \
   -e CLAUDE_CODE_OAUTH_TOKEN \
   "${DEEPGRAM_ENV_ARGS[@]}" \

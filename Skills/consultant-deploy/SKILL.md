@@ -500,6 +500,16 @@ Rollback is the reverse: remove `model` from the configs FIRST, then roll back t
 because the template now carries `model`, never render a fresh config with `CONSULTANT_IMAGE`
 pointing at a pre-#29 image.
 
+## Effort (`CLAUDE_CODE_EFFORT_LEVEL`)
+
+Every spawn runs with `-e CLAUDE_CODE_EFFORT_LEVEL=high` (Tim 2026-11-26: consultants always run the latest Opus at
+high effort). The CLI's own default for `claude-opus-5-5` is `medium`, and the relay passes no `--effort`, so without
+this line a consultant runs at medium. The env var is the first source the CLI reads, so it beats `--effort` and any
+settings file. `CONSULTANT_EFFORT` overrides the level for one spawn (`low`, `medium`, `high`, `xhigh`, `max`; anything
+else is refused). On agentic the line lives in `/srv/agents/env/<name>.env` and in the carry copy
+`/mnt/scribe-data/carry/meta/<name>.env` (`agents.py place` copies the carry copy over the live one); changing it
+means editing both and recreating the container (`agents.py stop`, then `run`), since a restart keeps the old env.
+
 ## Boot-time restore (reboot survival)
 
 Podman restart policies don't survive a WSL/VM reboot, and the fleet's `--restart on-failure`
