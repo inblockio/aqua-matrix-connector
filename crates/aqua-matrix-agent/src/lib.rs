@@ -4,6 +4,7 @@
 // the bound is hit through this crate's public API so the limit stays here).
 #![recursion_limit = "256"]
 
+mod agent_flag;
 mod call;
 mod device_role;
 mod dm;
