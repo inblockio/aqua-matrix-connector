@@ -144,12 +144,12 @@ assert m == {"/agent/config.json": (".aqua-matrix-test/alpha-aqua-consultant-con
              "/agent/memory": (".aqua-matrix-test/alpha-aqua-consultant-persist/memory", False, 1001),
              "/refs": (".local/share/agent-refs/views/alpha-aqua-consultant", True, 1000),
              "/agent/avatar.png": (".aqua-matrix-test/alpha-avatar.jpg", True, 1000)}, m
-assert d["env_names"] == ["AGENT_TARGET", "AGENT_CONFIG_FILE", "CLAUDE_CODE_OAUTH_TOKEN"], d["env_names"]
+assert d["env_names"] == ["AGENT_TARGET", "AGENT_CONFIG_FILE", "CLAUDE_CODE_EFFORT_LEVEL", "CLAUDE_CODE_OAUTH_TOKEN"], d["env_names"]
 assert len(d["cap_drop"]) == 11 and d["security_opt"] == ["no-new-privileges"] and d["pids"] == 512
 assert sys.argv[2] not in open(sys.argv[1]).read()
 PY
 check "env file: 0600, target, config path and token" bash -c \
-  '[ "$(stat -c %a "$1")" = 600 ] && grep -qxF "AGENT_TARGET=$2" "$1" && grep -qxF "AGENT_CONFIG_FILE=/agent/config.json" "$1" && grep -qxF "CLAUDE_CODE_OAUTH_TOKEN=fake-token-sekrit" "$1"' \
+  '[ "$(stat -c %a "$1")" = 600 ] && grep -qxF "AGENT_TARGET=$2" "$1" && grep -qxF "AGENT_CONFIG_FILE=/agent/config.json" "$1" && grep -qxF "CLAUDE_CODE_EFFORT_LEVEL=high" "$1" && grep -qxF "CLAUDE_CODE_OAUTH_TOKEN=fake-token-sekrit" "$1"' \
   _ "$E" "$TARGET"
 check "the token appears nowhere but the env file" bash -c '! grep -rqF fake-token-sekrit "$1" "$2" "$3" "$4" "$5"' \
   _ "$SB/out/full.out" "$SB/out/full.err" "$SIDE" "$NOTIFY_LOG" "$J"
